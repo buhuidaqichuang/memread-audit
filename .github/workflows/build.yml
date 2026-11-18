@@ -5,14 +5,14 @@ on:
   workflow_dispatch:
 
 jobs:
-  # 形态一：命令行二进制（推荐，配合 NewTerm + sudo 使用）
+  # 形态一：命令行二进制（NewTerm + sudo 使用）
   binary:
     runs-on: macos-13
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Compile for iOS arm64
+      - name: Compile CLI for iOS arm64
         run: |
           set -e
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
@@ -22,7 +22,7 @@ jobs:
             -O2 \
             -isysroot "$SDK" \
             -miphoneos-version-min=15.0 \
-            -o memread memread.c
+            -o memread memread.c memread_core.c
           file memread
           ls -l memread
 
@@ -39,29 +39,35 @@ jobs:
             ent.plist
           if-no-files-found: error
 
-  # 形态二：打包成 .ipa（需要 ldid 重签才能拿到 platform-application）
+  # 形态二：UI App（.ipa），列表选择 App、自动找 PID、一键读取
   ipa:
-    needs: binary
     runs-on: macos-13
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download binary
-        uses: actions/download-artifact@v4
-        with:
-          name: memread-arm64
-          path: dist
-
-      - name: Package Payload
+      - name: Compile UI app
         run: |
           set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK = $SDK"
           rm -rf build
           mkdir -p build/Payload/memread.app
-          cp dist/memread build/Payload/memread.app/memread
-          chmod 755 build/Payload/memread.app/memread
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -fobjc-arc \
+            -O2 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=15.0 \
+            -framework UIKit -framework Foundation \
+            -o build/Payload/memread.app/memread \
+            app/main.m app/AppDelegate.m app/ViewController.m app/DetailViewController.m memread_core.c
+          file build/Payload/memread.app/memread
           cp app/Info.plist build/Payload/memread.app/Info.plist
-          cp dist/ent.plist build/ent.plist
+          cp ent.plist build/ent.plist
+
+      - name: Package ipa
+        run: |
           cd build
           zip -qr memread.ipa Payload
           ls -l memread.ipa
