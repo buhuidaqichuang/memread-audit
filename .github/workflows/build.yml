@@ -7,7 +7,7 @@ on:
 jobs:
   # 形态一：命令行二进制（NewTerm + sudo 使用）
   binary:
-    runs-on: macos-13
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,7 +41,7 @@ jobs:
 
   # 形态二：UI App（.ipa），列表选择 App、自动找 PID、一键读取
   ipa:
-    runs-on: macos-13
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
