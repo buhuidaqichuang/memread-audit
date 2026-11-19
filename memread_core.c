@@ -6,13 +6,30 @@
 #include <stdint.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
+#include <mach/vm_map.h>
 #include <mach/vm_region.h>
 #include <mach/vm_prot.h>
 
 // libproc 是 iOS 私有头，但符号在 libSystem 里，手动声明即可
 extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 extern int proc_name(int pid, void *buffer, uint32_t buffersize);
+
+// iOS SDK 的 <mach/mach_vm.h> 被 #error 屏蔽，但符号在 libSystem 里，手动声明
+extern kern_return_t mach_vm_region(
+    vm_map_t target_task,
+    mach_vm_address_t *address,
+    mach_vm_size_t *size,
+    vm_region_flavor_t flavor,
+    vm_region_info_t info,
+    mach_msg_type_number_t *infoCnt,
+    mach_port_t *object_name);
+
+extern kern_return_t mach_vm_read_overwrite(
+    vm_map_t target_task,
+    mach_vm_address_t address,
+    mach_vm_size_t size,
+    mach_vm_address_t data,
+    mach_vm_size_t *outsize);
 
 int memread_dump(pid_t pid, const char *out_path, int rw_only,
                  void (*progress)(unsigned long long done, void *ctx), void *ctx) {
@@ -42,12 +59,7 @@ int memread_dump(pid_t pid, const char *out_path, int rw_only,
 
         int readable = (info.protection & VM_PROT_READ) != 0;
         int writable = (info.protection & VM_PROT_WRITE) != 0;
-        int shared = 0;
-#ifdef SM_SHARED
-        shared = (info.share_mode == SM_SHARED || info.share_mode == SM_SHARED_ALIASED);
-#elif defined(SM_COW)
-        shared = (info.share_mode == SM_COW || info.share_mode == SM_PRIVATE_ALIASED);
-#endif
+        int shared = info.shared;  /* boolean_t，iOS SDK 无 share_mode 字段 */
 
         if (readable && !shared && (!rw_only || writable) &&
             size <= (mach_vm_size_t)(512ULL * 1024 * 1024)) {
