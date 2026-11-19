@@ -3,6 +3,12 @@
 
 #include <sys/types.h>
 
+// libproc 是 iOS 私有头，但符号在 libSystem 里，手动声明
+extern int proc_pidpath(int pid, void *buffer, unsigned int buffersize);
+extern int proc_name(int pid, void *buffer, unsigned int buffersize);
+
+#define MEMREAD_PROC_PATH_MAX (4 * 1024)
+
 // 读取目标进程内存（无注入、无 ptrace，目标不可感知）
 // 返回 0 成功；progress 可为 NULL
 int memread_dump(pid_t pid, const char *out_path, int rw_only,

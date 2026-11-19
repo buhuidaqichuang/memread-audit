@@ -59,6 +59,7 @@ jobs:
             -O2 \
             -isysroot "$SDK" \
             -miphoneos-version-min=15.0 \
+            -I . \
             -framework UIKit -framework Foundation \
             -o build/Payload/memread.app/memread \
             app/main.m app/AppDelegate.m app/ViewController.m app/DetailViewController.m memread_core.c

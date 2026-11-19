@@ -3,12 +3,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <libproc.h>
+#include <stdint.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <mach/vm_region.h>
 #include <mach/vm_prot.h>
+
+// libproc 是 iOS 私有头，但符号在 libSystem 里，手动声明即可
+extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+extern int proc_name(int pid, void *buffer, uint32_t buffersize);
 
 int memread_dump(pid_t pid, const char *out_path, int rw_only,
                  void (*progress)(unsigned long long done, void *ctx), void *ctx) {

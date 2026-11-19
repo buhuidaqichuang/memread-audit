@@ -1,6 +1,5 @@
 #import "DetailViewController.h"
 #import "memread_core.h"
-#include <libproc.h>
 
 @interface DetailViewController ()
 @property (nonatomic, strong) UIScrollView *scroll;
@@ -82,7 +81,7 @@
     pid_t pids[8192];
     int n = memread_list_procs(pids, 8192);
     for (int i = 0; i < n; i++) {
-        char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+        char path[MEMREAD_PROC_PATH_MAX] = {0};
         if (memread_proc_path(pids[i], path, sizeof(path)) <= 0) continue;
         NSString *p = [NSString stringWithUTF8String:path];
         if (!p.length) continue;
