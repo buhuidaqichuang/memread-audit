@@ -67,6 +67,18 @@ jobs:
           cp app/Info.plist build/Payload/memread.app/Info.plist
           cp ent.plist build/ent.plist
 
+      - name: Codesign app bundle with entitlements
+        run: |
+          set -e
+          plutil -convert binary1 build/Payload/memread.app/Info.plist
+          codesign --force --sign - --timestamp=none \
+            --entitlements ent.plist \
+            build/Payload/memread.app
+          echo "=== verify ==="
+          codesign -dvvv build/Payload/memread.app || true
+          echo "=== entitlements ==="
+          codesign -d --entitlements :- build/Payload/memread.app || true
+
       - name: Package ipa
         run: |
           cd build
