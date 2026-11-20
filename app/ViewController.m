@@ -1,5 +1,6 @@
 #import "ViewController.h"
 #import "DetailViewController.h"
+#import "FilesViewController.h"
 
 // 私有 API：按 bundle id 取 App 图标（UIKit 内部实现，SpringBoard 也用同一条）
 static UIImage *MemReadIconForBundle(NSString *bid) {
@@ -78,6 +79,11 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
                                          style:UIBarButtonItemStylePlain
                                         target:self
                                         action:@selector(onManual)];
+    self.navigationItem.leftBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"结果"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self
+                                        action:@selector(onFiles)];
 
     [self loadApps];
 }
@@ -138,6 +144,12 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
 
 - (void)updateSearchResultsForSearchController:(UISearchController *)searchController {
     [self applyFilter];
+}
+
+// 结果页：App 内浏览/删除 Media 下的 memread_* 文件
+- (void)onFiles {
+    FilesViewController *vc = [[FilesViewController alloc] init];
+    [self.navigationController pushViewController:vc animated:YES];
 }
 
 // 兜底：直接粘贴 bundle id，绕开列表枚举
