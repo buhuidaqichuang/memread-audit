@@ -31,8 +31,22 @@ extern kern_return_t mach_vm_read_overwrite(
     mach_vm_address_t data,
     mach_vm_size_t *outsize);
 
-int memread_dump(pid_t pid, const char *out_path, int rw_only,
-                 void (*progress)(unsigned long long done, void *ctx), void *ctx) {
+// 判断一段缓冲区是否全零（按 8 字节步进，足够快）
+static int all_zero(const unsigned char *p, size_t n) {
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t v = 0;
+        memcpy(&v, p + i, 8);
+        if (v) return 0;
+    }
+    for (; i < n; i++) {
+        if (p[i]) return 0;
+    }
+    return 1;
+}
+
+int memread_dump_ex(pid_t pid, const char *out_path, int rw_only,
+                    memread_region_cb cb, void *ctx) {
     task_t task = MACH_PORT_NULL;
     kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
     if (kr != KERN_SUCCESS) {
@@ -43,8 +57,14 @@ int memread_dump(pid_t pid, const char *out_path, int rw_only,
     FILE *f = fopen(out_path, "wb");
     if (!f) { perror("fopen"); return -2; }
 
+    // 4MB 分块：既降低单次分配的失败率，也让进度能持续回调
+    const mach_vm_size_t CHUNK = 4ULL * 1024 * 1024;
+    unsigned char *buf = (unsigned char *)malloc((size_t)CHUNK);
+    if (!buf) { fclose(f); return -4; }
+
     mach_vm_address_t addr = 0;
     unsigned long long total = 0;
+    unsigned long long skipped_total = 0;
     int regions = 0;
 
     while (1) {
@@ -63,26 +83,61 @@ int memread_dump(pid_t pid, const char *out_path, int rw_only,
 
         if (readable && !shared && (!rw_only || writable) &&
             size <= (mach_vm_size_t)(512ULL * 1024 * 1024)) {
-            void *buf = malloc((size_t)size);
-            if (buf) {
+            regions++;
+            mach_vm_address_t off = 0;
+            while (off < size) {
+                mach_vm_size_t cur = (size - off > CHUNK) ? CHUNK : (size - off);
                 mach_vm_size_t got = 0;
-                kr = mach_vm_read_overwrite(task, addr, size,
+                kr = mach_vm_read_overwrite(task, addr + off, cur,
                                             (mach_vm_address_t)buf, &got);
-                if (kr == KERN_SUCCESS && got == size) {
-                    fwrite(buf, 1, (size_t)size, f);
-                    total += size;
-                    regions++;
-                    if (progress) progress(total, ctx);
+                int ok = (kr == KERN_SUCCESS && got == cur);
+                int skipped = 0;
+                if (ok) {
+                    if (all_zero(buf, (size_t)cur)) {
+                        skipped = 1;
+                        skipped_total += cur;
+                    } else {
+                        fwrite(buf, 1, (size_t)cur, f);
+                        total += cur;
+                    }
                 }
-                free(buf);
+                if (cb) cb((unsigned long long)(addr + off),
+                           (unsigned long long)cur,
+                           total, skipped, ctx);
+                off += cur;
             }
         }
         addr += size;
     }
 
+    free(buf);
     fclose(f);
-    fprintf(stderr, "读取完成: %llu 字节, %d 个区域 -> %s\n", total, regions, out_path);
+    fprintf(stderr, "读取完成: %llu 字节写入, %llu 字节零页跳过, %d 个区域 -> %s\n",
+            total, skipped_total, regions, out_path);
     return total > 0 ? 0 : -3;
+}
+
+// 旧接口适配：把详细回调降级成累计字节回调
+struct cb_wrap {
+    void (*progress)(unsigned long long, void *);
+    void *ctx;
+};
+
+static void wrap_cb(unsigned long long addr, unsigned long long chunk,
+                    unsigned long long total, int skipped, void *ctx) {
+    (void)addr; (void)chunk; (void)skipped;
+    struct cb_wrap *w = (struct cb_wrap *)ctx;
+    if (w && w->progress) w->progress(total, w->ctx);
+}
+
+int memread_dump(pid_t pid, const char *out_path, int rw_only,
+                 void (*progress)(unsigned long long done, void *ctx), void *ctx) {
+    struct cb_wrap w;
+    w.progress = progress;
+    w.ctx = ctx;
+    return memread_dump_ex(pid, out_path, rw_only,
+                           progress ? wrap_cb : NULL,
+                           progress ? &w : NULL);
 }
 
 int memread_list_procs(pid_t *pids, int max) {

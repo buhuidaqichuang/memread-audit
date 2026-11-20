@@ -9,9 +9,21 @@
 @property (nonatomic, strong) UILabel *bundleLabel;
 @property (nonatomic, strong) UILabel *dataLabel;
 @property (nonatomic, strong) UILabel *resultLabel;
+@property (nonatomic, strong) UITextView *logView;
 @property (nonatomic, strong) UIActivityIndicatorView *spinner;
 @property (nonatomic, assign) pid_t currentPid;
+- (void)appendLogLine:(unsigned long long)addr
+                chunk:(unsigned long long)chunk
+                total:(unsigned long long)total
+              skipped:(int)skipped;
 @end
+
+// 读取过程中的实时回调（在后台线程触发，内部切到主线程刷 UI）
+static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
+                           unsigned long long total, int skipped, void *ctx) {
+    DetailViewController *vc = (__bridge DetailViewController *)ctx;
+    [vc appendLogLine:addr chunk:chunk total:total skipped:skipped];
+}
 
 @implementation DetailViewController
 
@@ -46,6 +58,21 @@
     [self addButton:@"读取内存 (rw-only, 无注入)" width:W y:&y sel:@selector(onRead)];
     [self addButton:@"用指定 PID 读取" width:W y:&y sel:@selector(onManualPid)];
     [self addButton:@"把信息写入 Media" width:W y:&y sel:@selector(onSave)];
+
+    // 实时内存读取面板
+    UILabel *logTitle = [self addLabel:@"实时读取（地址 / 块大小 / 累计）" width:W y:&y];
+    logTitle.font = [UIFont boldSystemFontOfSize:13];
+
+    self.logView = [[UITextView alloc] initWithFrame:CGRectMake(20, y, W - 40, 240)];
+    self.logView.editable = NO;
+    self.logView.selectable = YES;
+    self.logView.font = [UIFont fontWithName:@"Menlo" size:10] ?: [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
+    self.logView.backgroundColor = [UIColor secondarySystemBackgroundColor];
+    self.logView.layer.cornerRadius = 8;
+    self.logView.layer.masksToBounds = YES;
+    self.logView.text = @"等待读取…";
+    [self.scroll addSubview:self.logView];
+    y += 252;
 
     self.scroll.contentSize = CGSizeMake(W, y + 40);
 }
@@ -133,23 +160,47 @@
     [self performSelector:@selector(onFind) withObject:nil afterDelay:2.5];
 }
 
+- (void)appendLogLine:(unsigned long long)addr chunk:(unsigned long long)chunk
+                total:(unsigned long long)total skipped:(int)skipped {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!self.isViewLoaded) return;
+        NSString *line = [NSString stringWithFormat:@"0x%08llX  +%.1fMB  %@累计 %.1fMB\n",
+                          addr, chunk / 1048576.0,
+                          skipped ? @"[零页跳过] " : @"",
+                          total / 1048576.0];
+        NSString *txt = [self.logView.text stringByAppendingString:line];
+        if (txt.length > 60000) {
+            txt = [@"…\n" stringByAppendingString:[txt substringFromIndex:txt.length - 40000]];
+        }
+        self.logView.text = txt;
+        [self.logView scrollRangeToVisible:NSMakeRange(self.logView.text.length - 1, 1)];
+    });
+}
+
 - (void)readPid:(pid_t)pid {
     if (pid <= 0) { self.resultLabel.text = @"PID 无效"; return; }
     self.currentPid = pid;
     self.pidLabel.text = [NSString stringWithFormat:@"PID: %d", pid];
     [self.spinner startAnimating];
+    self.logView.text = [NSString stringWithFormat:@"开始读取 pid=%d\n", pid];
     self.resultLabel.text = @"读取中（无注入、无 ptrace）...";
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        int rc = memread_dump(pid, "/var/mobile/Media/memread_dump.bin", 1, NULL, NULL);
+        int rc = memread_dump_ex(pid, "/var/mobile/Media/memread_dump.bin", 1,
+                                 DetailRegionCb, (__bridge void *)self);
         unsigned long long size = 0;
         NSDictionary *attrs = [[NSFileManager defaultManager]
                                attributesOfItemAtPath:@"/var/mobile/Media/memread_dump.bin" error:nil];
         size = [attrs[NSFileSize] unsignedLongLongValue];
         dispatch_async(dispatch_get_main_queue(), ^{
             [self.spinner stopAnimating];
+            NSString *line = [NSString stringWithFormat:@"结束 rc=%d，文件 %.1f MB\n",
+                              rc, size / 1048576.0];
+            self.logView.text = [self.logView.text stringByAppendingString:line];
+            [self.logView scrollRangeToVisible:NSMakeRange(self.logView.text.length - 1, 1)];
             self.resultLabel.text = [NSString stringWithFormat:
-                @"完成 rc=%d\n%llu 字节\n/var/mobile/Media/memread_dump.bin", rc, size];
+                @"完成 rc=%d\n%.1f MB\n/var/mobile/Media/memread_dump.bin",
+                rc, size / 1048576.0];
         });
     });
 }
