@@ -35,11 +35,10 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
     }];
 }
 
-@interface ViewController () <UITableViewDataSource, UITableViewDelegate, UISearchResultsUpdating>
+@interface ViewController () <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, strong) UITableView *table;
-@property (nonatomic, strong) UISearchController *searchController;
 @property (nonatomic, strong) NSMutableArray *allApps;
-@property (nonatomic, strong) NSMutableArray *filtered;
+@property (nonatomic, strong) NSArray *sections;   // @{@"title":字母, @"apps":@[app...]}
 @property (nonatomic, strong) NSMutableDictionary *iconCache;
 @end
 
@@ -49,41 +48,26 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
     [super viewDidLoad];
     self.title = @"选择要读取的 App";
     self.allApps = [NSMutableArray array];
-    self.filtered = [NSMutableArray array];
     self.iconCache = [NSMutableDictionary dictionary];
+    self.sections = @[];
 
     self.table = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStylePlain];
     self.table.dataSource = self;
     self.table.delegate = self;
-    self.table.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
     self.table.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [self.view addSubview:self.table];
 
-    // 用系统 UISearchController：位置由导航栏管理，不会被状态栏压住
-    self.searchController = [[UISearchController alloc] initWithSearchResultsController:nil];
-    self.searchController.searchResultsUpdater = self;
-    self.searchController.obscuresBackgroundDuringPresentation = NO;
-    self.searchController.searchBar.placeholder = @"搜索名字或 Bundle ID";
-    // 关闭候选栏/自动纠错：切输入法时候选栏的 CoreImage 样式化在本机越狱环境下会崩
-    self.searchController.searchBar.autocorrectionType = UITextAutocorrectionTypeNo;
-    self.searchController.searchBar.spellCheckingType = UITextSpellCheckingTypeNo;
-    self.searchController.searchBar.autocapitalizationType = UITextAutocapitalizationTypeNone;
-    self.searchController.searchBar.smartQuotesType = UITextSmartQuotesTypeNo;
-    self.searchController.searchBar.smartDashesType = UITextSmartDashesTypeNo;
-    self.navigationItem.searchController = self.searchController;
-    self.navigationItem.hidesSearchBarWhenScrolling = NO;
-    self.definesPresentationContext = YES;
-
-    self.navigationItem.rightBarButtonItem =
-        [[UIBarButtonItem alloc] initWithTitle:@"手动"
-                                         style:UIBarButtonItemStylePlain
-                                        target:self
-                                        action:@selector(onManual)];
+    // 不用任何系统键盘输入：本机越狱环境下键盘候选栏会触发 CoreImage 崩溃
     self.navigationItem.leftBarButtonItem =
         [[UIBarButtonItem alloc] initWithTitle:@"结果"
                                          style:UIBarButtonItemStylePlain
                                         target:self
                                         action:@selector(onFiles)];
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"剪贴板"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self
+                                        action:@selector(onClipboard)];
 
     [self loadApps];
 }
@@ -124,26 +108,38 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
         }];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.allApps = arr;
-            [self applyFilter];
+            [self buildSections];
         });
     });
 }
 
-- (void)applyFilter {
-    NSString *q = [self.searchController.searchBar.text lowercaseString];
-    [self.filtered removeAllObjects];
+// 按首字母分节，配 UITableView 右侧索引条（点字母跳转，不弹键盘）
+- (void)buildSections {
+    NSMutableDictionary *byLetter = [NSMutableDictionary dictionary];
     for (NSDictionary *d in self.allApps) {
-        if (q.length == 0 ||
-            [[d[@"name"] lowercaseString] containsString:q] ||
-            [[d[@"bid"] lowercaseString] containsString:q]) {
-            [self.filtered addObject:d];
+        NSString *name = d[@"name"] ?: @"";
+        NSString *key = @"#";
+        if (name.length) {
+            unichar c = [name characterAtIndex:0];
+            if ([[NSCharacterSet letterCharacterSet] characterIsMember:c]) {
+                key = [[name substringToIndex:1] uppercaseString];
+            }
         }
+        NSMutableArray *arr = byLetter[key];
+        if (!arr) { arr = [NSMutableArray array]; byLetter[key] = arr; }
+        [arr addObject:d];
     }
+    NSMutableArray *ordered = [NSMutableArray array];
+    NSArray *keys = [[byLetter allKeys] sortedUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+        if ([a isEqualToString:@"#"]) return NSOrderedDescending;
+        if ([b isEqualToString:@"#"]) return NSOrderedAscending;
+        return [a compare:b];
+    }];
+    for (NSString *k in keys) {
+        [ordered addObject:@{@"title": k, @"apps": byLetter[k]}];
+    }
+    self.sections = ordered;
     [self.table reloadData];
-}
-
-- (void)updateSearchResultsForSearchController:(UISearchController *)searchController {
-    [self applyFilter];
 }
 
 // 结果页：App 内浏览/删除 Media 下的 memread_* 文件
@@ -152,32 +148,48 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
     [self.navigationController pushViewController:vc animated:YES];
 }
 
-// 兜底：直接粘贴 bundle id，绕开列表枚举
-- (void)onManual {
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"手动输入 Bundle ID"
-                                                              message:@"粘贴目标 App 的 bundle id"
-                                                       preferredStyle:UIAlertControllerStyleAlert];
-    [a addTextFieldWithConfigurationHandler:^(UITextField *t) {
-        t.placeholder = @"com.example.xxx";
-        t.autocapitalizationType = UITextAutocapitalizationTypeNone;
-        t.autocorrectionType = UITextAutocorrectionTypeNo;
-        t.spellCheckingType = UITextSpellCheckingTypeNo;
-        t.smartQuotesType = UITextSmartQuotesTypeNo;
-        t.smartDashesType = UITextSmartDashesTypeNo;
-        t.clearButtonMode = UITextFieldViewModeWhileEditing;
-    }];
-    __weak typeof(self) weakSelf = self;
-    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [a addAction:[UIAlertAction actionWithTitle:@"打开" style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
-        NSString *bid = a.textFields.firstObject.text;
-        bid = [bid stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (!bid.length) return;
-        NSDictionary *info = [weakSelf infoForBundleID:bid];
+// 无键盘手动入口：从剪贴板取 bundle id 或 PID
+- (void)onClipboard {
+    NSString *raw = [UIPasteboard generalPasteboard].string;
+    NSString *s = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (!s.length) {
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"剪贴板是空的"
+                                                                  message:@"先在别处复制 App 的 bundle id（含点）或十进制 PID，再点这里"
+                                                           preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
+        return;
+    }
+
+    BOOL allDigits = YES;
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        if (c < '0' || c > '9') { allDigits = NO; break; }
+    }
+
+    if (allDigits) {
+        pid_t pid = (pid_t)[s intValue];
         DetailViewController *dvc = [[DetailViewController alloc] init];
-        dvc.info = info;
-        [weakSelf.navigationController pushViewController:dvc animated:YES];
-    }]];
-    [self presentViewController:a animated:YES completion:nil];
+        dvc.info = @{@"bid": @"", @"name": [NSString stringWithFormat:@"直接读 PID %d", pid],
+                     @"bundlePath": @"", @"dataPath": @""};
+        dvc.initialPid = pid;
+        [self.navigationController pushViewController:dvc animated:YES];
+        return;
+    }
+
+    if ([s rangeOfString:@" "].location != NSNotFound || s.length > 200) {
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"剪贴板内容不像 bundle id"
+                                                                  message:s
+                                                           preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
+        return;
+    }
+
+    NSDictionary *info = [self infoForBundleID:s];
+    DetailViewController *dvc = [[DetailViewController alloc] init];
+    dvc.info = info;
+    [self.navigationController pushViewController:dvc animated:YES];
 }
 
 - (NSDictionary *)infoForBundleID:(NSString *)bid {
@@ -203,14 +215,35 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
     };
 }
 
+#pragma mark - UITableView
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
+    return (NSInteger)self.sections.count;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    return self.sections[section][@"title"];
+}
+
+- (NSArray<NSString *> *)sectionIndexTitlesForTableView:(UITableView *)tableView {
+    NSMutableArray *t = [NSMutableArray array];
+    for (NSDictionary *d in self.sections) [t addObject:d[@"title"]];
+    return t;
+}
+
+- (NSInteger)tableView:(UITableView *)tableView sectionForSectionIndexTitle:(NSString *)title atIndex:(NSInteger)index {
+    return index;
+}
+
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return self.filtered.count;
+    NSArray *apps = self.sections[section][@"apps"];
+    return (NSInteger)apps.count;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *c = [tableView dequeueReusableCellWithIdentifier:@"c"];
     if (!c) c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"c"];
-    NSDictionary *d = self.filtered[indexPath.row];
+    NSDictionary *d = self.sections[indexPath.section][@"apps"][indexPath.row];
     c.textLabel.text = d[@"name"];
     c.detailTextLabel.text = d[@"bid"];
 
@@ -229,7 +262,7 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     DetailViewController *dvc = [[DetailViewController alloc] init];
-    dvc.info = self.filtered[indexPath.row];
+    dvc.info = self.sections[indexPath.section][@"apps"][indexPath.row];
     [self.navigationController pushViewController:dvc animated:YES];
 }
 

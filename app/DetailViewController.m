@@ -57,7 +57,7 @@ static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
     [self addButton:@"启动 App" width:W y:&y sel:@selector(onLaunch)];
     [self addButton:@"读取内存 (rw-only, 无注入)" width:W y:&y sel:@selector(onRead)];
     [self addButton:@"扫描敏感数据 (不落盘, 出报告)" width:W y:&y sel:@selector(onScan)];
-    [self addButton:@"用指定 PID 读取" width:W y:&y sel:@selector(onManualPid)];
+    [self addButton:@"从剪贴板取 PID 读取" width:W y:&y sel:@selector(onManualPid)];
     [self addButton:@"把信息写入 Media" width:W y:&y sel:@selector(onSave)];
 
     // 实时内存读取面板
@@ -76,6 +76,14 @@ static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
     y += 252;
 
     self.scroll.contentSize = CGSizeMake(W, y + 40);
+
+    if (self.initialPid > 0) {
+        __weak typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [weakSelf readPid:weakSelf.initialPid];
+        });
+    }
 }
 
 - (UILabel *)addLabel:(NSString *)text width:(CGFloat)W y:(CGFloat *)y {
@@ -248,24 +256,20 @@ static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
     });
 }
 
-// 手动填 PID：绕过查找逻辑，直接读
+// 手动 PID：从剪贴板取（不用系统键盘，避开键盘候选栏的 CoreImage 崩溃）
 - (void)onManualPid {
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"输入 PID"
-                                                              message:@"填目标进程的 PID（十进制）"
-                                                       preferredStyle:UIAlertControllerStyleAlert];
-    [a addTextFieldWithConfigurationHandler:^(UITextField *t) {
-        t.placeholder = @"例如 1234";
-        t.keyboardType = UIKeyboardTypeNumberPad;
-    }];
-    __weak typeof(self) weakSelf = self;
-    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [a addAction:[UIAlertAction actionWithTitle:@"读取" style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
-        NSString *s = a.textFields.firstObject.text;
-        s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        pid_t pid = (pid_t)[s intValue];
-        [weakSelf readPid:pid];
-    }]];
-    [self presentViewController:a animated:YES completion:nil];
+    NSString *raw = [UIPasteboard generalPasteboard].string;
+    NSString *s = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (!s.length) {
+        self.resultLabel.text = @"剪贴板为空：先复制 PID";
+        return;
+    }
+    pid_t pid = (pid_t)[s intValue];
+    if (pid <= 0) {
+        self.resultLabel.text = @"剪贴板内容不是有效 PID";
+        return;
+    }
+    [self readPid:pid];
 }
 
 - (void)onSave {
