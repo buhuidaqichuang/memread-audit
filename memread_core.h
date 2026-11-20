@@ -27,6 +27,12 @@ typedef void (*memread_region_cb)(unsigned long long addr,
 int memread_dump_ex(pid_t pid, const char *out_path, int rw_only,
                     memread_region_cb cb, void *ctx);
 
+// 扫描模式：不落全量 dump，只把命中的敏感数据按 A/B/C/D 分级写入 out_path
+// label 用于报告头（通常是目标 bundle id）；返回 0 成功，hits 回填各档数量（可为 NULL）
+int memread_scan_ex(pid_t pid, const char *out_path, const char *label, int rw_only,
+                    memread_region_cb cb, void *ctx,
+                    unsigned long long hits[4]);
+
 // 兼容旧签名：只有累计字节的进度回调
 int memread_dump(pid_t pid, const char *out_path, int rw_only,
                  void (*progress)(unsigned long long done, void *ctx), void *ctx);

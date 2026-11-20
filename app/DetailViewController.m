@@ -56,6 +56,7 @@ static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
     [self addButton:@"查找 PID" width:W y:&y sel:@selector(onFind)];
     [self addButton:@"启动 App" width:W y:&y sel:@selector(onLaunch)];
     [self addButton:@"读取内存 (rw-only, 无注入)" width:W y:&y sel:@selector(onRead)];
+    [self addButton:@"扫描敏感数据 (不落盘, 出报告)" width:W y:&y sel:@selector(onScan)];
     [self addButton:@"用指定 PID 读取" width:W y:&y sel:@selector(onManualPid)];
     [self addButton:@"把信息写入 Media" width:W y:&y sel:@selector(onSave)];
 
@@ -209,6 +210,40 @@ static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
     pid_t pid = [self findPid];
     if (pid <= 0) { self.resultLabel.text = @"目标未运行，请先启动"; return; }
     [self readPid:pid];
+}
+
+// 扫描模式：不落盘，只输出分级报告
+- (void)onScan {
+    pid_t pid = [self findPid];
+    if (pid <= 0) { self.resultLabel.text = @"目标未运行，请先启动"; return; }
+    [self scanPid:pid];
+}
+
+- (void)scanPid:(pid_t)pid {
+    if (pid <= 0) { self.resultLabel.text = @"PID 无效"; return; }
+    self.currentPid = pid;
+    self.pidLabel.text = [NSString stringWithFormat:@"PID: %d", pid];
+    [self.spinner startAnimating];
+    self.logView.text = [NSString stringWithFormat:@"开始扫描 pid=%d\n", pid];
+    self.resultLabel.text = @"扫描中（不写 dump）...";
+
+    NSString *label = self.info[@"bid"] ?: @"(unknown)";
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        unsigned long long hits[4] = {0, 0, 0, 0};
+        int rc = memread_scan_ex(pid, "/var/mobile/Media/memread_scan.txt",
+                                 label.UTF8String, 1, DetailRegionCb,
+                                 (__bridge void *)self, hits);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self.spinner stopAnimating];
+            NSString *summary = [NSString stringWithFormat:
+                @"扫描完成 rc=%d   A=%llu B=%llu C=%llu D=%llu",
+                rc, hits[0], hits[1], hits[2], hits[3]];
+            self.logView.text = [self.logView.text stringByAppendingFormat:@"%@\n", summary];
+            [self.logView scrollRangeToVisible:NSMakeRange(self.logView.text.length - 1, 1)];
+            self.resultLabel.text = [NSString stringWithFormat:
+                @"%@\n报告: /var/mobile/Media/memread_scan.txt", summary];
+        });
+    });
 }
 
 // 手动填 PID：绕过查找逻辑，直接读
