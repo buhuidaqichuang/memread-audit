@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   # 形态一：命令行二进制（NewTerm + sudo 使用）
   binary:
@@ -93,3 +96,13 @@ jobs:
             build/memread.ipa
             build/ent.plist
           if-no-files-found: error
+
+      # 固定 tag 的 release：设备侧 update.sh 直接从这里拉最新 ipa
+      - name: Publish latest release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: MemRead latest
+          prerelease: true
+          files: build/memread.ipa

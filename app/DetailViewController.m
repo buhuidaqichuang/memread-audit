@@ -44,6 +44,7 @@
     [self addButton:@"查找 PID" width:W y:&y sel:@selector(onFind)];
     [self addButton:@"启动 App" width:W y:&y sel:@selector(onLaunch)];
     [self addButton:@"读取内存 (rw-only, 无注入)" width:W y:&y sel:@selector(onRead)];
+    [self addButton:@"用指定 PID 读取" width:W y:&y sel:@selector(onManualPid)];
     [self addButton:@"把信息写入 Media" width:W y:&y sel:@selector(onSave)];
 
     self.scroll.contentSize = CGSizeMake(W, y + 40);
@@ -70,8 +71,25 @@
     *y += 48;
 }
 
+// bundlePath 可能为空（手动输入 bundle id 时），此时用 LaunchServices 反查
+- (NSString *)resolveBundlePath {
+    NSString *p = self.info[@"bundlePath"];
+    if (p.length) return p;
+    Class cls = NSClassFromString(@"LSApplicationWorkspace");
+    if (!cls) return nil;
+    id ws = [cls performSelector:NSSelectorFromString(@"defaultWorkspace")];
+    SEL sApp = NSSelectorFromString(@"applicationForBundleIdentifier:");
+    if (![ws respondsToSelector:sApp]) return nil;
+    id proxy = [ws performSelector:sApp withObject:self.info[@"bid"]];
+    if (!proxy) return nil;
+    SEL sBundle = NSSelectorFromString(@"bundleURL");
+    if (![proxy respondsToSelector:sBundle]) return nil;
+    NSURL *u = [proxy performSelector:sBundle];
+    return u.path;
+}
+
 - (pid_t)findPid {
-    NSString *bundlePath = self.info[@"bundlePath"];
+    NSString *bundlePath = [self resolveBundlePath];
     if (!bundlePath.length) return 0;
     NSBundle *b = [NSBundle bundleWithPath:bundlePath];
     NSString *exeName = [b objectForInfoDictionaryKey:@"CFBundleExecutable"];
@@ -115,9 +133,8 @@
     [self performSelector:@selector(onFind) withObject:nil afterDelay:2.5];
 }
 
-- (void)onRead {
-    pid_t pid = [self findPid];
-    if (pid <= 0) { self.resultLabel.text = @"目标未运行，请先启动"; return; }
+- (void)readPid:(pid_t)pid {
+    if (pid <= 0) { self.resultLabel.text = @"PID 无效"; return; }
     self.currentPid = pid;
     self.pidLabel.text = [NSString stringWithFormat:@"PID: %d", pid];
     [self.spinner startAnimating];
@@ -135,6 +152,32 @@
                 @"完成 rc=%d\n%llu 字节\n/var/mobile/Media/memread_dump.bin", rc, size];
         });
     });
+}
+
+- (void)onRead {
+    pid_t pid = [self findPid];
+    if (pid <= 0) { self.resultLabel.text = @"目标未运行，请先启动"; return; }
+    [self readPid:pid];
+}
+
+// 手动填 PID：绕过查找逻辑，直接读
+- (void)onManualPid {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"输入 PID"
+                                                              message:@"填目标进程的 PID（十进制）"
+                                                       preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *t) {
+        t.placeholder = @"例如 1234";
+        t.keyboardType = UIKeyboardTypeNumberPad;
+    }];
+    __weak typeof(self) weakSelf = self;
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"读取" style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
+        NSString *s = a.textFields.firstObject.text;
+        s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        pid_t pid = (pid_t)[s intValue];
+        [weakSelf readPid:pid];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 - (void)onSave {

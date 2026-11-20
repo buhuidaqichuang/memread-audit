@@ -13,7 +13,7 @@ static UIImage *MemReadIconForBundle(NSString *bid) {
     [inv setTarget:ui];
     [inv setSelector:s];
     NSString *b = bid;
-    int fmt = 2;          // 2 = 完整尺寸图标
+    int fmt = 2;
     CGFloat sc = 2.0;
     [inv setArgument:&b atIndex:2];
     [inv setArgument:&fmt atIndex:3];
@@ -34,9 +34,9 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
     }];
 }
 
-@interface ViewController () <UITableViewDataSource, UITableViewDelegate, UISearchBarDelegate>
+@interface ViewController () <UITableViewDataSource, UITableViewDelegate, UISearchResultsUpdating>
 @property (nonatomic, strong) UITableView *table;
-@property (nonatomic, strong) UISearchBar *search;
+@property (nonatomic, strong) UISearchController *searchController;
 @property (nonatomic, strong) NSMutableArray *allApps;
 @property (nonatomic, strong) NSMutableArray *filtered;
 @property (nonatomic, strong) NSMutableDictionary *iconCache;
@@ -51,24 +51,29 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
     self.filtered = [NSMutableArray array];
     self.iconCache = [NSMutableDictionary dictionary];
 
-    self.search = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 50)];
-    self.search.delegate = self;
-    self.search.placeholder = @"搜索名字或 Bundle ID";
-    [self.view addSubview:self.search];
-
     self.table = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStylePlain];
     self.table.dataSource = self;
     self.table.delegate = self;
     self.table.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
+    self.table.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [self.view addSubview:self.table];
 
-    [self loadApps];
-}
+    // 用系统 UISearchController：位置由导航栏管理，不会被状态栏压住
+    self.searchController = [[UISearchController alloc] initWithSearchResultsController:nil];
+    self.searchController.searchResultsUpdater = self;
+    self.searchController.obscuresBackgroundDuringPresentation = NO;
+    self.searchController.searchBar.placeholder = @"搜索名字或 Bundle ID";
+    self.navigationItem.searchController = self.searchController;
+    self.navigationItem.hidesSearchBarWhenScrolling = NO;
+    self.definesPresentationContext = YES;
 
-- (void)viewDidLayoutSubviews {
-    [super viewDidLayoutSubviews];
-    self.search.frame = CGRectMake(0, 0, self.view.bounds.size.width, 50);
-    self.table.frame = CGRectMake(0, 50, self.view.bounds.size.width, self.view.bounds.size.height - 50);
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"手动"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self
+                                        action:@selector(onManual)];
+
+    [self loadApps];
 }
 
 - (void)loadApps {
@@ -113,7 +118,7 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
 }
 
 - (void)applyFilter {
-    NSString *q = [self.search.text lowercaseString];
+    NSString *q = [self.searchController.searchBar.text lowercaseString];
     [self.filtered removeAllObjects];
     for (NSDictionary *d in self.allApps) {
         if (q.length == 0 ||
@@ -125,12 +130,56 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
     [self.table reloadData];
 }
 
-- (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText {
+- (void)updateSearchResultsForSearchController:(UISearchController *)searchController {
     [self applyFilter];
 }
 
-- (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar {
-    [searchBar resignFirstResponder];
+// 兜底：直接粘贴 bundle id，绕开列表枚举
+- (void)onManual {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"手动输入 Bundle ID"
+                                                              message:@"粘贴目标 App 的 bundle id"
+                                                       preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *t) {
+        t.placeholder = @"com.example.xxx";
+        t.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        t.autocorrectionType = UITextAutocorrectionTypeNo;
+        t.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    __weak typeof(self) weakSelf = self;
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"打开" style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
+        NSString *bid = a.textFields.firstObject.text;
+        bid = [bid stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (!bid.length) return;
+        NSDictionary *info = [weakSelf infoForBundleID:bid];
+        DetailViewController *dvc = [[DetailViewController alloc] init];
+        dvc.info = info;
+        [weakSelf.navigationController pushViewController:dvc animated:YES];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (NSDictionary *)infoForBundleID:(NSString *)bid {
+    NSDictionary *fallback = @{@"bid": bid, @"name": bid, @"bundlePath": @"", @"dataPath": @""};
+    Class cls = NSClassFromString(@"LSApplicationWorkspace");
+    if (!cls) return fallback;
+    id ws = [cls performSelector:NSSelectorFromString(@"defaultWorkspace")];
+    SEL sApp = NSSelectorFromString(@"applicationForBundleIdentifier:");
+    if (![ws respondsToSelector:sApp]) return fallback;
+    id proxy = [ws performSelector:sApp withObject:bid];
+    if (!proxy) return fallback;
+    NSURL *bundleURL = [proxy respondsToSelector:NSSelectorFromString(@"bundleURL")]
+                       ? [proxy performSelector:NSSelectorFromString(@"bundleURL")] : nil;
+    NSURL *dataURL = [proxy respondsToSelector:NSSelectorFromString(@"dataContainerURL")]
+                     ? [proxy performSelector:NSSelectorFromString(@"dataContainerURL")] : nil;
+    NSString *name = [proxy respondsToSelector:NSSelectorFromString(@"localizedName")]
+                     ? [proxy performSelector:NSSelectorFromString(@"localizedName")] : bid;
+    return @{
+        @"bid": bid,
+        @"name": name ?: bid,
+        @"bundlePath": bundleURL.path ?: @"",
+        @"dataPath": dataURL.path ?: @""
+    };
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
