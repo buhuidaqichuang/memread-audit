@@ -69,6 +69,12 @@ jobs:
           file build/Payload/memread.app/memread
           cp app/Info.plist build/Payload/memread.app/Info.plist
           cp ent.plist build/ent.plist
+          # 生成各尺寸图标（源图 1024）
+          for spec in "AppIcon60x60@2x.png 120" "AppIcon60x60@3x.png 180" "AppIcon76x76@2x~ipad.png 152" "AppIcon83.5x83.5@2x~ipad.png 167" "AppIcon1024.png 1024"; do
+            set -- $spec
+            sips -z "$2" "$2" app/AppIcon1024.png --out "build/Payload/memread.app/$1" >/dev/null
+          done
+          ls -l build/Payload/memread.app
 
       - name: Codesign app bundle with entitlements
         run: |

@@ -63,6 +63,12 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
     self.searchController.searchResultsUpdater = self;
     self.searchController.obscuresBackgroundDuringPresentation = NO;
     self.searchController.searchBar.placeholder = @"搜索名字或 Bundle ID";
+    // 关闭候选栏/自动纠错：切输入法时候选栏的 CoreImage 样式化在本机越狱环境下会崩
+    self.searchController.searchBar.autocorrectionType = UITextAutocorrectionTypeNo;
+    self.searchController.searchBar.spellCheckingType = UITextSpellCheckingTypeNo;
+    self.searchController.searchBar.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    self.searchController.searchBar.smartQuotesType = UITextSmartQuotesTypeNo;
+    self.searchController.searchBar.smartDashesType = UITextSmartDashesTypeNo;
     self.navigationItem.searchController = self.searchController;
     self.navigationItem.hidesSearchBarWhenScrolling = NO;
     self.definesPresentationContext = YES;
@@ -143,6 +149,9 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
         t.placeholder = @"com.example.xxx";
         t.autocapitalizationType = UITextAutocapitalizationTypeNone;
         t.autocorrectionType = UITextAutocorrectionTypeNo;
+        t.spellCheckingType = UITextSpellCheckingTypeNo;
+        t.smartQuotesType = UITextSmartQuotesTypeNo;
+        t.smartDashesType = UITextSmartDashesTypeNo;
         t.clearButtonMode = UITextFieldViewModeWhileEditing;
     }];
     __weak typeof(self) weakSelf = self;
