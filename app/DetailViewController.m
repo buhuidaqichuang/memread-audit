@@ -233,11 +233,13 @@ static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
         int rc = memread_scan_ex(pid, "/var/mobile/Media/memread_scan.txt",
                                  label.UTF8String, 1, DetailRegionCb,
                                  (__bridge void *)self, hits);
+        // block 不能捕获数组，先转成标量
+        unsigned long long a = hits[0], b = hits[1], c = hits[2], d = hits[3];
         dispatch_async(dispatch_get_main_queue(), ^{
             [self.spinner stopAnimating];
             NSString *summary = [NSString stringWithFormat:
                 @"扫描完成 rc=%d   A=%llu B=%llu C=%llu D=%llu",
-                rc, hits[0], hits[1], hits[2], hits[3]];
+                rc, a, b, c, d];
             self.logView.text = [self.logView.text stringByAppendingFormat:@"%@\n", summary];
             [self.logView scrollRangeToVisible:NSMakeRange(self.logView.text.length - 1, 1)];
             self.resultLabel.text = [NSString stringWithFormat:
