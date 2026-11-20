@@ -130,7 +130,7 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
         [arr addObject:d];
     }
     NSMutableArray *ordered = [NSMutableArray array];
-    NSArray *keys = [[byLetter allKeys] sortedUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+    NSArray *keys = [[byLetter allKeys] sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
         if ([a isEqualToString:@"#"]) return NSOrderedDescending;
         if ([b isEqualToString:@"#"]) return NSOrderedAscending;
         return [a compare:b];
