@@ -1,4 +1,5 @@
 #import "FilesViewController.h"
+#import "DumpViewController.h"
 
 static NSString *const kMediaDir = @"/var/mobile/Media";
 
@@ -99,13 +100,10 @@ static NSString *const kMediaDir = @"/var/mobile/Media";
         self.navigationItem.backButtonTitle = @"返回";
         [self.navigationController pushViewController:vc animated:YES];
     } else {
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:name
-            message:[NSString stringWithFormat:@"二进制文件，%@。\n路径: %@", [self sizeText:d[@"size"]], path]
-            preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]];
-        [a addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive
-                                            handler:^(UIAlertAction *act) { [self deleteRow:indexPath]; }]];
-        [self presentViewController:a animated:YES completion:nil];
+        // 二进制 dump：进十六进制浏览页（分页读，不会把 842MB 全读进内存）
+        DumpViewController *vc = [[DumpViewController alloc] init];
+        vc.path = path;
+        [self.navigationController pushViewController:vc animated:YES];
     }
 }
 

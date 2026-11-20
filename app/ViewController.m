@@ -25,6 +25,20 @@ static UIImage *MemReadIconForBundle(NSString *bid) {
     return (UIImage *)ret;
 }
 
+// 备用：直接从 App 包内读图标文件（私有 API 失败时兜底）
+static UIImage *MemReadIconFromBundlePath(NSString *bundlePath) {
+    if (!bundlePath.length) return nil;
+    NSArray *names = @[@"AppIcon60x60@2x.png", @"AppIcon60x60@3x.png",
+                      @"AppIcon76x76@2x~ipad.png", @"AppIcon83.5x83.5@2x~ipad.png",
+                      @"Icon-60@2x.png", @"Icon-72@2x.png", @"Icon.png"];
+    for (NSString *n in names) {
+        NSString *p = [bundlePath stringByAppendingPathComponent:n];
+        UIImage *img = [UIImage imageWithContentsOfFile:p];
+        if (img) return img;
+    }
+    return nil;
+}
+
 // 缩放到固定边长，保证行高稳定
 static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
     if (!img) return nil;
@@ -35,9 +49,11 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
     }];
 }
 
-@interface ViewController () <UITableViewDataSource, UITableViewDelegate>
+@interface ViewController () <UITableViewDataSource, UITableViewDelegate, UISearchResultsUpdating>
 @property (nonatomic, strong) UITableView *table;
+@property (nonatomic, strong) UISearchController *searchController;
 @property (nonatomic, strong) NSMutableArray *allApps;
+@property (nonatomic, strong) NSMutableArray *filtered;   // 搜索命中（扁平）
 @property (nonatomic, strong) NSArray *sections;   // @{@"title":字母, @"apps":@[app...]}
 @property (nonatomic, strong) NSMutableDictionary *iconCache;
 @end
@@ -48,6 +64,7 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
     [super viewDidLoad];
     self.title = @"选择要读取的 App";
     self.allApps = [NSMutableArray array];
+    self.filtered = [NSMutableArray array];
     self.iconCache = [NSMutableDictionary dictionary];
     self.sections = @[];
 
@@ -57,17 +74,26 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
     self.table.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [self.view addSubview:self.table];
 
-    // 不用任何系统键盘输入：本机越狱环境下键盘候选栏会触发 CoreImage 崩溃
-    self.navigationItem.leftBarButtonItem =
+    // 系统搜索框：位置由导航栏管理，不会被状态栏压住
+    self.searchController = [[UISearchController alloc] initWithSearchResultsController:nil];
+    self.searchController.searchResultsUpdater = self;
+    self.searchController.obscuresBackgroundDuringPresentation = NO;
+    self.searchController.searchBar.placeholder = @"搜索名字或 Bundle ID";
+    self.searchController.searchBar.autocorrectionType = UITextAutocorrectionTypeNo;
+    self.searchController.searchBar.spellCheckingType = UITextSpellCheckingTypeNo;
+    self.searchController.searchBar.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    self.searchController.searchBar.smartQuotesType = UITextSmartQuotesTypeNo;
+    self.searchController.searchBar.smartDashesType = UITextSmartDashesTypeNo;
+    self.navigationItem.searchController = self.searchController;
+    self.navigationItem.hidesSearchBarWhenScrolling = NO;
+    self.definesPresentationContext = YES;
+
+    // 结果页放右上，读取产物（dump / 扫描报告）都在这里看和删
+    self.navigationItem.rightBarButtonItem =
         [[UIBarButtonItem alloc] initWithTitle:@"结果"
                                          style:UIBarButtonItemStylePlain
                                         target:self
                                         action:@selector(onFiles)];
-    self.navigationItem.rightBarButtonItem =
-        [[UIBarButtonItem alloc] initWithTitle:@"剪贴板"
-                                         style:UIBarButtonItemStylePlain
-                                        target:self
-                                        action:@selector(onClipboard)];
 
     [self loadApps];
 }
@@ -140,6 +166,28 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
     }
     self.sections = ordered;
     [self.table reloadData];
+    [self applyFilter];
+}
+
+- (BOOL)isSearching {
+    return self.searchController.isActive;
+}
+
+- (void)applyFilter {
+    NSString *q = [self.searchController.searchBar.text lowercaseString];
+    [self.filtered removeAllObjects];
+    for (NSDictionary *d in self.allApps) {
+        if (q.length == 0 ||
+            [[d[@"name"] lowercaseString] containsString:q] ||
+            [[d[@"bid"] lowercaseString] containsString:q]) {
+            [self.filtered addObject:d];
+        }
+    }
+    [self.table reloadData];
+}
+
+- (void)updateSearchResultsForSearchController:(UISearchController *)searchController {
+    [self applyFilter];
 }
 
 // 结果页：App 内浏览/删除 Media 下的 memread_* 文件
@@ -217,15 +265,23 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
 
 #pragma mark - UITableView
 
+- (NSDictionary *)appAt:(NSIndexPath *)indexPath {
+    if ([self isSearching]) return self.filtered[indexPath.row];
+    return self.sections[indexPath.section][@"apps"][indexPath.row];
+}
+
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
+    if ([self isSearching]) return 1;
     return (NSInteger)self.sections.count;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    if ([self isSearching]) return nil;
     return self.sections[section][@"title"];
 }
 
 - (NSArray<NSString *> *)sectionIndexTitlesForTableView:(UITableView *)tableView {
+    if ([self isSearching]) return nil;
     NSMutableArray *t = [NSMutableArray array];
     for (NSDictionary *d in self.sections) [t addObject:d[@"title"]];
     return t;
@@ -236,6 +292,7 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    if ([self isSearching]) return (NSInteger)self.filtered.count;
     NSArray *apps = self.sections[section][@"apps"];
     return (NSInteger)apps.count;
 }
@@ -243,7 +300,7 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *c = [tableView dequeueReusableCellWithIdentifier:@"c"];
     if (!c) c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"c"];
-    NSDictionary *d = self.sections[indexPath.section][@"apps"][indexPath.row];
+    NSDictionary *d = [self appAt:indexPath];
     c.textLabel.text = d[@"name"];
     c.detailTextLabel.text = d[@"bid"];
 
@@ -252,6 +309,7 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
     UIImage *icon = self.iconCache[bid];
     if (!icon) {
         icon = MemReadResizeIcon(MemReadIconForBundle(bid), 36);
+        if (!icon) icon = MemReadResizeIcon(MemReadIconFromBundlePath(d[@"bundlePath"]), 36);
         if (icon) self.iconCache[bid] = icon;
     }
     c.imageView.image = icon;
@@ -262,7 +320,7 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     DetailViewController *dvc = [[DetailViewController alloc] init];
-    dvc.info = self.sections[indexPath.section][@"apps"][indexPath.row];
+    dvc.info = [self appAt:indexPath];
     [self.navigationController pushViewController:dvc animated:YES];
 }
 

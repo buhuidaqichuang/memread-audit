@@ -65,15 +65,24 @@ jobs:
             -I . \
             -framework UIKit -framework Foundation -framework Metal -framework OpenGLES \
             -o build/Payload/memread.app/memread \
-            app/main.m app/AppDelegate.m app/ViewController.m app/DetailViewController.m app/FilesViewController.m memread_core.c
+            app/main.m app/AppDelegate.m app/ViewController.m app/DetailViewController.m app/FilesViewController.m app/DumpViewController.m memread_core.c
           file build/Payload/memread.app/memread
           cp app/Info.plist build/Payload/memread.app/Info.plist
           cp ent.plist build/ent.plist
-          # 生成各尺寸图标（源图 1024）
+          # 生成各尺寸图标（源图 1024），作为 CFBundleIconFiles 的兜底
           for spec in "AppIcon60x60@2x.png 120" "AppIcon60x60@3x.png 180" "AppIcon76x76@2x~ipad.png 152" "AppIcon83.5x83.5@2x~ipad.png 167" "AppIcon1024.png 1024"; do
             set -- $spec
             sips -z "$2" "$2" app/AppIcon1024.png --out "build/Payload/memread.app/$1" >/dev/null
           done
+          # 生成 Assets.car（iOS 17 桌面图标走 asset catalog）
+          mkdir -p app/Assets.xcassets/AppIcon.appiconset
+          sips -z 1024 1024 app/AppIcon1024.png --out app/Assets.xcassets/AppIcon.appiconset/AppIcon1024.png >/dev/null
+          xcrun actool app/Assets.xcassets \
+            --compile build/Payload/memread.app \
+            --platform iphoneos \
+            --minimum-deployment-target 15.0 \
+            --app-icon AppIcon \
+            --output-partial-info-plist build/icon-partial.plist
           ls -l build/Payload/memread.app
 
       - name: Codesign app bundle with entitlements

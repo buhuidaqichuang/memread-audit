@@ -1,4 +1,5 @@
 #import "DetailViewController.h"
+#import "FilesViewController.h"
 #import "memread_core.h"
 
 @interface DetailViewController ()
@@ -59,6 +60,7 @@ static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
     [self addButton:@"扫描敏感数据 (不落盘, 出报告)" width:W y:&y sel:@selector(onScan)];
     [self addButton:@"从剪贴板取 PID 读取" width:W y:&y sel:@selector(onManualPid)];
     [self addButton:@"把信息写入 Media" width:W y:&y sel:@selector(onSave)];
+    [self addButton:@"查看结果文件（dump / 报告）" width:W y:&y sel:@selector(onShowFiles)];
 
     // 实时内存读取面板
     UILabel *logTitle = [self addLabel:@"实时读取（地址 / 块大小 / 累计）" width:W y:&y];
@@ -210,8 +212,21 @@ static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
             self.resultLabel.text = [NSString stringWithFormat:
                 @"完成 rc=%d\n%.1f MB\n/var/mobile/Media/memread_dump.bin",
                 rc, size / 1048576.0];
+
+            UIAlertController *a = [UIAlertController alertControllerWithTitle:@"读取完成"
+                message:[NSString stringWithFormat:@"rc=%d，写入 %.1f MB\ndump 很大，看完可以在「结果」页删掉", rc, size / 1048576.0]
+                preferredStyle:UIAlertControllerStyleAlert];
+            [a addAction:[UIAlertAction actionWithTitle:@"稍后" style:UIAlertActionStyleCancel handler:nil]];
+            [a addAction:[UIAlertAction actionWithTitle:@"去查看" style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *act) { [self onShowFiles]; }]];
+            [self presentViewController:a animated:YES completion:nil];
         });
     });
+}
+
+- (void)onShowFiles {
+    FilesViewController *vc = [[FilesViewController alloc] init];
+    [self.navigationController pushViewController:vc animated:YES];
 }
 
 - (void)onRead {

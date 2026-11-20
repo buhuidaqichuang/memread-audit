@@ -3,6 +3,7 @@
 #import <OpenGLES/EAGL.h>
 #import <mach-o/dyld.h>
 #import <unistd.h>
+#import <dlfcn.h>
 #import "AppDelegate.h"
 
 // 启动自检：把进程身份与 GPU 能力写盘，便于从电脑侧 AFC 直接取回分析
@@ -55,8 +56,26 @@ static void MemReadEnvSelfCheck(void) {
     EAGLContext *gl = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2];
     MemReadEnvLine(@"eagl_es2=%@", gl ? @"OK" : @"NIL");
 
+    // CoreImage 走的是 OpenGL ES；这里记录能否加载驱动与拿到 glGetString
+    void *hGL = dlopen("/System/Library/Frameworks/OpenGLES.framework/OpenGLES", RTLD_NOW | RTLD_GLOBAL);
+    MemReadEnvLine(@"opengles_dlopen=%s", hGL ? "OK" : (dlerror() ?: "NULL"));
+    if (hGL) {
+        MemReadEnvLine(@"glGetString=%p", dlsym(hGL, "glGetString"));
+        MemReadEnvLine(@"glCreateShader=%p", dlsym(hGL, "glCreateShader"));
+    }
+
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     MemReadEnvLine(@"metal_device=%@", dev ? dev.name : @"NIL");
+
+    // 图标资源是否真的进包
+    NSString *b = [[NSBundle mainBundle] bundlePath];
+    NSArray *files = @[@"Assets.car", @"AppIcon60x60@2x.png", @"AppIcon76x76@2x~ipad.png",
+                       @"AppIcon83.5x83.5@2x~ipad.png", @"AppIcon1024.png"];
+    for (NSString *f in files) {
+        BOOL e = [[NSFileManager defaultManager] fileExistsAtPath:[b stringByAppendingPathComponent:f]];
+        MemReadEnvLine(@"file %@=%d", f, e ? 1 : 0);
+    }
+    MemReadEnvLine(@"CFBundleIconName=%@", [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleIconName"] ?: @"(none)");
 
     MemReadEnvLine(@"========== end");
 }
