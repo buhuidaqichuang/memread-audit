@@ -106,7 +106,7 @@ static NSString *MemReadHexPage(NSString *path, unsigned long long offset, unsig
                                                           countStyle:NSByteCountFormatterCountStyleFile],
                            self.total, page, MAX(pages, (unsigned long long)1), self.offset];
     self.textView.text = MemReadHexPage(self.path, self.offset, kPageSize);
-    [self.textView setContentOffset:CGPointZero animated:NO];
+    [self.textView setContentOffset:CGPointMake(0, 0) animated:NO];
 }
 
 - (void)onPrev {
