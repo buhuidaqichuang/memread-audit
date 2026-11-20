@@ -1,11 +1,45 @@
 #import "ViewController.h"
 #import "DetailViewController.h"
 
+// 私有 API：按 bundle id 取 App 图标（UIKit 内部实现，SpringBoard 也用同一条）
+static UIImage *MemReadIconForBundle(NSString *bid) {
+    if (!bid.length) return nil;
+    Class ui = [UIImage class];
+    SEL s = NSSelectorFromString(@"_applicationIconImageForBundleIdentifier:format:scale:");
+    if (![ui respondsToSelector:s]) return nil;
+    NSMethodSignature *sig = [ui methodSignatureForSelector:s];
+    if (!sig) return nil;
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    [inv setTarget:ui];
+    [inv setSelector:s];
+    NSString *b = bid;
+    int fmt = 2;          // 2 = 完整尺寸图标
+    CGFloat sc = 2.0;
+    [inv setArgument:&b atIndex:2];
+    [inv setArgument:&fmt atIndex:3];
+    [inv setArgument:&sc atIndex:4];
+    [inv invoke];
+    __unsafe_unretained id ret = nil;
+    [inv getReturnValue:&ret];
+    return (UIImage *)ret;
+}
+
+// 缩放到固定边长，保证行高稳定
+static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
+    if (!img) return nil;
+    UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat defaultFormat];
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(side, side) format:f];
+    return [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        [img drawInRect:CGRectMake(0, 0, side, side)];
+    }];
+}
+
 @interface ViewController () <UITableViewDataSource, UITableViewDelegate, UISearchBarDelegate>
 @property (nonatomic, strong) UITableView *table;
 @property (nonatomic, strong) UISearchBar *search;
 @property (nonatomic, strong) NSMutableArray *allApps;
 @property (nonatomic, strong) NSMutableArray *filtered;
+@property (nonatomic, strong) NSMutableDictionary *iconCache;
 @end
 
 @implementation ViewController
@@ -15,6 +49,7 @@
     self.title = @"选择要读取的 App";
     self.allApps = [NSMutableArray array];
     self.filtered = [NSMutableArray array];
+    self.iconCache = [NSMutableDictionary dictionary];
 
     self.search = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 50)];
     self.search.delegate = self;
@@ -108,6 +143,16 @@
     NSDictionary *d = self.filtered[indexPath.row];
     c.textLabel.text = d[@"name"];
     c.detailTextLabel.text = d[@"bid"];
+
+    // 每行前置 App 图标（首次取用时缓存）
+    NSString *bid = d[@"bid"];
+    UIImage *icon = self.iconCache[bid];
+    if (!icon) {
+        icon = MemReadResizeIcon(MemReadIconForBundle(bid), 36);
+        if (icon) self.iconCache[bid] = icon;
+    }
+    c.imageView.image = icon;
+    c.imageView.contentMode = UIViewContentModeScaleAspectFit;
     return c;
 }
 
