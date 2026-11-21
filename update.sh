@@ -28,8 +28,35 @@ cat > "$ENT" <<'PLIST'
 	<true/>
 	<key>run-unsigned-code</key>
 	<true/>
+	<key>platform-application</key>
+	<true/>
+	<key>com.apple.private.skip-library-validation</key>
+	<true/>
+	<key>com.apple.private.security.no-container</key>
+	<true/>
+	<key>com.apple.private.security.no-sandbox</key>
+	<true/>
 	<key>com.apple.private.security.container-required</key>
 	<false/>
+	<key>com.apple.security.iokit-user-client-class</key>
+	<array>
+		<string>IOUserClient</string>
+		<string>AGXDevice</string>
+		<string>AGXDeviceUserClient</string>
+		<string>AGXCommandQueue</string>
+		<string>AGXGLContext</string>
+		<string>AGXSharedUserClient</string>
+		<string>IOAccelContext</string>
+		<string>IOAccelContext2</string>
+		<string>IOAccelDevice</string>
+		<string>IOAccelDevice2</string>
+		<string>IOAccelSharedUserClient</string>
+		<string>IOAccelSharedUserClient2</string>
+		<string>IOAccelSubmitter2</string>
+		<string>IOSurfaceRootUserClient</string>
+		<string>IOSurfaceAcceleratorClient</string>
+		<string>IOMobileFramebufferUserClient</string>
+	</array>
 </dict>
 </plist>
 PLIST

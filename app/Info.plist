@@ -46,17 +46,17 @@
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>CFBundleIconFile</key>
-	<string>Icon.png</string>
-	<key>CFBundleIconName</key>
-	<string>AppIcon</string>
+	<string>Icon</string>
 	<key>CFBundleIcons</key>
 	<dict>
 		<key>CFBundlePrimaryIcon</key>
 		<dict>
 			<key>CFBundleIconFiles</key>
 			<array>
+				<string>Icon-60</string>
+				<string>Icon-72</string>
+				<string>Icon-76</string>
 				<string>AppIcon60x60</string>
-				<string>AppIcon76x76</string>
 			</array>
 		</dict>
 	</dict>
@@ -66,7 +66,10 @@
 		<dict>
 			<key>CFBundleIconFiles</key>
 			<array>
-				<string>AppIcon60x60</string>
+				<string>Icon-60</string>
+				<string>Icon-72</string>
+				<string>Icon-76</string>
+				<string>Icon-83.5</string>
 				<string>AppIcon76x76</string>
 				<string>AppIcon83.5x83.5</string>
 			</array>
