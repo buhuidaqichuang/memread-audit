@@ -2,6 +2,8 @@
 // 只负责显示 /var/mobile/Media/memread_live.txt 里的进度，不读任何目标进程内存
 
 #import <UIKit/UIKit.h>
+#include <stdarg.h>
+#import <unistd.h>
 
 static UIWindow *gWin = nil;
 static UIView *gPanel = nil;
@@ -9,7 +11,24 @@ static UILabel *gLabel = nil;
 static NSTimer *gTimer = nil;
 
 static NSString *const kLivePath = @"/var/mobile/Media/memread_live.txt";
+static NSString *const kLogPath  = @"/var/mobile/Media/memread_float.log";
 static NSString *const kHiddenKey = @"com.gsy.memreadfloat.hidden";
+
+// 落盘日志：确认 dylib 是否被 SpringBoard 加载、scene 是否可用
+static void FLog(NSString *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    df.dateFormat = @"HH:mm:ss";
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n",
+                      [df stringFromDate:[NSDate date]], msg];
+    NSString *old = [NSString stringWithContentsOfFile:kLogPath
+                                             encoding:NSUTF8StringEncoding error:nil] ?: @"";
+    [[old stringByAppendingString:line] writeToFile:kLogPath
+                                          atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
 
 static NSString *ReadLive(void) {
     NSString *s = [NSString stringWithContentsOfFile:kLivePath
@@ -58,23 +77,33 @@ static void TryShowPanel(void) {
     if (gWin) return;
 
     UIApplication *app = [UIApplication sharedApplication];
+    NSInteger sceneCount = 0;
+    if (@available(iOS 13.0, *)) {
+        sceneCount = (NSInteger)app.connectedScenes.count;
+    }
+    FLog(@"try show, scenes=%ld", (long)sceneCount);
+
     UIWindowScene *scene = nil;
     for (id s in app.connectedScenes) {
         if ([s isKindOfClass:[UIWindowScene class]]) { scene = (UIWindowScene *)s; break; }
     }
-    if (!scene) {
-        // SpringBoard 场景还没就绪，稍后重试
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ TryShowPanel(); });
+
+    if ([[NSUserDefaults standardUserDefaults] boolForKey:kHiddenKey]) {
+        FLog(@"skip: hidden flag set");
         return;
     }
 
-    if ([[NSUserDefaults standardUserDefaults] boolForKey:kHiddenKey]) return;
-
-    gWin = [[UIWindow alloc] initWithWindowScene:scene];
+    // 有 scene 就用 scene，没有就退回 UIScreen 全屏（SpringBoard 里很常见）
+    if (scene) {
+        gWin = [[UIWindow alloc] initWithWindowScene:scene];
+        gWin.frame = scene.coordinateSpace.bounds;
+        FLog(@"window via scene");
+    } else {
+        gWin = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        FLog(@"window via UIScreen %.0fx%.0f", gWin.frame.size.width, gWin.frame.size.height);
+    }
     gWin.windowLevel = UIWindowLevelAlert + 1;
     gWin.backgroundColor = [UIColor clearColor];
-    gWin.frame = scene.coordinateSpace.bounds;
 
     FloatRootView *root = [[FloatRootView alloc] initWithFrame:gWin.bounds];
     root.backgroundColor = [UIColor clearColor];
@@ -82,7 +111,7 @@ static void TryShowPanel(void) {
     vc.view = root;
     gWin.rootViewController = vc;
 
-    CGRect b = scene.coordinateSpace.bounds;
+    CGRect b = gWin.bounds;
     CGFloat W = 300, H = 200;
     CGFloat x = b.size.width - W - 20;
     CGFloat y = 110;
@@ -121,6 +150,8 @@ static void TryShowPanel(void) {
     [root addSubview:panel];
     gPanel = panel;
     gWin.hidden = NO;
+    [gWin makeKeyAndVisible];
+    FLog(@"panel shown at %.0f,%.0f", x, y);
 
     gTimer = [NSTimer scheduledTimerWithTimeInterval:0.6 repeats:YES block:^(NSTimer *t) {
         gLabel.text = ReadLive();
@@ -129,6 +160,8 @@ static void TryShowPanel(void) {
 
 __attribute__((constructor))
 static void memread_float_init(void) {
+    FLog(@"dylib loaded pid=%d bundle=%@", getpid(),
+         [[NSBundle mainBundle] bundleIdentifier]);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ TryShowPanel(); });
 }
