@@ -194,6 +194,25 @@ static int ctx_has_word(const char *ctx, size_t n) {
     return 0;
 }
 
+// 上下文里是否出现"电话"语义（用来把孤立 11 位数字与真号码区分开）
+static int ctx_has_phone_word(const char *ctx, size_t n) {
+    static const char *words[] = {
+        "phone", "mobile", "msisdn", "tel", "telephone", "contact", NULL
+    };
+    if (n == 0) return 0;
+    char low[SCAN_CTX + 1];
+    size_t m = n > SCAN_CTX ? SCAN_CTX : n;
+    for (size_t i = 0; i < m; i++) {
+        char c = ctx[i];
+        low[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+    }
+    low[m] = 0;
+    for (int i = 0; words[i]; i++) {
+        if (strstr(low, words[i])) return 1;
+    }
+    return 0;
+}
+
 static int is_jwt(const char *s, size_t n) {
     if (n < 32 || strncmp(s, "eyJ", 3) != 0) return 0;
     int dots = 0;
@@ -205,13 +224,13 @@ static int is_pem(const char *s, size_t n) {
     return (strstr(s, "PRIVATE KEY") != NULL || strstr(s, "BEGIN OPENSSH") != NULL);
 }
 
+// 严格 base64：只认标准字符集，不含 _ / - / ，避免把 UE/SDK 标识符、路径当成密钥
 static int is_b64ish(const char *s, size_t n) {
     int pad = 0;
     for (size_t i = 0; i < n; i++) {
         char c = s[i];
         int ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                 (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=' ||
-                 c == '-' || c == '_';
+                 (c >= '0' && c <= '9') || c == '+' || c == '=';
         if (c == '=') pad++;
         if (!ok) return 0;
     }
@@ -360,8 +379,11 @@ static int classify(const char *s, size_t n, const char *ctx, size_t ctxn,
         *conf = 0; *type = (n >= 32) ? "secret(hex/b64)" : "secret"; return 0;
     }
     if (is_email(s, n)) { *conf = 0; *type = "email"; return 1; }
-    // 手机号 / 卡号 / 身份证：可直接定位到人或冒用（短信、支付），按高可信处理
-    if (is_cn_phone(s)) { *conf = 0; *type = "phone"; return 0; }
+    // 手机号：只有周围出现 phone/mobile/tel 这类语义才算高可信；孤立数字串降到 B 档
+    if (is_cn_phone(s)) {
+        if (ctx_has_phone_word(ctx, ctxn)) { *conf = 0; *type = "phone"; return 0; }
+        *conf = 1; *type = "phone(no-ctx)"; return 1;
+    }
     if (is_card_number(s)) { *conf = 0; *type = "card"; return 0; }
     if (is_idcard(s)) { *conf = 0; *type = "idcard"; return 0; }
     // 自写密钥最常落在这一档：纯数字长串 / 字母数字混合长串
