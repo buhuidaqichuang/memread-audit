@@ -16,7 +16,14 @@
 @property (nonatomic, strong) NSDate *hudStart;
 @property (nonatomic, assign) BOOL hudCancel;
 @property (nonatomic, assign) int *chainCancelFlag;
-@property (nonatomic, assign) int hudMode;   // 0 = 指针链扫描，1 = 值指纹采样
+// 值指纹分帧采样
+@property (nonatomic, strong) UIView *sigPanel;
+@property (nonatomic, strong) UILabel *sigPanelLabel;
+@property (nonatomic, strong) UIButton *sigPickBtn;
+@property (nonatomic, strong) NSMutableArray<NSData *> *sigFrames;
+@property (nonatomic, assign) uint64_t sigAddr;
+@property (nonatomic, assign) int sigVt;
+@property (nonatomic, assign) int sigBytes;
 @end
 
 @implementation ValueListViewController
@@ -257,62 +264,175 @@
     if (vt == MEMREAD_VALTYPE_AUTO) vt = MEMREAD_VALTYPE_INT32;
 
     NSString *msg = [NSString stringWithFormat:
-        @"目标 0x%llX（%@）\n\n采样会连读 4 次（约 1.2 秒），期间请让这个数值变化（开枪/切枪/走两步）。\n"
-        @"只保留完全不变的字节做指纹，会变的字节自动排除。",
+        @"目标 0x%llX（%@）\n\n"
+        @"分帧采样：需要来回切 3 次。\n"
+        @"① 切到游戏开枪/切枪，让数值变化\n"
+        @"② 回 MemRead 点「采一次」\n"
+        @"③ 重复到 3 次，自动算指纹\n\n"
+        @"（App 在后台会被挂起，没法自动连采，所以改成手动一帧一帧采）",
         a, [SavedAddressStore typeName:vt]];
     UIAlertController *ask = [UIAlertController alertControllerWithTitle:@"采样值指纹"
                                                                 message:msg
                                                          preferredStyle:UIAlertControllerStyleAlert];
     [ask addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     __weak typeof(self) ws = self;
-    [ask addAction:[UIAlertAction actionWithTitle:@"开始采样" style:UIAlertActionStyleDefault
+    [ask addAction:[UIAlertAction actionWithTitle:@"开始" style:UIAlertActionStyleDefault
                                           handler:^(UIAlertAction *x) {
-        [ws captureSignatureAt:a type:vt bytes:[ws valueBytesForType:vt]];
+        [ws startSigFlowAt:a type:vt bytes:[ws valueBytesForType:vt]];
     }]];
     [self presentViewController:ask animated:YES completion:nil];
 }
 
-- (void)captureSignatureAt:(uint64_t)addr type:(int)vt bytes:(int)vb {
-    [self showSigSampleHUD];
-    memread_sig_t *sig = (memread_sig_t *)calloc(1, sizeof(memread_sig_t));
+#pragma mark - 分帧采样（手动一帧一帧）
+
+- (void)startSigFlowAt:(uint64_t)addr type:(int)vt bytes:(int)vb {
+    self.sigAddr = addr;
+    self.sigVt = vt;
+    self.sigBytes = vb;
+    self.sigFrames = [NSMutableArray array];
+    [self showSigPanel];
+}
+
+- (void)showSigPanel {
+    [self hideSigPanel];
+    CGFloat w = MIN(320, self.view.bounds.size.width - 32), h = 168;
+    UIView *v = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
+    v.center = CGPointMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds));
+    v.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin |
+                         UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
+    v.backgroundColor = [UIColor colorWithWhite:0 alpha:0.9];
+    v.layer.cornerRadius = 14;
+    v.clipsToBounds = YES;
+
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, w - 32, 86)];
+    l.numberOfLines = 5;
+    l.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
+    l.textColor = [UIColor whiteColor];
+    [v addSubview:l];
+
+    UIButton *pick = [UIButton buttonWithType:UIButtonTypeSystem];
+    pick.frame = CGRectMake(16, 100, w - 32, 46);
+    pick.backgroundColor = [UIColor colorWithWhite:1 alpha:0.14];
+    pick.layer.cornerRadius = 8;
+    pick.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+    [pick setTitle:@"采一次（0/3）" forState:UIControlStateNormal];
+    [pick setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [pick addTarget:self action:@selector(takeSigFrame) forControlEvents:UIControlEventTouchUpInside];
+    [v addSubview:pick];
+
+    UIButton *cancel = [UIButton buttonWithType:UIButtonTypeSystem];
+    cancel.frame = CGRectMake(16, 150, w - 32, 34);
+    [cancel setTitle:@"取消" forState:UIControlStateNormal];
+    [cancel setTitleColor:[UIColor systemRedColor] forState:UIControlStateNormal];
+    cancel.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightRegular];
+    [cancel addTarget:self action:@selector(onCancelSigPanel) forControlEvents:UIControlEventTouchUpInside];
+    [v addSubview:cancel];
+
+    [self.view addSubview:v];
+    self.sigPanel = v;
+    self.sigPanelLabel = l;
+    self.sigPickBtn = pick;
+    [self updateSigPanel];
+}
+
+- (void)updateSigPanel {
+    NSUInteger n = self.sigFrames.count;
+    NSString *head = [NSString stringWithFormat:@"值指纹采样  %lu/3", (unsigned long)MIN(n, (NSUInteger)3)];
+    NSString *hint = (n == 0)
+        ? @"① 切到游戏开枪/切枪，让数值变化\n② 回这里点「采一次」"
+        : @"已采到一帧。再切去游戏改一次数值，回来继续采。";
+    if (n >= 3) hint = @"稳定字节不够，再多采 1~3 次（最多 6 次）";
+    self.sigPanelLabel.text = [NSString stringWithFormat:@"%@\n%@\n只保留三帧都没变的字节。", head, hint];
+    [self.sigPickBtn setTitle:(n == 0 ? @"采一次（0/3）"
+                                      : [NSString stringWithFormat:@"采一次（%lu/3）", (unsigned long)MIN(n, (NSUInteger)3)])
+                     forState:UIControlStateNormal];
+}
+
+- (void)takeSigFrame {
+    if (!self.sigAddr) return;
+    self.sigPickBtn.enabled = NO;
     pid_t pid = self.pid;
+    uint64_t a = self.sigAddr;
     __weak typeof(self) ws = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        int rc = sig ? memread_sig_capture(pid, addr, vb, sig) : -4;
+        unsigned char buf[MEMREAD_SIG_LEN];
+        int rc = memread_sig_read_frame(pid, a, buf, MEMREAD_SIG_LEN, MEMREAD_SIG_PRE);
+        NSData *d = (rc == 0) ? [NSData dataWithBytes:buf length:MEMREAD_SIG_LEN] : nil;
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(ws) self2 = ws;
-            if (!self2) { free(sig); return; }
-            [self2 hideChainHUD];
-            void (^after)(void) = ^{
-                if (!sig || rc != 0) {
-                    UIAlertController *e = [UIAlertController
-                        alertControllerWithTitle:@"采样失败"
-                                         message:[NSString stringWithFormat:
-                                                  @"rc=%d\n稳定字节不够（至少 12 个）。可能这个地址周围本身都是易变字段，换个相邻地址再试。", rc]
-                                  preferredStyle:UIAlertControllerStyleAlert];
-                    [e addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-                    [self2 presentViewController:e animated:YES completion:nil];
-                    free(sig);
-                    return;
-                }
-                NSMutableArray<NSNumber *> *offs = [NSMutableArray array];
-                NSMutableArray<NSNumber *> *vals = [NSMutableArray array];
-                for (int i = 0; i < sig->stable_n; i++) {
-                    [offs addObject:@(sig->offs[i])];
-                    [vals addObject:@(sig->vals[i])];
-                }
-                [self2 promptSaveSigWin:sig->win targetOff:sig->target_off offs:offs vals:vals
-                                    type:vt stable:sig->stable_n];
-                free(sig);
-            };
-            if (self2.presentedViewController) {
-                [self2 dismissViewControllerAnimated:YES completion:after];
-            } else {
-                after();
+            if (!self2) return;
+            self2.sigPickBtn.enabled = YES;
+            if (!d) {
+                self2.sigPanelLabel.text = [NSString stringWithFormat:
+                    @"读取失败 rc=%d\n游戏可能退出了，重开一局再来。", rc];
+                return;
             }
+            [self2.sigFrames addObject:d];
+            if (self2.sigFrames.count >= 3) [self2 evaluateSigFrames];
+            else [self2 updateSigPanel];
         });
     });
 }
+
+- (void)evaluateSigFrames {
+    NSUInteger n = self.sigFrames.count;
+    if (n < 2) return;
+    unsigned char first[MEMREAD_SIG_LEN];
+    [self.sigFrames[0] getBytes:first length:MEMREAD_SIG_LEN];
+
+    NSMutableArray<NSNumber *> *offs = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *vals = [NSMutableArray array];
+    int stable = 0;
+    int vb = self.sigBytes;
+    for (int i = 0; i < MEMREAD_SIG_LEN; i++) {
+        if (i >= MEMREAD_SIG_PRE && i < MEMREAD_SIG_PRE + vb) continue;   // 数值字节会变，排除
+        BOOL same = YES;
+        for (NSUInteger f = 1; f < n && same; f++) {
+            unsigned char other[MEMREAD_SIG_LEN];
+            [self.sigFrames[f] getBytes:other length:MEMREAD_SIG_LEN];
+            if (other[i] != first[i]) same = NO;
+        }
+        if (same) {
+            [offs addObject:@(i)];
+            [vals addObject:@(first[i])];
+            stable++;
+        }
+    }
+
+    if (stable >= 12) {
+        [self hideSigPanel];
+        [self promptSaveSigWin:MEMREAD_SIG_LEN targetOff:MEMREAD_SIG_PRE
+                           offs:offs vals:vals type:self.sigVt stable:stable];
+        return;
+    }
+    if (n >= 6) {
+        [self hideSigPanel];
+        UIAlertController *e = [UIAlertController
+            alertControllerWithTitle:@"采样失败"
+                             message:[NSString stringWithFormat:
+                                      @"只有 %d 个稳定字节（至少 12 个）。\n"
+                                      @"多采几帧、或换个相邻地址再试。", stable]
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [e addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:e animated:YES completion:nil];
+        return;
+    }
+    [self updateSigPanel];
+}
+
+- (void)hideSigPanel {
+    [self.sigPanel removeFromSuperview];
+    self.sigPanel = nil;
+    self.sigPanelLabel = nil;
+    self.sigPickBtn = nil;
+}
+
+- (void)onCancelSigPanel {
+    [self hideSigPanel];
+    self.sigFrames = nil;
+    self.sigAddr = 0;
+}
+
 
 - (void)promptSaveSigWin:(int)win targetOff:(int)toff offs:(NSArray<NSNumber *> *)offs
                      vals:(NSArray<NSNumber *> *)vals type:(int)vt stable:(int)stable {
@@ -426,53 +546,10 @@
     self.hud = v;
     self.hudLabel = l;
     self.hudStart = [NSDate date];
-    self.hudMode = 0;
 
     __weak typeof(self) ws = self;
     self.hudTimer = [NSTimer scheduledTimerWithTimeInterval:0.4 repeats:YES block:^(NSTimer *t) {
-        if (ws.hudMode == 1) [ws updateSigHUD];
-        else [ws updateChainHUD];
-    }];
-}
-
-- (void)updateSigHUD {
-    int phase = 0, hits = 0;
-    unsigned long long done = 0, total = 0;
-    memread_sig_progress(&phase, &done, &total, &hits);
-    double el = self.hudStart ? -[self.hudStart timeIntervalSinceNow] : 0;
-    self.hudLabel.text = [NSString stringWithFormat:
-        @"采样值指纹  第 %llu/%d 次\n保持数值在变化（开枪 / 切枪）\n用时 %.1fs",
-        done, 4, el];
-}
-
-// 采样时的轻量进度条（1.2 秒，无取消）
-- (void)showSigSampleHUD {
-    [self hideChainHUD];
-    CGFloat w = 280, h = 104;
-    UIView *v = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
-    v.center = CGPointMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds));
-    v.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin |
-                         UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
-    v.backgroundColor = [UIColor colorWithWhite:0 alpha:0.85];
-    v.layer.cornerRadius = 14;
-    v.clipsToBounds = YES;
-
-    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(16, 14, w - 32, 76)];
-    l.numberOfLines = 3;
-    l.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
-    l.textColor = [UIColor whiteColor];
-    l.text = @"采样值指纹  第 0/4 次";
-    [v addSubview:l];
-
-    [self.view addSubview:v];
-    self.hud = v;
-    self.hudLabel = l;
-    self.hudStart = [NSDate date];
-    self.hudMode = 1;
-
-    __weak typeof(self) ws = self;
-    self.hudTimer = [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *t) {
-        [ws updateSigHUD];
+        [ws updateChainHUD];
     }];
 }
 

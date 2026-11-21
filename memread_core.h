@@ -193,6 +193,7 @@ void memread_chain_progress(int *level, unsigned long long *done, unsigned long 
 
 #define MEMREAD_SIG_LEN         128
 #define MEMREAD_SIG_MAX_STABLE  128
+#define MEMREAD_SIG_PRE         32   // 窗口起点在目标地址前多少字节
 
 typedef struct {
     int win;                 // 窗口长度（字节）
@@ -205,6 +206,8 @@ typedef struct {
 // 采样指纹：连读 4 次，只留不变字节；value_size 是目标数值占用字节（4/8），会被排除
 // 返回 0 成功（稳定字节 >= 12），-4 稳定字节不足，-3 读失败，-1 取进程失败
 int memread_sig_capture(pid_t pid, uint64_t addr, int value_size, memread_sig_t *out);
+// 单帧采样：读 [addr-pre, addr-pre+len) 共 len 字节（分帧手动采样用，App 侧比较多帧）
+int memread_sig_read_frame(pid_t pid, uint64_t addr, unsigned char *out, int len, int pre);
 // 扫可写内存找指纹（允许 25% 稳定字节已变，按匹配度降序返回），
 // 返回候选条数；-5 = 已取消且无结果，-1 取进程失败，-2 参数错，-4 内存不足
 int memread_sig_scan(pid_t pid, const memread_sig_t *sig, uint64_t *out, int cap,

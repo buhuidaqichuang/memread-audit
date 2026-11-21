@@ -2412,6 +2412,16 @@ void memread_sig_progress(int *phase, unsigned long long *done, unsigned long lo
     if (hits) *hits = g_sig_hits;
 }
 
+// 单帧采样：读目标前后一段窗口（供 App 侧「切游戏改数值 → 回来采一次」的分帧指纹）
+int memread_sig_read_frame(pid_t pid, uint64_t addr, unsigned char *out, int len, int pre) {
+    if (!out || len <= 0 || pre < 0 || addr < (uint64_t)pre) return -2;
+    task_t task = MACH_PORT_NULL;
+    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
+    int rc = sig_read_block(task, addr - (uint64_t)pre, len, out);
+    mach_port_deallocate(mach_task_self(), task);
+    return (rc == 0) ? 0 : -3;
+}
+
 // 采样：连读 4 次（每次间隔 300ms），只保留完全不变的字节；目标数值本身的字节强制排除
 int memread_sig_capture(pid_t pid, uint64_t addr, int value_size, memread_sig_t *out) {
     if (!out) return -2;
