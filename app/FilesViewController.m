@@ -49,6 +49,14 @@ static NSString *const kMediaDir = @"/var/mobile/Media";
     [self reload];
 }
 
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    // push 进来时再挂一次，避免导航栏缓存了上一页的状态导致搜索栏不显示
+    self.navigationItem.searchController = self.searchController;
+    self.navigationItem.hidesSearchBarWhenScrolling = NO;
+    [self reload];
+}
+
 - (void)reload {
     [self.items removeAllObjects];
     NSFileManager *fm = [NSFileManager defaultManager];

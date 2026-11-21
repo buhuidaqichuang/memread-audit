@@ -342,6 +342,14 @@ int memread_scan_ex(pid_t pid, const char *out_path, const char *label, int rw_o
     FILE *f = fopen(out_path, "w");
     if (!f) { perror("fopen"); return -2; }
 
+    // 分档临时文件：扫描时各档分别落盘，结束后按 A→B→C 顺序拼进报告
+    char tp[3][1024];
+    FILE *ft[3] = {NULL, NULL, NULL};
+    for (int t = 0; t < 3; t++) {
+        snprintf(tp[t], sizeof(tp[t]), "%s.t%d", out_path, t);
+        ft[t] = fopen(tp[t], "wb");
+    }
+
     struct tm tmv;
     time_t now = time(NULL);
     localtime_r(&now, &tmv);
@@ -358,7 +366,7 @@ int memread_scan_ex(pid_t pid, const char *out_path, const char *label, int rw_o
 
     static uint64_t dedup[DEDUP_N];
     memset(dedup, 0, sizeof(dedup));
-    unsigned long long written = 0;
+    unsigned long long written_tier[3] = {0, 0, 0};
     unsigned long long bytes = 0;
     int regions = 0;
     mach_vm_address_t addr = 0;
@@ -416,7 +424,7 @@ int memread_scan_ex(pid_t pid, const char *out_path, const char *label, int rw_o
                             int tier = classify(tmp, n, cbuf, cn, &conf, &type);
                             if (hits) hits[tier]++;
 
-                            if (tier < 3 && written < SCAN_MAX_DETAIL) {
+                            if (tier < 3 && written_tier[tier] < SCAN_MAX_DETAIL) {
                                 uint64_t h = fnv1a(tmp, n);
                                 int seen = 0;
                                 for (int k = 0; k < 64; k++) {
@@ -430,11 +438,12 @@ int memread_scan_ex(pid_t pid, const char *out_path, const char *label, int rw_o
                                 if (!seen) {
                                     static const char tierc[4] = {'A', 'B', 'C', 'D'};
                                     static const char *confc[3] = {"high", "medium", "low"};
-                                    fprintf(f, "[%c/%s] 0x%08llX len=%zu %s\n    %s\n",
+                                    FILE *dst = ft[tier] ? ft[tier] : f;
+                                    fprintf(dst, "[%c/%s] 0x%08llX len=%zu %s\n    %s\n",
                                             tierc[tier], confc[conf],
                                             (unsigned long long)(addr + off + i),
                                             len, type, tmp);
-                                    written++;
+                                    written_tier[tier]++;
                                 }
                             }
                         }
@@ -448,13 +457,34 @@ int memread_scan_ex(pid_t pid, const char *out_path, const char *label, int rw_o
         addr += size;
     }
 
+    // 按 A → B → C 顺序把各档明细拼进报告，保证报告里是高可信在前
+    static const char *tierTitle[3] = {
+        "A 档（高可信：密钥 / 凭证 / 身份证 / 银行卡等）",
+        "B 档（中等：邮箱 / 电话 / 地址 / 会话等）",
+        "C 档（低可信：URL / 疑似 blob / 普通字符串）"
+    };
+    for (int t = 0; t < 3; t++) {
+        if (ft[t]) { fclose(ft[t]); ft[t] = NULL; }
+        fprintf(f, "\n========== %s ==========\n", tierTitle[t]);
+        FILE *in = fopen(tp[t], "rb");
+        if (in) {
+            char rb[4096];
+            size_t rn;
+            while ((rn = fread(rb, 1, sizeof(rb), in)) > 0) {
+                fwrite(rb, 1, rn, f);
+            }
+            fclose(in);
+        }
+        remove(tp[t]);
+    }
+
     fprintf(f, "\n# scanned=%llu bytes  regions=%d  A=%llu B=%llu C=%llu D=%llu  detail=%llu\n",
             bytes, regions,
             (unsigned long long)(hits ? hits[0] : 0),
             (unsigned long long)(hits ? hits[1] : 0),
             (unsigned long long)(hits ? hits[2] : 0),
             (unsigned long long)(hits ? hits[3] : 0),
-            written);
+            written_tier[0] + written_tier[1] + written_tier[2]);
 
     free(buf);
     fclose(f);
