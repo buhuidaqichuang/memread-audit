@@ -499,6 +499,15 @@
         memread_chain_t *chains = (memread_chain_t *)calloc((size_t)CAP, sizeof(memread_chain_t));
         int depth = 0, n = -4;
         if (chains) n = memread_chain_scan(pid, addr, MEMREAD_CHAIN_MAX_DEPTH, chains, CAP, &depth, cancelFlag);
+        // 正向 1~6 层都没命中：反过来从目标往上找「谁指向它」
+        if (chains && n == 0) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                __strong typeof(ws) self3 = ws;
+                self3.hudLabel.text = @"正向没找到，改反向扫描（谁指向这个地址）…";
+            });
+            n = memread_chain_scan_reverse(pid, addr, MEMREAD_CHAIN_MAX_DEPTH, chains, CAP);
+            depth = 0;
+        }
 
         NSMutableArray<NSDictionary *> *copies = [NSMutableArray array];
         for (int i = 0; i < n && i < CAP; i++) {
@@ -600,7 +609,7 @@
                  target:(uint64_t)t type:(int)vt {
     if (n <= 0 || chains.count == 0) {
         NSString *m = (n == 0)
-            ? @"1~6 层都没找到静态指针链。常见原因：这个值不在对象字段里（临时缓冲/网络包副本），或者对象头不是 vtable 形态。"
+            ? @"正向（静态槽往下）1~6 层、反向（从目标往上找谁指向它）都没找到。常见原因：这个值不在对象字段里（临时缓冲/网络包副本），或者中间容器每帧重建。"
             : ([self chainCancelled] ? @"已取消扫描。" : [NSString stringWithFormat:@"扫描失败 rc=%d", n]);
         UIAlertController *e = [UIAlertController alertControllerWithTitle:@"没有链"
                                                                   message:m
@@ -610,11 +619,17 @@
         return;
     }
 
+    int minDepth = depth;
+    if (minDepth <= 0) {
+        minDepth = 99;
+        for (NSDictionary *c in chains) minDepth = MIN(minDepth, (int)[c[@"depth"] intValue]);
+    }
+
     NSMutableString *msg = [NSMutableString stringWithFormat:
         @"命中 %d 条（最短 %d 层），已按「对象校验跳数多 → 坐标形态 → 层数少 → main 模块 → 偏移小」排序，越靠前越可能是真路径。\n"
         @"对象校验 = 每一跳的指针所指对象，开头 8 字节是模块内 vtable（UE 的 UObject 特征）。\n"
         @"坐标✔ = 末跳地址后面紧跟一个模长≈1 的四元数，说明落在 FVector 坐标字段上。\n\n",
-        (int)chains.count, depth];
+        (int)chains.count, minDepth];
     for (int i = 0; i < chains.count && i < 3; i++) {
         NSDictionary *c = chains[i];
         [msg appendFormat:@"%@  （对象 %@/%@%@）\n",

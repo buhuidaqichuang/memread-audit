@@ -225,6 +225,11 @@ int memread_chain_scan(pid_t pid, uint64_t target, int max_depth,
                        memread_chain_t *out, int cap, int *found_depth,
                        volatile int *cancel);
 
+// 反向链扫描：从 target 往上找「谁指向它」，直到槽落在模块数据段。正向扫不到时用。
+// 返回条数，负数=错误（-1 task_for_pid 失败，2 模块未加载，-4 内存不足）
+int memread_chain_scan_reverse(pid_t pid, uint64_t target, int max_depth,
+                               memread_chain_t *out, int cap);
+
 // 用保存的链算出本轮目标地址：0 成功，2 模块未加载，-3 链断
 int memread_chain_resolve(pid_t pid, const char *uuid, uint64_t static_off,
                           const int64_t *offs, int depth, uint64_t *out_addr);

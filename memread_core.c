@@ -2821,6 +2821,178 @@ int memread_chain_scan(pid_t pid, uint64_t target, int max_depth,
     return results;
 }
 
+#pragma mark - 反向链扫描（从目标地址往上找「谁指向它」）
+
+// 正向扫不到时用这个：拿目标地址当起点，反查哪块内存里的指针指向它，
+// 再对那些指针的基址反查，直到槽落在模块数据段（跨重启可复原）。
+
+typedef struct {
+    uint64_t slot;    // 槽地址（命中后即静态槽候选）
+    uint64_t base;    // 槽里读到的值：下一层要找的 target
+    int64_t off;      // target - base
+    int parent;       // 上一层节点下标
+} chainrev_node_t;
+
+typedef struct { uint64_t t; int idx; } chainrev_target_t;
+
+static int chainrev_target_cmp(const void *pa, const void *pb) {
+    uint64_t x = ((const chainrev_target_t *)pa)->t;
+    uint64_t y = ((const chainrev_target_t *)pb)->t;
+    if (x == y) return 0;
+    return (x < y) ? -1 : 1;
+}
+
+#define MEMREAD_CHAIN_REV_NODE_CAP 3000
+
+int memread_chain_scan_reverse(pid_t pid, uint64_t target, int max_depth,
+                               memread_chain_t *out, int cap) {
+    if (!out || cap <= 0 || target == 0) return -2;
+    if (max_depth < 1) max_depth = 1;
+    if (max_depth > MEMREAD_CHAIN_MAX_DEPTH) max_depth = MEMREAD_CHAIN_MAX_DEPTH;
+    if (module_cache_ensure(pid) != 0 || g_modsegn == 0) return 2;
+
+    task_t task = MACH_PORT_NULL;
+    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
+
+    chainrev_node_t *lv[MEMREAD_CHAIN_MAX_DEPTH + 1] = {0};
+    int ln[MEMREAD_CHAIN_MAX_DEPTH + 1] = {0};
+    for (int i = 0; i <= max_depth; i++) {
+        lv[i] = (chainrev_node_t *)calloc(MEMREAD_CHAIN_REV_NODE_CAP, sizeof(chainrev_node_t));
+        if (!lv[i]) {
+            for (int k = 0; k < i; k++) free(lv[k]);
+            mach_port_deallocate(mach_task_self(), task);
+            return -4;
+        }
+    }
+
+    lv[0][0].slot = 0;
+    lv[0][0].base = target;
+    lv[0][0].off = 0;
+    lv[0][0].parent = -1;
+    ln[0] = 1;
+
+    const mach_vm_size_t CHUNK = 4ULL * 1024 * 1024;
+    unsigned char *buf = (unsigned char *)malloc((size_t)CHUNK);
+    int results = 0;
+    int stopdepth = 0;
+
+    if (buf) {
+        for (int d = 1; d <= max_depth && results < cap; d++) {
+            chainrev_target_t *tg = (chainrev_target_t *)malloc(sizeof(chainrev_target_t) * (size_t)ln[d - 1]);
+            if (!tg) break;
+            for (int i = 0; i < ln[d - 1]; i++) {
+                tg[i].t = lv[d - 1][i].base;
+                tg[i].idx = i;
+            }
+            qsort(tg, (size_t)ln[d - 1], sizeof(chainrev_target_t), chainrev_target_cmp);
+
+            mach_vm_address_t addr = 0;
+            int full = 0;
+            for (;;) {
+                mach_vm_size_t size = 0;
+                vm_region_basic_info_data_64_t info;
+                mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+                mach_port_t obj = MACH_PORT_NULL;
+                kern_return_t kr = mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
+                                                 (vm_region_info_t)&info, &cnt, &obj);
+                if (kr != KERN_SUCCESS || size == 0) break;
+                if (!snap_region_ok(&info, size)) { addr += size; continue; }
+
+                uint64_t off = 0;
+                while (off + 8 <= (uint64_t)size && !full) {
+                    mach_vm_size_t cur = (mach_vm_size_t)((size - off > CHUNK) ? CHUNK : (size - off));
+                    cur -= (cur % 8);
+                    if (cur == 0) break;
+                    mach_vm_size_t got = 0;
+                    kr = mach_vm_read_overwrite(task, addr + off, cur,
+                                               (mach_vm_address_t)buf, &got);
+                    if (kr != KERN_SUCCESS || got != cur) { off += cur; continue; }
+
+                    for (mach_vm_size_t o = 0; o + 8 <= cur; o += 8) {
+                        uint64_t v;
+                        memcpy(&v, buf + o, 8);
+                        if (v < 0x100000000ULL) continue;
+                        // 在目标表里找 t ∈ [v - OFF_NEG, v + OFF_WIN]
+                        uint64_t lo = v - MEMREAD_CHAIN_OFF_NEG;
+                        uint64_t hi = v + MEMREAD_CHAIN_OFF_WIN;
+                        int i = 0;
+                        {
+                            int l = 0, r = ln[d - 1] - 1, pos = ln[d - 1];
+                            while (l <= r) {
+                                int m = (l + r) / 2;
+                                if (tg[m].t < lo) l = m + 1;
+                                else { pos = m; r = m - 1; }
+                            }
+                            i = pos;
+                        }
+                        for (; i < ln[d - 1] && tg[i].t <= hi; i++) {
+                            int64_t delta = (int64_t)tg[i].t - (int64_t)v;
+                            if (delta < -(int64_t)MEMREAD_CHAIN_OFF_NEG || delta > (int64_t)MEMREAD_CHAIN_OFF_WIN) continue;
+                            if (!chain_is_object(task, v)) continue;   // 基址必须是对象，否则不是结构指针
+
+                            uint64_t slot = (uint64_t)addr + off + o;
+                            if (ln[d] >= MEMREAD_CHAIN_REV_NODE_CAP) { full = 1; break; }
+                            int node_idx = ln[d];
+                            chainrev_node_t *nd = &lv[d][ln[d]];
+                            nd->slot = slot;
+                            nd->base = v;
+                            nd->off = delta;
+                            nd->parent = tg[i].idx;
+                            ln[d]++;
+
+                            memread_modseg_t seg;
+                            if (chain_module_slot(slot, &seg) == 0 && results < cap) {
+                                // 槽在模块数据段：把这一路的偏移串成链并验证
+                                int64_t offs[MEMREAD_CHAIN_MAX_DEPTH] = {0};
+                                int depth = d;
+                                int p = node_idx;
+                                for (int k = d; k >= 1 && p >= 0; k--) {
+                                    offs[k - 1] = lv[k][p].off;   // offs[0] = 离静态槽最近的那一跳
+                                    p = lv[k][p].parent;
+                                }
+                                int valid = 0, flags = 0;
+                                if (chain_verify(task, slot, offs, depth, target, &valid, &flags) == 0) {
+                                    int dup = 0;
+                                    for (int q = 0; q < results; q++) {
+                                        if (out[q].static_off == slot - seg.base &&
+                                            strcmp(out[q].uuid, seg.uuid) == 0) { dup = 1; break; }
+                                    }
+                                    if (!dup) {
+                                        memread_chain_t *c = &out[results];
+                                        memset(c, 0, sizeof(*c));
+                                        memcpy(c->uuid, seg.uuid, sizeof(c->uuid));
+                                        memcpy(c->name, seg.name, sizeof(c->name));
+                                        c->static_off = slot - seg.base;
+                                        c->depth = depth;
+                                        c->valid_hops = valid;
+                                        c->flags = flags;
+                                        memcpy(c->offs, offs, sizeof(c->offs));
+                                        results++;
+                                    }
+                                }
+                            }
+                        }
+                        if (full) break;
+                    }
+                    if (full) break;
+                    off += cur;
+                }
+                if (full) break;
+                addr += size;
+            }
+            free(tg);
+            if (results > 0) { stopdepth = d; break; }
+            if (ln[d] == 0) break;     // 上一层就没指针指向，再往上也没意义
+        }
+        free(buf);
+    }
+
+    for (int i = 0; i <= max_depth; i++) free(lv[i]);
+    mach_port_deallocate(mach_task_self(), task);
+    fprintf(stderr, "反向链扫描: 深度=%d 条数=%d\n", stopdepth, results);
+    return results;
+}
+
 // 扫描进度：层数 / 本层已扫字节 / 本层总量 / 本层候选槽 / 已命中链
 void memread_chain_progress(int *level, unsigned long long *done, unsigned long long *total,
                             int *nodes, int *results) {
