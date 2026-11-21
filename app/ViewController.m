@@ -108,7 +108,7 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
 
 #pragma mark - 列表
 
-@interface ViewController () <UITableViewDataSource, UITableViewDelegate, UISearchResultsUpdating>
+@interface ViewController () <UITableViewDataSource, UITableViewDelegate, UISearchResultsUpdating, UISearchControllerDelegate>
 @property (nonatomic, strong) UITableView *table;
 @property (nonatomic, strong) UISearchController *searchController;
 @property (nonatomic, strong) UIButton *searchButton;     // GPU 不可用时的自绘搜索入口
@@ -144,6 +144,7 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
     if (gpuOK) {
         self.searchController = [[UISearchController alloc] initWithSearchResultsController:nil];
         self.searchController.searchResultsUpdater = self;
+        self.searchController.delegate = self;
         self.searchController.obscuresBackgroundDuringPresentation = NO;
         self.searchController.searchBar.placeholder = @"搜索名字或 Bundle ID";
         self.searchController.searchBar.autocorrectionType = UITextAutocorrectionTypeNo;
@@ -336,10 +337,16 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
 }
 
 - (void)applyFilter {
-    NSString *q = self.query.lowercaseString ?: @"";
-    if (!self.searchButton && self.searchController.isActive) {
-        q = (self.searchController.searchBar.text ?: @"").lowercaseString;
+    NSString *q;
+    if (self.searchController && self.searchController.isActive) {
+        // 系统搜索框：把文字同步进 self.query，否则 isSearching 永远为 NO，过滤结果不会被用到
+        q = self.searchController.searchBar.text ?: @"";
+        self.query = q;
+    } else {
+        q = self.query ?: @"";
     }
+    q = q.lowercaseString;
+
     [self.filtered removeAllObjects];
     for (NSDictionary *d in self.allApps) {
         if (q.length == 0 ||
@@ -349,6 +356,11 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
         }
     }
     [self.table reloadData];
+}
+
+- (void)willDismissSearchController:(UISearchController *)searchController {
+    self.query = @"";
+    [self applyFilter];
 }
 
 - (void)updateSearchResultsForSearchController:(UISearchController *)searchController {

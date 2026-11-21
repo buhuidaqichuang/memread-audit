@@ -22,12 +22,15 @@ static NSString *const kMediaDir = @"/var/mobile/Media";
     self.table.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [self.view addSubview:self.table];
 
-    self.navigationItem.rightBarButtonItem =
+    // 左上角必须留给系统返回按钮，否则进了结果页就退不回去
+    UIBarButtonItem *refresh =
         [[UIBarButtonItem alloc] initWithTitle:@"刷新" style:UIBarButtonItemStylePlain
                                         target:self action:@selector(reload)];
-    self.navigationItem.leftBarButtonItem =
+    UIBarButtonItem *clear =
         [[UIBarButtonItem alloc] initWithTitle:@"清空" style:UIBarButtonItemStylePlain
                                         target:self action:@selector(clearAll)];
+    self.navigationItem.rightBarButtonItems = @[refresh, clear];
+    self.navigationItem.backButtonTitle = @"返回";
     [self reload];
 }
 
@@ -132,7 +135,7 @@ static NSString *const kMediaDir = @"/var/mobile/Media";
         }
         [self reload];
     }]];
-    a.popoverPresentationController.barButtonItem = self.navigationItem.leftBarButtonItem;
+    a.popoverPresentationController.barButtonItem = self.navigationItem.rightBarButtonItems.lastObject;
     [self presentViewController:a animated:YES completion:nil];
 }
 
