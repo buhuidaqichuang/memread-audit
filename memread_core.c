@@ -2277,7 +2277,7 @@ static int coord_scan(pid_t pid, int (*visit)(const memread_coord_hit_t *, void 
     if (pscanned) *pscanned = 0;
     task_t task = MACH_PORT_NULL;
     if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
-    module_cache_ensure(pid);   // coord_heap_ptr 要用模块段范围
+    module_cache_ensure(pid);   // coord_heap_ptr 要用模块段范围，region 也要据此跳过模块映像
 
     const mach_vm_size_t CHUNK = 4ULL * 1024 * 1024;
     unsigned char *buf = (unsigned char *)malloc((size_t)CHUNK);
@@ -2296,7 +2296,14 @@ static int coord_scan(pid_t pid, int (*visit)(const memread_coord_hit_t *, void 
         kern_return_t kr = mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
                                          (vm_region_info_t)&info, &cnt, &obj);
         if (kr != KERN_SUCCESS || size == 0) break;
-        if (snap_region_ok(&info, size)) {
+        // 跳过模块映像里的区域：那里的四元数/角度全是静态常量，坐标不在那儿，还会把名额占满
+        int in_module = 0;
+        for (int i = 0; i < g_modsegn; i++) {
+            uint64_t s = g_modsegs[i].seg_start, e = g_modsegs[i].seg_end;
+            if (((uint64_t)addr >= s && (uint64_t)addr < e) ||
+                ((uint64_t)addr + size > s && (uint64_t)addr < e)) { in_module = 1; break; }
+        }
+        if (!in_module && snap_region_ok(&info, size)) {
             uint64_t off = 0;
             while (off + 32 <= (uint64_t)size) {
                 if (cancel && *cancel) { stop = 1; break; }
