@@ -145,6 +145,27 @@ int memread_unknown_diff(pid_t pid, int cond, int float_only,
 int memread_coord_lock(pid_t pid, int *ptriplets, unsigned long long *pcands,
                        memread_region_cb cb, void *ctx);
 
+// ---- 坐标结构扫描（不依赖知道坐标值）----
+// 判据：某处连续 3 个 float 是合理坐标，紧跟（+12 或 +16）4 个 float 构成模长≈1 的四元数
+#define MEMREAD_COORD_HIT_CAP 20000
+typedef struct {
+    uint64_t addr;      // FVector 起始地址（4 字节对齐）
+    float v[3];
+    int quat_off;       // 12 / 16；-12 / -16 表示该四元数是平凡值(0,0,0,1)
+} memread_coord_hit_t;
+
+int memread_coord_probe(pid_t pid, memread_coord_hit_t *out, int cap, int *found,
+                        volatile int *cancel, memread_region_cb cb, void *ctx);
+
+// 两次探测按地址求差：位移长度落在 [min_len, max_len] 的留下，按位移大小排序
+int memread_coord_diff(const memread_coord_hit_t *a, int na,
+                       const memread_coord_hit_t *b, int nb,
+                       memread_coord_hit_t *out, int cap, int *found,
+                       float min_len, float max_len);
+
+// 用一批地址覆盖候选表（供列表页直接点『链』）
+int memread_valscan_set(const uint64_t *addrs, int n, int type);
+
 void memread_snapshot_free(void);
 
 // 预统计可写区域总量（进度百分比用，不读内存，只枚举 region）；返回 0 成功

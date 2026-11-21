@@ -2146,6 +2146,180 @@ int memread_coord_lock(pid_t pid, int *ptriplets, unsigned long long *pcands,
     return 0;
 }
 
+#pragma mark - 坐标结构扫描（四元数锚定，不需要知道坐标值）
+
+static int coord_quat_unit(const float *q, int *trivial) {
+    for (int i = 0; i < 4; i++) {
+        if (!isfinite(q[i]) || q[i] > 1.02f || q[i] < -1.02f) return 0;
+    }
+    float n = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
+    if (n < 0.98f || n > 1.02f) return 0;
+    // UE 的 FQuat 排布 (x,y,z,w)，(0,0,0,1) 就是「无旋转」，这种命中太多，标成平凡
+    if (trivial) *trivial = (fabsf(q[0]) < 1e-3f && fabsf(q[1]) < 1e-3f && fabsf(q[2]) < 1e-3f);
+    return 1;
+}
+
+// 在 p 处试匹配：3 个 float 坐标 + 后随单位四元数
+static int coord_try(const unsigned char *p, float v[3], int *quat_off) {
+    float q[4];
+    memcpy(v, p, 12);
+    for (int i = 0; i < 3; i++) {
+        if (!isfinite(v[i])) return 0;
+        float lim = (i == 2) ? 5000.0f : 200000.0f;   // 高度范围更小，能砍掉一堆噪声
+        if (v[i] > lim || v[i] < -lim) return 0;
+    }
+    if (v[0] == 0.0f && v[1] == 0.0f && v[2] == 0.0f) return 0;
+    for (int off = 12; off <= 16; off += 4) {
+        memcpy(q, p + off, 16);
+        int triv = 0;
+        if (!coord_quat_unit(q, &triv)) continue;
+        *quat_off = triv ? -off : off;
+        return 1;
+    }
+    return 0;
+}
+
+static int coord_hit_cmp(const void *pa, const void *pb) {
+    const memread_coord_hit_t *a = (const memread_coord_hit_t *)pa;
+    const memread_coord_hit_t *b = (const memread_coord_hit_t *)pb;
+    int at = (a->quat_off < 0), bt = (b->quat_off < 0);
+    if (at != bt) return at - bt;                 // 非平凡旋转优先
+    if (a->addr != b->addr) return (a->addr < b->addr) ? -1 : 1;
+    return 0;
+}
+
+static int coord_addr_cmp(const void *pa, const void *pb) {
+    const memread_coord_hit_t *a = (const memread_coord_hit_t *)pa;
+    const memread_coord_hit_t *b = (const memread_coord_hit_t *)pb;
+    if (a->addr == b->addr) return 0;
+    return (a->addr < b->addr) ? -1 : 1;
+}
+
+int memread_coord_probe(pid_t pid, memread_coord_hit_t *out, int cap, int *found,
+                        volatile int *cancel, memread_region_cb cb, void *ctx) {
+    if (found) *found = 0;
+    if (!out || cap <= 0) return -2;
+    task_t task = MACH_PORT_NULL;
+    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
+
+    const mach_vm_size_t CHUNK = 4ULL * 1024 * 1024;
+    unsigned char *buf = (unsigned char *)malloc((size_t)CHUNK);
+    if (!buf) {
+        mach_port_deallocate(mach_task_self(), task);
+        return -4;
+    }
+    int n = 0;
+    unsigned long long scanned = 0;
+    mach_vm_address_t addr = 0;
+    for (;;) {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        kern_return_t kr = mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
+                                         (vm_region_info_t)&info, &cnt, &obj);
+        if (kr != KERN_SUCCESS || size == 0) break;
+        if (snap_region_ok(&info, size)) {
+            uint64_t off = 0;
+            while (off + 32 <= (uint64_t)size) {
+                if (cancel && *cancel) break;
+                mach_vm_size_t cur = (mach_vm_size_t)((size - off > CHUNK) ? CHUNK : (size - off));
+                cur -= (cur % 8);
+                if (cur == 0) break;
+                mach_vm_size_t got = 0;
+                kr = mach_vm_read_overwrite(task, addr + off, cur,
+                                           (mach_vm_address_t)buf, &got);
+                if (kr == KERN_SUCCESS && got == cur) {
+                    for (mach_vm_size_t o = 0; o + 32 <= cur; o += 4) {
+                        if (n >= cap) break;
+                        float v[3];
+                        int qo = 0;
+                        if (!coord_try(buf + o, v, &qo)) continue;
+                        out[n].addr = (uint64_t)addr + off + o;
+                        out[n].v[0] = v[0]; out[n].v[1] = v[1]; out[n].v[2] = v[2];
+                        out[n].quat_off = qo;
+                        n++;
+                    }
+                    if (n >= cap) break;
+                    scanned += cur;
+                    if (cb && ((scanned & 0x3FFFFFFF) == 0)) cb(scanned, cur, scanned, 0, ctx);
+                }
+                off += cur;
+            }
+        }
+        if (n >= cap) break;
+        addr += size;
+    }
+    free(buf);
+    mach_port_deallocate(mach_task_self(), task);
+    qsort(out, (size_t)n, sizeof(memread_coord_hit_t), coord_hit_cmp);
+    if (found) *found = n;
+    fprintf(stderr, "坐标结构扫描: %d 个候选（%llu 字节）\n", n, scanned);
+    return 0;
+}
+
+// 两次探测求差：同一地址的坐标位移落在 [min_len, max_len] 的留下（走动时该变、静止时不该变）
+int memread_coord_diff(const memread_coord_hit_t *a, int na,
+                       const memread_coord_hit_t *b, int nb,
+                       memread_coord_hit_t *out, int cap, int *found,
+                       float min_len, float max_len) {
+    if (found) *found = 0;
+    if (!a || !b || na <= 0 || nb <= 0 || !out || cap <= 0) return -2;
+    memread_coord_hit_t *sa = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * (size_t)na);
+    memread_coord_hit_t *sb = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * (size_t)nb);
+    float *lens = (float *)malloc(sizeof(float) * (size_t)cap);
+    if (!sa || !sb || !lens) { free(sa); free(sb); free(lens); return -4; }
+    memcpy(sa, a, sizeof(memread_coord_hit_t) * (size_t)na);
+    memcpy(sb, b, sizeof(memread_coord_hit_t) * (size_t)nb);
+    qsort(sa, (size_t)na, sizeof(memread_coord_hit_t), coord_addr_cmp);
+    qsort(sb, (size_t)nb, sizeof(memread_coord_hit_t), coord_addr_cmp);
+
+    int i = 0, j = 0, n = 0;
+    while (i < na && j < nb && n < cap) {
+        if (sa[i].addr < sb[j].addr) { i++; continue; }
+        if (sa[i].addr > sb[j].addr) { j++; continue; }
+        float dx = sb[j].v[0] - sa[i].v[0];
+        float dy = sb[j].v[1] - sa[i].v[1];
+        float dz = sb[j].v[2] - sa[i].v[2];
+        float len = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (len >= min_len && len <= max_len) {
+            out[n] = sb[j];
+            lens[n] = len;
+            n++;
+        }
+        i++; j++;
+    }
+    free(sa); free(sb);
+    // 位移大的排前面（走动距离更明显，最可能是人物根组件）
+    for (int k = 1; k < n; k++) {
+        memread_coord_hit_t h = out[k];
+        float L = lens[k];
+        int m = k - 1;
+        while (m >= 0 && lens[m] < L) { out[m + 1] = out[m]; lens[m + 1] = lens[m]; m--; }
+        out[m + 1] = h;
+        lens[m + 1] = L;
+    }
+    free(lens);
+    if (found) *found = n;
+    return 0;
+}
+
+// 把一批地址直接灌进候选表（坐标结构扫描命中后用，供列表里点『链』）
+int memread_valscan_set(const uint64_t *addrs, int n, int type) {
+    if (!addrs || n <= 0) return -2;
+    if (n > MEMREAD_VALSCAN_MAX) n = MEMREAD_VALSCAN_MAX;
+    memread_valscan_reset();
+    g_valents = (memread_valent_t *)calloc(MEMREAD_VALSCAN_MAX, sizeof(memread_valent_t));
+    if (!g_valents) return -4;
+    for (int i = 0; i < n; i++) {
+        g_valents[i].addr = addrs[i];
+        g_valents[i].prev = 0;
+        g_valents[i].type = type;
+    }
+    g_valcount = (unsigned long long)n;
+    return 0;
+}
+
 #pragma mark - 指针链扫描（模块静态槽 + 多级偏移，跨重启复原堆地址）
 
 #define MEMREAD_CHAIN_NODE_CAP 120000    // 每层最多保留的候选槽

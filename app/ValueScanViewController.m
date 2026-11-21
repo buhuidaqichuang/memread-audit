@@ -5,6 +5,7 @@
 #import "memread_core.h"
 #import "FloatPanelController.h"
 #include <string.h>
+#include <stdlib.h>
 #include <QuartzCore/QuartzCore.h>
 
 @interface ValueScanViewController ()
@@ -18,6 +19,8 @@
 @property (nonatomic, strong) UITextView *progressView;
 @property (nonatomic, strong) UIView *previewBox;
 @property (nonatomic, assign) pid_t currentPid;
+@property (nonatomic, assign) void *coordA;      // memread_coord_hit_t*：结构扫描基准
+@property (nonatomic, assign) int coordAn;
 - (void)appendProgressLine:(NSString *)line;
 - (void)clearProgress;
 @end
@@ -120,6 +123,7 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
     [self addButton:@"收敛：按变化筛选候选" width:W y:&y sel:@selector(onRefine)];
     [self addButton:@"未知值扫描（不知道数值）" width:W y:&y sel:@selector(onUnknown)];
     [self addButton:@"坐标扫描（走动→站定→跳）" width:W y:&y sel:@selector(onCoord)];
+    [self addButton:@"坐标结构扫描（不用输坐标值）" width:W y:&y sel:@selector(onCoordProbe)];
     [self addButton:@"释放内存快照（省内存）" width:W y:&y sel:@selector(onFreeSnap)];
     [self addButton:@"查看候选列表（点一行读当前值）" width:W y:&y sel:@selector(onList)];
     [self addButton:@"已保存地址（自定义标签）" width:W y:&y sel:@selector(onSaved)];
@@ -758,6 +762,117 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
                                                                 preferredStyle:UIAlertControllerStyleAlert];
             [ok addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
             [ok addAction:[UIAlertAction actionWithTitle:@"查看候选" style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *x) { [self2 onList]; }]];
+            [self2 presentViewController:ok animated:YES completion:nil];
+        });
+    });
+}
+
+#pragma mark 坐标结构扫描（不用知道坐标值）
+
+- (void)onCoordProbe {
+    __weak typeof(self) ws = self;
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"坐标结构扫描"
+                                                               message:@"不需要知道坐标值。判据是「3 个 float 坐标 + 紧跟一个模长=1 的四元数」，随机数据几乎不可能凑出来。\n\n① 站定别动 → 记录基准\n② 走 3~5 步、站住 → 对比，位移对得上就是人物坐标"
+                                                        preferredStyle:UIAlertControllerStyleActionSheet];
+    [a addAction:[UIAlertAction actionWithTitle:@"① 站定：记录基准" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) { [ws coordProbeSecond:NO]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"② 走动后：对比定位" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) { [ws coordProbeSecond:YES]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)coordProbeSecond:(BOOL)second {
+    pid_t pid = [self ensurePid];
+    if (pid <= 0) return;
+    if (second && (!self.coordA || self.coordAn <= 0)) {
+        [self appendProgressLine:@"还没有基准，先点『① 站定：记录基准』"];
+        self.statusLabel.text = @"先记录基准";
+        return;
+    }
+    [self.spinner startAnimating];
+    self.statusLabel.text = second ? @"结构扫描：对比中…" : @"结构扫描：读内存中…";
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        int found = 0;
+        int cap = MEMREAD_COORD_HIT_CAP;
+        memread_coord_hit_t *buf = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * (size_t)cap);
+        int rc = buf ? memread_coord_probe(pid, buf, cap, &found, NULL, NULL, NULL) : -4;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) self2 = ws;
+            if (!self2) { free(buf); return; }
+            [self2.spinner stopAnimating];
+
+            if (rc != 0) {
+                free(buf);
+                NSString *why = (rc == -1) ? @"读不到进程（先确认游戏在跑、App 已重绑）"
+                                           : [NSString stringWithFormat:@"结构扫描失败 rc=%d", rc];
+                self2.statusLabel.text = why;
+                [self2 appendProgressLine:why];
+                return;
+            }
+
+            if (!second) {
+                memread_coord_hit_t *old = (memread_coord_hit_t *)self2.coordA;
+                if (old) free(old);
+                self2.coordA = buf;
+                self2.coordAn = found;
+                NSString *line = [NSString stringWithFormat:@"基准已记录：%d 个候选（只算结构合法的位置）", found];
+                self2.statusLabel.text = line;
+                [self2 appendProgressLine:line];
+                UIAlertController *ok = [UIAlertController alertControllerWithTitle:@"基准已记录"
+                                                                           message:[NSString stringWithFormat:@"%d 个候选。\n现在回游戏走 3~5 步，站住，再回来点『② 走动后：对比定位』。", found]
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+                [ok addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+                [self2 presentViewController:ok animated:YES completion:nil];
+                return;
+            }
+
+            memread_coord_hit_t *out = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * (size_t)cap);
+            int m = 0;
+            if (out) {
+                memread_coord_diff((memread_coord_hit_t *)self2.coordA, self2.coordAn,
+                                   buf, found, out, cap, &m, 2.0f, 5000.0f);
+            }
+            free(buf);
+            if (!out) {
+                self2.statusLabel.text = @"内存不足";
+                return;
+            }
+
+            if (m <= 0) {
+                free(out);
+                self2.statusLabel.text = @"没匹配上";
+                [self2 appendProgressLine:@"没匹配上：走动幅度太小，或两次扫描之间角色没动。走远点（5~10 步）再试"];
+                return;
+            }
+
+            uint64_t *addrs = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)m);
+            for (int i = 0; i < m; i++) addrs[i] = out[i].addr;
+            memread_valscan_set(addrs, m, MEMREAD_VALTYPE_FLOAT);
+            free(addrs);
+
+            NSString *line = [NSString stringWithFormat:@"结构扫描匹配：%d 个（位移从大到小）", m];
+            self2.statusLabel.text = line;
+            [self2 appendProgressLine:line];
+            [self2 refreshCount];
+
+            NSMutableString *msg = [NSMutableString stringWithFormat:
+                @"%d 个坐标字段跟着你动了。位移最大的最可能是人物根组件（相机/挂点也会动）。\n\n", m];
+            for (int i = 0; i < m && i < 3; i++) {
+                [msg appendFormat:@"%d) 0x%llX  (%.2f, %.2f, %.2f)%@\n", i + 1,
+                 (unsigned long long)out[i].addr,
+                 out[i].v[0], out[i].v[1], out[i].v[2],
+                 (out[i].quat_off < 0) ? @"  平凡旋转" : @"  有旋转"];
+            }
+            free(out);
+
+            UIAlertController *ok = [UIAlertController alertControllerWithTitle:@"已锁定坐标候选"
+                                                                       message:msg
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+            [ok addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+            [ok addAction:[UIAlertAction actionWithTitle:@"查看候选（点『链』）" style:UIAlertActionStyleDefault
                                                 handler:^(UIAlertAction *x) { [self2 onList]; }]];
             [self2 presentViewController:ok animated:YES completion:nil];
         });
