@@ -18,6 +18,8 @@
 @property (nonatomic, assign) uint64_t chainStaticOff;
 @property (nonatomic, copy) NSArray<NSNumber *> *chainOffsets;   // int64，长度 = 解引用层数
 @property (nonatomic, readonly) BOOL hasChain;
+// 保存时记录的进程可执行路径：游戏重启后用它自动找回新 pid
+@property (nonatomic, copy) NSString *procPath;
 @end
 
 // 已保存地址仓库：落盘 /var/mobile/Media/memread_saved.json，重装 App 不丢
@@ -43,6 +45,9 @@
 - (BOOL)addChain:(NSString *)uuid name:(NSString *)name staticOff:(uint64_t)staticOff
             offs:(NSArray<NSNumber *> *)offs type:(int)type label:(NSString *)label
            group:(NSString *)group note:(NSString *)note;
+- (BOOL)addChain:(NSString *)uuid name:(NSString *)name staticOff:(uint64_t)staticOff
+            offs:(NSArray<NSNumber *> *)offs type:(int)type label:(NSString *)label
+           group:(NSString *)group note:(NSString *)note procPath:(NSString *)procPath;
 - (BOOL)removeAtIndex:(NSUInteger)idx;
 - (BOOL)renameAtIndex:(NSUInteger)idx label:(NSString *)label;
 - (BOOL)setGroupAtIndex:(NSUInteger)idx group:(NSString *)group;

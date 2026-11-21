@@ -94,6 +94,8 @@ static uint64_t MemParseAddr(NSString *s) {
         } else {
             s.chainOffsets = @[];
         }
+        NSString *pp = d[@"proc"];
+        s.procPath = [pp isKindOfClass:[NSString class]] ? pp : @"";
         [out addObject:s];
     }
     return out;
@@ -131,6 +133,13 @@ static uint64_t MemParseAddr(NSString *s) {
 - (BOOL)addChain:(NSString *)uuid name:(NSString *)name staticOff:(uint64_t)staticOff
             offs:(NSArray<NSNumber *> *)offs type:(int)type label:(NSString *)label
            group:(NSString *)group note:(NSString *)note {
+    return [self addChain:uuid name:name staticOff:staticOff offs:offs type:type
+                     label:label group:group note:note procPath:@""];
+}
+
+- (BOOL)addChain:(NSString *)uuid name:(NSString *)name staticOff:(uint64_t)staticOff
+            offs:(NSArray<NSNumber *> *)offs type:(int)type label:(NSString *)label
+           group:(NSString *)group note:(NSString *)note procPath:(NSString *)procPath {
     if (!uuid.length || !offs.count || offs.count > MEMREAD_CHAIN_MAX_DEPTH) return NO;
     NSString *lb = [label stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (!lb.length) lb = @"未命名";
@@ -149,6 +158,7 @@ static uint64_t MemParseAddr(NSString *s) {
         @"cname": (name.length ? name : @""),
         @"coff": @(staticOff),
         @"cchain": co,
+        @"proc": (procPath.length ? procPath : @""),
         @"ts": [NSString stringWithFormat:@"%.0f", [NSDate date].timeIntervalSince1970]
     };
     [_items addObject:d];

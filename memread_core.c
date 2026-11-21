@@ -2387,7 +2387,16 @@ void memread_chain_progress(int *level, unsigned long long *done, unsigned long 
 // 返回 0 成功；2 = 模块未加载；-3 = 链断了（指针不可读或越界）
 int memread_chain_resolve(pid_t pid, const char *uuid, uint64_t static_off,
                           const int64_t *offs, int depth, uint64_t *out_addr) {
+    return memread_chain_resolve_ex(pid, uuid, static_off, offs, depth, out_addr, NULL, NULL);
+}
+
+// 带诊断：fail_hop 从 1 开始，表示第几跳的指针读不出来 / 非法；fail_val 是那一跳槽里的原值
+int memread_chain_resolve_ex(pid_t pid, const char *uuid, uint64_t static_off,
+                             const int64_t *offs, int depth, uint64_t *out_addr,
+                             int *fail_hop, uint64_t *fail_val) {
     if (out_addr) *out_addr = 0;
+    if (fail_hop) *fail_hop = 0;
+    if (fail_val) *fail_val = 0;
     if (depth <= 0 || depth > MEMREAD_CHAIN_MAX_DEPTH) return -2;
     uint64_t base = 0;
     char nm[64] = {0};
@@ -2401,7 +2410,12 @@ int memread_chain_resolve(pid_t pid, const char *uuid, uint64_t static_off,
     int rc = 0;
     for (int i = 0; i < depth; i++) {
         uint64_t v = 0;
-        if (chain_read_u64(task, a, &v) != 0 || v < 0x100000000ULL) { rc = -3; break; }
+        if (chain_read_u64(task, a, &v) != 0 || v < 0x100000000ULL) {
+            rc = -3;
+            if (fail_hop) *fail_hop = i + 1;
+            if (fail_val) *fail_val = v;
+            break;
+        }
         a = (uint64_t)((int64_t)v + offs[i]);
     }
     mach_port_deallocate(mach_task_self(), task);

@@ -180,6 +180,11 @@ int memread_chain_scan(pid_t pid, uint64_t target, int max_depth,
 int memread_chain_resolve(pid_t pid, const char *uuid, uint64_t static_off,
                           const int64_t *offs, int depth, uint64_t *out_addr);
 
+// 同上，额外给出失败跳数（1 起）与那一跳槽里的原值，用于区分「模块没了 / 链在第几跳断」
+int memread_chain_resolve_ex(pid_t pid, const char *uuid, uint64_t static_off,
+                             const int64_t *offs, int depth, uint64_t *out_addr,
+                             int *fail_hop, uint64_t *fail_val);
+
 // 扫描进度（扫描线程写、UI 定时读）：当前层、本层已扫字节、本层总量、候选槽数、已命中链数
 void memread_chain_progress(int *level, unsigned long long *done, unsigned long long *total,
                             int *nodes, int *results);

@@ -17,6 +17,7 @@ static uint64_t SaveParseAddr(NSString *s) {
 @property (nonatomic, strong) NSArray<NSArray<NSNumber *> *> *sections; // 每组：扁平的 item 下标
 @property (nonatomic, strong) NSArray<NSString *> *sectionNames;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *resolved; // 扁平下标 → 本轮实际地址
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *resolveNotes; // 解析失败原因
 @property (nonatomic, assign) NSUInteger generation;
 @end
 
@@ -66,6 +67,7 @@ static uint64_t SaveParseAddr(NSString *s) {
 - (void)reloadAll {
     [[SavedAddressStore shared] reload];
     self.items = [[SavedAddressStore shared] allItems];
+    [self rebindPidIfNeeded];
     [self buildSections];
     [self resolveAddresses];
     if (!self.items.count) {
@@ -119,7 +121,11 @@ static uint64_t SaveParseAddr(NSString *s) {
 
 - (void)resolveAddresses {
     self.resolved = [NSMutableDictionary dictionaryWithCapacity:self.items.count];
-    if (self.pid <= 0) return;
+    self.resolveNotes = [NSMutableDictionary dictionary];
+    if (self.pid <= 0) {
+        for (NSUInteger i = 0; i < self.items.count; i++) self.resolveNotes[@(i)] = @"未绑定进程";
+        return;
+    }
     for (NSUInteger i = 0; i < self.items.count; i++) {
         SavedAddress *s = self.items[i];
         if (s.hasChain) {
@@ -127,9 +133,18 @@ static uint64_t SaveParseAddr(NSString *s) {
             int d = (int)MIN(s.chainOffsets.count, (NSUInteger)MEMREAD_CHAIN_MAX_DEPTH);
             for (int k = 0; k < d; k++) offs[k] = [s.chainOffsets[(NSUInteger)k] longLongValue];
             uint64_t t = 0;
-            if (memread_chain_resolve(self.pid, s.moduleUUID.UTF8String, s.chainStaticOff,
-                                      offs, d, &t) == 0 && t) {
+            int hop = 0;
+            uint64_t fv = 0;
+            int rc = memread_chain_resolve_ex(self.pid, s.moduleUUID.UTF8String, s.chainStaticOff,
+                                              offs, d, &t, &hop, &fv);
+            if (rc == 0 && t) {
                 self.resolved[@(i)] = @(t);
+            } else if (rc == 2) {
+                self.resolveNotes[@(i)] = @"模块未加载";
+            } else if (rc == -3) {
+                self.resolveNotes[@(i)] = [NSString stringWithFormat:@"链断在第 %d 跳（槽值 0x%llX）", hop, fv];
+            } else {
+                self.resolveNotes[@(i)] = [NSString stringWithFormat:@"解析失败 rc=%d（进程可能已变）", rc];
             }
             continue;
         }
@@ -141,8 +156,35 @@ static uint64_t SaveParseAddr(NSString *s) {
         char nm[64] = {0};
         if (memread_module_base(self.pid, s.moduleUUID.UTF8String, &base, nm, sizeof(nm)) == 0 && base) {
             self.resolved[@(i)] = @(base + s.moduleOff);
+        } else {
+            self.resolveNotes[@(i)] = @"模块未加载";
         }
         // 解析不到就留空：这条会显示「模块未加载」
+    }
+}
+
+// 游戏重启后 pid 会变：按保存时记下的可执行路径找回新 pid
+static pid_t SavedFindPidForPath(NSString *path) {
+    if (!path.length) return 0;
+    pid_t pids[512];
+    int n = memread_list_procs(pids, 512);
+    for (int i = 0; i < n; i++) {
+        char buf[MEMREAD_PROC_PATH_MAX];
+        if (memread_proc_path(pids[i], buf, sizeof(buf)) != 0) continue;
+        if (strcmp(buf, path.UTF8String) == 0) return pids[i];
+    }
+    return 0;
+}
+
+- (void)rebindPidIfNeeded {
+    for (SavedAddress *s in self.items) {
+        if (!s.procPath.length) continue;
+        pid_t p = SavedFindPidForPath(s.procPath);
+        if (p > 0 && p != self.pid) {
+            self.pid = p;
+            return;
+        }
+        return;   // 找到第一条带路径的记录就够了
     }
 }
 
@@ -232,7 +274,7 @@ static uint64_t SaveParseAddr(NSString *s) {
 
     NSNumber *ra = self.resolved[@(flat)];
     NSString *addrText = ra ? [NSString stringWithFormat:@"0x%llX", ra.unsignedLongLongValue]
-                            : (s.hasChain ? @"链断了/模块未加载" : @"模块未加载");
+                            : (self.resolveNotes[@(flat)] ?: @"未解析");
     NSString *modText;
     if (s.hasChain) {
         modText = [NSString stringWithFormat:@"  链 %@", [self chainSummary:s]];
@@ -265,7 +307,7 @@ static uint64_t SaveParseAddr(NSString *s) {
     SavedAddress *s = self.items[flat];
     NSNumber *ra = self.resolved[@(flat)];
     if (!ra) {
-        self.values[@(flat)] = @"模块未加载";
+        self.values[@(flat)] = (self.resolveNotes[@(flat)] ?: @"未解析");
         NSIndexPath *ip = [self indexPathForFlat:flat];
         if (ip) [self.table reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
         return;
@@ -299,7 +341,7 @@ static uint64_t SaveParseAddr(NSString *s) {
     NSString *val = self.values[@(flat)] ?: @"—";
     NSNumber *ra = self.resolved[@(flat)];
     NSString *addrText = ra ? [NSString stringWithFormat:@"0x%llX", ra.unsignedLongLongValue]
-                            : (s.hasChain ? @"链断了/模块未加载" : @"模块未加载");
+                            : (self.resolveNotes[@(flat)] ?: @"未解析");
     NSString *where;
     if (s.hasChain) {
         where = [NSString stringWithFormat:@"\n链: %@", [self chainSummary:s]];

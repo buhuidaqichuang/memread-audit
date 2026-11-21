@@ -388,6 +388,11 @@
 - (void)promptSaveChain:(NSDictionary *)c type:(int)vt {
     NSString *text = [self chainText:c[@"name"] staticOff:[c[@"off"] unsignedLongLongValue]
                                 offs:c[@"offs"] number:1];
+    char pbuf[MEMREAD_PROC_PATH_MAX] = {0};
+    NSString *procPath = @"";
+    if (memread_proc_path(self.pid, pbuf, sizeof(pbuf)) == 0 && pbuf[0]) {
+        procPath = [NSString stringWithUTF8String:pbuf] ?: @"";
+    }
     UIAlertController *a = [UIAlertController
         alertControllerWithTitle:@"保存指针链"
                          message:[NSString stringWithFormat:@"%@\n\n重启游戏后按模块基址重算，链断会显示「链断了」", text]
@@ -415,7 +420,8 @@
                                                    type:vt
                                                   label:label
                                                   group:group
-                                                   note:@""];
+                                                   note:@""
+                                               procPath:procPath];
         UIAlertController *r = [UIAlertController alertControllerWithTitle:(ok ? @"已保存" : @"保存失败")
                                                                    message:(ok ? text : @"链字段缺失")
                                                             preferredStyle:UIAlertControllerStyleAlert];
@@ -426,6 +432,11 @@
 }
 
 - (void)promptSaveAllChains:(NSArray<NSDictionary *> *)chains type:(int)vt {
+    char pbuf[MEMREAD_PROC_PATH_MAX] = {0};
+    NSString *procPath = @"";
+    if (memread_proc_path(self.pid, pbuf, sizeof(pbuf)) == 0 && pbuf[0]) {
+        procPath = [NSString stringWithUTF8String:pbuf] ?: @"";
+    }
     UIAlertController *a = [UIAlertController
         alertControllerWithTitle:[NSString stringWithFormat:@"保存 %d 条链", (int)chains.count]
                          message:@"重启游戏后逐条看哪个还能读对，其余删掉即可。全部存同一分组，标签自动编号。"
@@ -460,7 +471,8 @@
                                                  type:vt
                                                 label:[NSString stringWithFormat:@"%@%lu", prefix, (unsigned long)(i + 1)]
                                                 group:group
-                                                 note:@""]) saved++;
+                                                 note:@""
+                                             procPath:procPath]) saved++;
         }
         if (group.length) [[NSUserDefaults standardUserDefaults] setObject:group forKey:@"MemReadLastGroup"];
         UIAlertController *r = [UIAlertController
