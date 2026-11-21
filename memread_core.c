@@ -2178,6 +2178,25 @@ static int chain_read_u64(task_t task, uint64_t addr, uint64_t *out) {
     return 0;
 }
 
+// 地址是否落在某个已解析模块的任意段里
+static int chain_addr_in_module(uint64_t addr) {
+    if (!g_modsegs) return 0;
+    for (int i = 0; i < g_modsegn; i++) {
+        if (addr >= g_modsegs[i].seg_start && addr < g_modsegs[i].seg_end) return 1;
+    }
+    return 0;
+}
+
+// 对象合法性：8 字节对齐、可读，且对象开头 8 字节（vtable）指向模块内
+// （UE 的 UObject 都是这个形态；能挡掉绝大多数“值凑巧相等”的别名路径）
+static int chain_is_object(task_t task, uint64_t ptr) {
+    if (ptr < 0x100000000ULL || (ptr & 7)) return 0;
+    uint64_t vt = 0;
+    if (chain_read_u64(task, ptr, &vt) != 0) return 0;
+    if (vt < 0x100000000ULL || (vt & 7)) return 0;
+    return chain_addr_in_module(vt);
+}
+
 static int chain_frontier_lower(const uint64_t *f, int n, uint64_t key) {
     int lo = 0, hi = n;
     while (lo < hi) {
@@ -2228,11 +2247,12 @@ static int chain_scan_level(task_t task, const uint64_t *front, int fn,
                     memcpy(&v, buf + o, 8);
                     if (v < 0x100000000ULL) continue;
                     uint64_t lo = v - MEMREAD_CHAIN_OFF_NEG;   // 只允许极小的负偏移（成员指针指向对象内部时才有）
-                    uint64_t hi = v + MEMREAD_CHAIN_OFF_WIN;   // 结构体字段偏移，通常 < 0x1000
+                    uint64_t hi = v + MEMREAD_CHAIN_OFF_WIN;   // UE 的 UObject 字段偏移经常上万字节
                     int i = chain_frontier_lower(front, fn, lo);
                     for (; i < fn && front[i] <= hi; i++) {
                         int64_t d = (int64_t)front[i] - (int64_t)v;
                         if (d < -(int64_t)MEMREAD_CHAIN_OFF_NEG || d > (int64_t)MEMREAD_CHAIN_OFF_WIN) continue;
+                        if (!chain_is_object(task, v)) continue;   // 值不是对象指针 → 别名，丢弃（放在匹配之后，避免每个槽都读一次）
                         if (*outn >= cap) { full = 1; break; }
                         out[*outn].addr = (uint64_t)addr + off + o;
                         out[*outn].off = (int32_t)d;
@@ -2251,11 +2271,16 @@ static int chain_scan_level(task_t task, const uint64_t *front, int fn,
     return 0;
 }
 
-// 槽地址是否落在某个模块的可写段里（是 → 该地址可跨重启复原）
+// 槽地址是否落在某个模块的数据段里（是 → 该地址可跨重启复原）
+// 允许 __DATA / __DATA_CONST / __common / __bss：静态指针不一定都在可写段
 static int chain_module_slot(uint64_t addr, memread_modseg_t *out) {
     if (!g_modsegs) return -1;
     for (int i = 0; i < g_modsegn; i++) {
-        if (g_modsegs[i].writable && addr >= g_modsegs[i].seg_start && addr < g_modsegs[i].seg_end) {
+        const char *sn = g_modsegs[i].segname;
+        int is_data = (strstr(sn, "DATA") != NULL) || (strstr(sn, "data") != NULL) ||
+                      (strstr(sn, "common") != NULL) || (strstr(sn, "bss") != NULL);
+        if (!is_data) continue;
+        if (addr >= g_modsegs[i].seg_start && addr < g_modsegs[i].seg_end) {
             if (out) *out = g_modsegs[i];
             return 0;
         }
@@ -2263,20 +2288,26 @@ static int chain_module_slot(uint64_t addr, memread_modseg_t *out) {
     return 1;
 }
 
-static int chain_verify(task_t task, uint64_t slot, const int64_t *offs, int depth, uint64_t target) {
+static int chain_verify(task_t task, uint64_t slot, const int64_t *offs, int depth, uint64_t target,
+                        int *out_valid) {
     uint64_t a = slot;
+    int valid = 0;
     for (int i = 0; i < depth; i++) {
         uint64_t v = 0;
         if (chain_read_u64(task, a, &v) != 0) return -1;
         if (v < 0x100000000ULL) return 1;
+        if (chain_is_object(task, v)) valid++;
         a = (uint64_t)((int64_t)v + offs[i]);
     }
+    if (out_valid) *out_valid = valid;
     return (a == target) ? 0 : 1;
 }
 
 static int chain_cmp(const void *pa, const void *pb) {
     const memread_chain_t *a = (const memread_chain_t *)pa;
     const memread_chain_t *b = (const memread_chain_t *)pb;
+    // 对象校验通过的跳数多者优先：这才是“真对象路径”的主要判据
+    if (a->valid_hops != b->valid_hops) return (b->valid_hops - a->valid_hops);
     if (a->depth != b->depth) return (a->depth < b->depth) ? -1 : 1;
     int am = (strcmp(a->name, "main") == 0);
     int bm = (strcmp(b->name, "main") == 0);
@@ -2343,13 +2374,15 @@ int memread_chain_scan(pid_t pid, uint64_t target, int max_depth,
                     offs[k] = nd->off;
                     p = nd->parent;
                 }
-                if (chain_verify(task, lv[lvl][j].addr, offs, depth, target) != 0) continue;
+                int valid_hops = 0;
+                if (chain_verify(task, lv[lvl][j].addr, offs, depth, target, &valid_hops) != 0) continue;
                 memread_chain_t *c = &out[results];
                 memset(c, 0, sizeof(*c));
                 memcpy(c->uuid, seg.uuid, sizeof(c->uuid));
                 memcpy(c->name, seg.name, sizeof(c->name));
                 c->static_off = lv[lvl][j].addr - seg.base;
                 c->depth = depth;
+                c->valid_hops = valid_hops;
                 memcpy(c->offs, offs, sizeof(c->offs));
                 results++;
             }
@@ -2621,6 +2654,13 @@ int memread_chain_resolve_ex(pid_t pid, const char *uuid, uint64_t static_off,
     for (int i = 0; i < depth; i++) {
         uint64_t v = 0;
         if (chain_read_u64(task, a, &v) != 0 || v < 0x100000000ULL) {
+            rc = -3;
+            if (fail_hop) *fail_hop = i + 1;
+            if (fail_val) *fail_val = v;
+            break;
+        }
+        // 中间指针必须是「对象」（开头是模块内 vtable），否则说明链指到了普通数据
+        if (i + 1 < depth && !chain_is_object(task, v)) {
             rc = -3;
             if (fail_hop) *fail_hop = i + 1;
             if (fail_val) *fail_val = v;

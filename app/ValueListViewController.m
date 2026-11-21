@@ -508,7 +508,9 @@
                 @"uuid": [NSString stringWithUTF8String:chains[i].uuid],
                 @"name": [NSString stringWithUTF8String:chains[i].name],
                 @"off": @(chains[i].static_off),
-                @"offs": offs
+                @"offs": offs,
+                @"obj": @(chains[i].valid_hops),
+                @"depth": @(chains[i].depth)
             }];
         }
 
@@ -540,7 +542,7 @@
     l.numberOfLines = 3;
     l.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
     l.textColor = [UIColor whiteColor];
-    l.text = @"第 1/4 层  已扫 0%\n准备中…";
+    l.text = [NSString stringWithFormat:@"第 1/%d 层  已扫 0%%\n准备中…", MEMREAD_CHAIN_MAX_DEPTH];
     [v addSubview:l];
 
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -597,7 +599,7 @@
                  target:(uint64_t)t type:(int)vt {
     if (n <= 0 || chains.count == 0) {
         NSString *m = (n == 0)
-            ? @"3 层、4 层都没找到静态指针链。常见原因：中间指针只存在临时对象里、或走对象池 + 索引，不是固定字段链。"
+            ? @"1~6 层都没找到静态指针链。常见原因：这个值不在对象字段里（临时缓冲/网络包副本），或者对象头不是 vtable 形态。"
             : ([self chainCancelled] ? @"已取消扫描。" : [NSString stringWithFormat:@"扫描失败 rc=%d", n]);
         UIAlertController *e = [UIAlertController alertControllerWithTitle:@"没有链"
                                                                   message:m
@@ -608,12 +610,14 @@
     }
 
     NSMutableString *msg = [NSMutableString stringWithFormat:
-        @"命中 %d 条（最短 %d 层），已按「层数少 → main 模块 → 偏移小」排序，越靠前越稳。\n"
-        @"先存一条、重启游戏验证；拿不准就「全部保存到分组」，重启后逐个看哪个还对。\n\n", (int)chains.count, depth];
+        @"命中 %d 条（最短 %d 层），已按「对象校验跳数多 → 层数少 → main 模块 → 偏移小」排序，越靠前越可能是真路径。\n"
+        @"对象校验 = 每一跳的指针所指对象，开头 8 字节是模块内 vtable（UE 的 UObject 特征）。\n\n",
+        (int)chains.count, depth];
     for (int i = 0; i < chains.count && i < 3; i++) {
         NSDictionary *c = chains[i];
-        [msg appendFormat:@"%@\n", [self chainText:c[@"name"] staticOff:[c[@"off"] unsignedLongLongValue]
-                                             offs:c[@"offs"] number:i + 1]];
+        [msg appendFormat:@"%@  （对象 %@/%@）\n",
+         [self chainText:c[@"name"] staticOff:[c[@"off"] unsignedLongLongValue]
+                     offs:c[@"offs"] number:i + 1], c[@"obj"], c[@"depth"]];
     }
     if (chains.count > 3) [msg appendFormat:@"…另 %d 条见下方列表", (int)chains.count - 3];
 
@@ -623,9 +627,9 @@
     __weak typeof(self) ws = self;
     for (int i = 0; i < chains.count; i++) {
         NSDictionary *c = chains[i];
-        NSString *title = [NSString stringWithFormat:@"#%d  %@ + 0x%llX  (%lu 层)",
+        NSString *title = [NSString stringWithFormat:@"#%d  %@ + 0x%llX  (%lu 层 · 对象 %@)",
                            i + 1, c[@"name"], [c[@"off"] unsignedLongLongValue],
-                           (unsigned long)((NSArray *)c[@"offs"]).count];
+                           (unsigned long)((NSArray *)c[@"offs"]).count, c[@"obj"]];
         [a addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *x) {
             [ws promptSaveChain:c type:vt];
