@@ -321,12 +321,18 @@
     if (memread_proc_path(self.pid, pbuf, sizeof(pbuf)) == 0 && pbuf[0]) {
         procPath = [NSString stringWithUTF8String:pbuf] ?: @"";
     }
+    NSString *extra = @"";
+    if (stable >= 110) {
+        extra = [NSString stringWithFormat:
+            @"\n\n注意：这次采样数值几乎没变化（稳定字节 %d/%d）。指纹太严，重启后可能扫不到；"
+            @"建议退回游戏让数值变化（开枪/切枪）再重采一次。", stable, win];
+    }
     UIAlertController *a = [UIAlertController
         alertControllerWithTitle:@"保存值指纹"
                          message:[NSString stringWithFormat:
                                   @"窗口 %d 字节，稳定字节 %d 个，类型 %@\n\n"
-                                  @"重启游戏后点这行的「读」会先扫堆找指纹，找到再按同一偏移读值。",
-                                  win, stable, [SavedAddressStore typeName:vt]]
+                                  @"重启游戏后点这行的「读」会先扫堆找指纹，找到再按同一偏移读值。%@",
+                                  win, stable, [SavedAddressStore typeName:vt], extra]
                   preferredStyle:UIAlertControllerStyleAlert];
     [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
         tf.placeholder = @"标签名，如 M4 弹匣 / 玩家血量";

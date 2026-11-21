@@ -22,6 +22,9 @@ static uint64_t SaveParseAddr(NSString *s) {
 @property (nonatomic, strong) UIBarButtonItem *selectItem;
 @property (nonatomic, strong) UIBarButtonItem *deleteItem;
 @property (nonatomic, strong) UIToolbar *editBar;
+// 进程身份（主模块 UUID + 基址）：游戏重启后必然变，用来判断 pid 已经过期
+@property (nonatomic, copy) NSString *bindToken;
+@property (nonatomic, assign) BOOL rebindTried;
 // 指纹定位进度浮层
 @property (nonatomic, strong) UIView *sigHud;
 @property (nonatomic, strong) UILabel *sigHudLabel;
@@ -156,6 +159,7 @@ static uint64_t SaveParseAddr(NSString *s) {
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
+    self.rebindTried = NO;
     [self reloadAll];
 }
 
@@ -181,9 +185,28 @@ static uint64_t SaveParseAddr(NSString *s) {
     [self refreshValues];
 }
 
+- (NSString *)currentProcToken {
+    if (self.pid <= 0) return @"";
+    char u[40] = {0};
+    uint64_t b = 0;
+    if (memread_proc_token(self.pid, u, sizeof(u), &b) != 0) return @"";
+    return [NSString stringWithFormat:@"%s|%llu", u, b];
+}
+
+// pid 过期（游戏重启）就重绑并重新解析；返回是否发生了重绑
+- (BOOL)ensurePidFresh {
+    NSString *now = [self currentProcToken];
+    if (!self.bindToken.length || !now.length || [now isEqualToString:self.bindToken]) return NO;
+    [self rebindPidIfNeeded];
+    [self resolveAddresses];
+    return YES;
+}
+
 - (void)refreshValues {
     [self.values removeAllObjects];
     [self.table reloadData];
+
+    if ([self ensurePidFresh]) self.rebindTried = YES;
 
     NSUInteger gen = ++self.generation;
     pid_t pid = self.pid;
@@ -194,15 +217,17 @@ static uint64_t SaveParseAddr(NSString *s) {
     __weak typeof(self) ws = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSMutableDictionary *res = [NSMutableDictionary dictionaryWithCapacity:items.count];
+        BOOL stale = NO;
         for (NSUInteger i = 0; i < items.count; i++) {
             SavedAddress *s = items[i];
             NSNumber *ra = resolved[@(i)];
             if (!ra) { res[@(i)] = s.hasSig ? @"指纹（未定位）" : @"模块未加载"; continue; }
             double v = 0;
             int rc = memread_read_scalar(pid, ra.unsignedLongLongValue, s.type, &v);
+            if (rc == -1) stale = YES;   // task_for_pid 失败 = pid 已不是那个游戏了
             res[@(i)] = (rc == 0)
                 ? [SavedAddressStore formatValue:v type:s.type]
-                : [NSString stringWithFormat:@"不可读 rc=%d", rc];
+                : (rc == -1 ? @"进程已变 rc=-1" : [NSString stringWithFormat:@"不可读 rc=%d", rc]);
         }
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(ws) self2 = ws;
@@ -210,6 +235,12 @@ static uint64_t SaveParseAddr(NSString *s) {
             [self2.values removeAllObjects];
             [self2.values addEntriesFromDictionary:res];
             [self2.table reloadData];
+            if (stale && !self2.rebindTried) {
+                self2.rebindTried = YES;
+                [self2 rebindPidIfNeeded];
+                [self2 resolveAddresses];
+                [self2 refreshValues];
+            }
         });
     });
 }
@@ -217,6 +248,7 @@ static uint64_t SaveParseAddr(NSString *s) {
 - (void)resolveAddresses {
     self.resolved = [NSMutableDictionary dictionaryWithCapacity:self.items.count];
     self.resolveNotes = [NSMutableDictionary dictionary];
+    self.bindToken = @"";
     if (self.pid <= 0) {
         for (NSUInteger i = 0; i < self.items.count; i++) self.resolveNotes[@(i)] = @"未绑定进程";
         return;
@@ -261,6 +293,7 @@ static uint64_t SaveParseAddr(NSString *s) {
         }
         // 解析不到就留空：这条会显示「模块未加载」
     }
+    self.bindToken = [self currentProcToken];
 }
 
 // 游戏重启后 pid 会变：按保存时记下的可执行路径找回新 pid
@@ -280,11 +313,10 @@ static pid_t SavedFindPidForPath(NSString *path) {
     for (SavedAddress *s in self.items) {
         if (!s.procPath.length) continue;
         pid_t p = SavedFindPidForPath(s.procPath);
-        if (p > 0 && p != self.pid) {
+        if (p > 0) {
             self.pid = p;
             return;
         }
-        return;   // 找到第一条带路径的记录就够了
     }
 }
 
@@ -419,6 +451,15 @@ static volatile int gSigCancelFlag = 0;
             __strong typeof(ws) self2 = ws;
             if (!self2) return;
             sender.enabled = YES;
+            if (rc == -1) {
+                // pid 已过期：先重绑 + 重新解析，再整页重读
+                self2.values[@(flat)] = @"进程已变，重绑中";
+                self2.rebindTried = NO;
+                [self2 ensurePidFresh];
+                [self2 resolveAddresses];
+                [self2 refreshValues];
+                return;
+            }
             self2.values[@(flat)] = (rc == 0)
                 ? [SavedAddressStore formatValue:v type:s.type]
                 : [NSString stringWithFormat:@"不可读 rc=%d", rc];
