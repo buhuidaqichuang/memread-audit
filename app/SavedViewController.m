@@ -30,6 +30,10 @@ static uint64_t SaveParseAddr(NSString *s) {
 @property (nonatomic, strong) UILabel *sigHudLabel;
 @property (nonatomic, strong) NSTimer *sigHudTimer;
 @property (nonatomic, strong) NSDate *sigHudStart;
+@property (nonatomic, copy) NSString *sigHudTitle;
+@property (nonatomic, assign) BOOL sigAutoCancel;
+@property (nonatomic, strong) NSMutableArray<NSNumber *> *sigAutoQueue;
+@property (nonatomic, assign) NSUInteger sigAutoIndex;
 @end
 
 @implementation SavedViewController
@@ -183,6 +187,7 @@ static uint64_t SaveParseAddr(NSString *s) {
     }
     [self.table reloadData];
     [self refreshValues];
+    [self autoLocateSignatures];
 }
 
 - (NSString *)currentProcToken {
@@ -438,6 +443,38 @@ static pid_t SavedFindPidForPath(NSString *path) {
 // 「读」按钮：立刻读这条地址的最新值并刷新本行（指纹条目先定位再读）
 static volatile int gSigCancelFlag = 0;
 
+// 指纹定位结果缓存：同一 pid 内不必每次重扫；换进程自动失效
+static NSMutableDictionary<NSString *, NSNumber *> *MemSavedSigCache = nil;
+static NSLock *MemSavedSigLock = nil;
+
+static void MemSavedSigCacheInit(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        MemSavedSigCache = [NSMutableDictionary dictionary];
+        MemSavedSigLock = [[NSLock alloc] init];
+    });
+}
+
+- (NSString *)sigCacheKeyFor:(SavedAddress *)s {
+    return [NSString stringWithFormat:@"%d|%@|%@|%d", (int)self.pid,
+            s.label ?: @"", s.group ?: @"", s.type];
+}
+
+- (NSNumber *)cachedSigAddressFor:(SavedAddress *)s {
+    MemSavedSigCacheInit();
+    [MemSavedSigLock lock];
+    NSNumber *n = MemSavedSigCache[[self sigCacheKeyFor:s]];
+    [MemSavedSigLock unlock];
+    return n;
+}
+
+- (void)setCachedSigAddress:(uint64_t)addr for:(SavedAddress *)s {
+    MemSavedSigCacheInit();
+    [MemSavedSigLock lock];
+    MemSavedSigCache[[self sigCacheKeyFor:s]] = @(addr);
+    [MemSavedSigLock unlock];
+}
+
 - (void)readValueAt:(uint64_t)addr flat:(NSUInteger)flat sender:(UIButton *)sender {
     if (flat >= self.items.count) return;
     SavedAddress *s = self.items[flat];
@@ -475,6 +512,12 @@ static volatile int gSigCancelFlag = 0;
     SavedAddress *s = self.items[flat];
     NSNumber *ra = self.resolved[@(flat)];
     if (!ra && s.hasSig) {
+        NSNumber *cached = [self cachedSigAddressFor:s];
+        if (cached) {
+            self.resolved[@(flat)] = cached;
+            [self readValueAt:cached.unsignedLongLongValue flat:flat sender:sender];
+            return;
+        }
         [self locateSignatureFor:s flat:flat sender:sender];
         return;
     }
@@ -485,6 +528,77 @@ static volatile int gSigCancelFlag = 0;
         return;
     }
     [self readValueAt:ra.unsignedLongLongValue flat:flat sender:sender];
+}
+
+// 进页面就自动定位指纹：命中即填地址并读数，不必手动按「读」
+- (void)autoLocateSignatures {
+    self.sigAutoCancel = NO;
+    self.sigAutoQueue = nil;
+    if (self.pid <= 0) return;
+    NSMutableArray<NSNumber *> *todo = [NSMutableArray array];
+    for (NSUInteger i = 0; i < self.items.count; i++) {
+        SavedAddress *s = self.items[i];
+        if (!s.hasSig) continue;
+        NSNumber *cached = [self cachedSigAddressFor:s];
+        if (cached) { self.resolved[@(i)] = cached; continue; }
+        [todo addObject:@(i)];
+    }
+    if (!todo.count) return;
+    self.sigAutoQueue = todo;
+    self.sigAutoIndex = 0;
+    [self locateNextAutoSig];
+}
+
+- (void)locateNextAutoSig {
+    if (self.sigAutoCancel) { [self hideSigHUD]; self.sigAutoQueue = nil; return; }
+    if (!self.sigAutoQueue || self.sigAutoIndex >= self.sigAutoQueue.count) {
+        [self hideSigHUD];
+        self.sigAutoQueue = nil;
+        [self refreshValues];
+        return;
+    }
+    NSUInteger flat = self.sigAutoQueue[self.sigAutoIndex].unsignedIntegerValue;
+    if (flat >= self.items.count) {
+        self.sigAutoIndex++;
+        [self locateNextAutoSig];
+        return;
+    }
+    SavedAddress *s = self.items[flat];
+    memread_sig_t *sig = (memread_sig_t *)calloc(1, sizeof(memread_sig_t));
+    if (!sig) { self.sigAutoIndex++; [self locateNextAutoSig]; return; }
+    sig->win = s.sigWin;
+    sig->target_off = s.sigTargetOff;
+    sig->stable_n = (int)MIN(s.sigOffs.count, (NSUInteger)MEMREAD_SIG_MAX_STABLE);
+    for (int i = 0; i < sig->stable_n; i++) {
+        sig->offs[i] = (unsigned char)[s.sigOffs[(NSUInteger)i] unsignedIntValue];
+        sig->vals[i] = (unsigned char)[s.sigVals[(NSUInteger)i] unsignedIntValue];
+    }
+    gSigCancelFlag = 0;
+    self.sigHudTitle = [NSString stringWithFormat:@"自动定位 %lu/%lu",
+                        (unsigned long)(self.sigAutoIndex + 1), (unsigned long)self.sigAutoQueue.count];
+    [self showSigHUD];
+
+    pid_t pid = self.pid;
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        uint64_t cand[16] = {0};
+        int n = memread_sig_scan(pid, sig, cand, 16, &gSigCancelFlag);
+        free(sig);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) self2 = ws;
+            if (!self2) return;
+            [self2 hideSigHUD];
+            if (n > 0) {
+                self2.resolved[@(flat)] = @(cand[0]);
+                [self2 setCachedSigAddress:cand[0] for:s];
+                [self2 readValueAt:cand[0] flat:flat sender:nil];
+            } else if (n == 0) {
+                self2.resolveNotes[@(flat)] = @"指纹没扫到（回对局再刷新）";
+            }
+            self2.sigAutoIndex++;
+            [self2 locateNextAutoSig];
+        });
+    });
 }
 
 // 扫描指纹定位：命中 1 处直接读；多处让用户挑
@@ -538,6 +652,7 @@ static volatile int gSigCancelFlag = 0;
                     [self2 presentViewController:e animated:YES completion:nil];
                 } else if (n == 1) {
                     self2.resolved[@(flat)] = arr.firstObject;
+                    [self2 setCachedSigAddress:arr.firstObject.unsignedLongLongValue for:self2.items[flat]];
                     [self2 readValueAt:arr.firstObject.unsignedLongLongValue flat:flat sender:sender];
                 } else {
                     [self2 chooseSignatureCandidate:arr flat:flat sender:sender];
@@ -595,17 +710,12 @@ static volatile int gSigCancelFlag = 0;
     unsigned long long done = 0, total = 0;
     memread_sig_progress(&phase, &done, &total, &hits);
     double el = self.sigHudStart ? -[self.sigHudStart timeIntervalSinceNow] : 0;
-    if (phase == 1) {
-        self.sigHudLabel.text = [NSString stringWithFormat:
-            @"采样指纹  第 %llu/%d 次\n保持数值在变化（开枪/切枪）\n用时 %.1fs",
-            done, 4, el];
-        return;
-    }
+    NSString *head = self.sigHudTitle.length ? self.sigHudTitle : @"定位指纹";
     double pct = (total > 0) ? (100.0 * (double)done / (double)total) : 0.0;
     if (pct > 100.0) pct = 100.0;
     self.sigHudLabel.text = [NSString stringWithFormat:
-        @"定位指纹  已扫 %.0f%%\n%.0f / %.0f MB  命中 %d 处\n用时 %.0fs",
-        pct, (double)done / 1048576.0, (double)total / 1048576.0, hits, el];
+        @"%@  已扫 %.0f%%\n%.0f / %.0f MB  命中 %d 处\n用时 %.0fs",
+        head, pct, (double)done / 1048576.0, (double)total / 1048576.0, hits, el];
 }
 
 - (void)hideSigHUD {
@@ -618,6 +728,8 @@ static volatile int gSigCancelFlag = 0;
 
 - (void)onCancelSigHUD {
     gSigCancelFlag = 1;
+    self.sigAutoCancel = YES;
+    self.sigAutoQueue = nil;
     [self hideSigHUD];
 }
 
@@ -636,12 +748,19 @@ static volatile int gSigCancelFlag = 0;
             __strong typeof(ws) self2 = ws;
             if (!self2) return;
             self2.resolved[@(flat)] = @(ad);
+            if (flat < self2.items.count) [self2 setCachedSigAddress:ad for:self2.items[flat]];
             [self2 readValueAt:ad flat:flat sender:sender];
         }]];
     }
     [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    a.popoverPresentationController.sourceView = sender;
-    a.popoverPresentationController.sourceRect = sender.bounds;
+    if (sender) {
+        a.popoverPresentationController.sourceView = sender;
+        a.popoverPresentationController.sourceRect = sender.bounds;
+    } else {
+        a.popoverPresentationController.sourceView = self.view;
+        a.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds),
+                                                                CGRectGetMidY(self.view.bounds), 1, 1);
+    }
     [self presentViewController:a animated:YES completion:nil];
 }
 
@@ -659,6 +778,8 @@ static volatile int gSigCancelFlag = 0;
     NSString *where;
     if (s.hasChain) {
         where = [NSString stringWithFormat:@"\n链: %@", [self chainSummary:s]];
+    } else if (s.hasSig) {
+        where = [NSString stringWithFormat:@"\n指纹: %lu 字节 / 窗口 %d", (unsigned long)s.sigOffs.count, s.sigWin];
     } else if (s.inModule) {
         where = [NSString stringWithFormat:@"\n模块: %@ + 0x%llX", (s.moduleName.length ? s.moduleName : @"mod"), s.moduleOff];
     } else {
@@ -684,6 +805,19 @@ static volatile int gSigCancelFlag = 0;
     }]];
     [a addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive
                                         handler:^(UIAlertAction *x) { [ws confirmDeleteAt:flat]; }]];
+    if (s.hasSig) {
+        [a addAction:[UIAlertAction actionWithTitle:@"重新定位指纹" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *x) {
+            __strong typeof(ws) self2 = ws;
+            if (!self2) return;
+            MemSavedSigCacheInit();
+            [MemSavedSigLock lock];
+            [MemSavedSigCache removeObjectForKey:[self2 sigCacheKeyFor:s]];
+            [MemSavedSigLock unlock];
+            [[self2 resolved] removeObjectForKey:@(flat)];
+            [self2 locateSignatureFor:s flat:flat sender:nil];
+        }]];
+    }
     [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:a animated:YES completion:nil];
 }
