@@ -102,6 +102,14 @@ static void MemDrawText(NSString *s, CGRect r, UIFont *font, UIColor *color) {
     }];
 }
 
+static NSString *MemTypeTag(int t) {
+    if (t == MEMREAD_VALTYPE_INT32) return @"i32";
+    if (t == MEMREAD_VALTYPE_INT64) return @"i64";
+    if (t == MEMREAD_VALTYPE_FLOAT) return @"f32";
+    if (t == MEMREAD_VALTYPE_DOUBLE) return @"f64";
+    return @"?";
+}
+
 static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color) {
     NSMutableParagraphStyle *p = [[NSMutableParagraphStyle alloc] init];
     p.lineBreakMode = NSLineBreakByClipping;
@@ -405,9 +413,12 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
     for (unsigned long long i = 0; i < n && i < 5; i++) {
         uint64_t addr = 0, prev = 0;
         double cur = 0;
-        if (memread_valscan_get(i, &addr, &prev) != 0) continue;
-        int prc = memread_valscan_peek(pid, type, i, NULL, &cur);
-        NSString *v = (prc == 0) ? [SavedAddressStore formatValue:cur type:type] : @"?";
+        int vt = type;
+        if (memread_valscan_get_ex(i, &addr, &prev, &vt) != 0) continue;
+        int prc = memread_valscan_peek(pid, vt, i, NULL, &cur);
+        NSString *v = (prc == 0)
+            ? [NSString stringWithFormat:@"%@ %@", [SavedAddressStore formatValue:cur type:vt], MemTypeTag(vt)]
+            : @"?";
         [rows addObject:@{@"addr": @(addr), @"v": v}];
     }
     self.lastLeft = left;
@@ -441,9 +452,12 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
     for (unsigned long long i = 0; i < n && i < 5; i++) {
         uint64_t addr = 0, prev = 0;
         double cur = 0;
-        if (memread_valscan_get(i, &addr, &prev) != 0) continue;
-        int prc = memread_valscan_peek(pid, type, i, NULL, &cur);
-        NSString *v = (prc == 0) ? [SavedAddressStore formatValue:cur type:type] : @"?";
+        int vt = type;
+        if (memread_valscan_get_ex(i, &addr, &prev, &vt) != 0) continue;
+        int prc = memread_valscan_peek(pid, vt, i, NULL, &cur);
+        NSString *v = (prc == 0)
+            ? [NSString stringWithFormat:@"%@ %@", [SavedAddressStore formatValue:cur type:vt], MemTypeTag(vt)]
+            : @"?";
         [rows addObject:@{@"addr": @(addr), @"v": v}];
     }
     unsigned long long after = left;

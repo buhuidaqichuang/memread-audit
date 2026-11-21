@@ -103,6 +103,7 @@ static uint64_t MemParseAddr(NSString *s) {
 
 + (NSString *)typeName:(int)type {
     switch (type) {
+        case -1: return @"auto";
         case 0: return @"int32";
         case 1: return @"int64";
         case 2: return @"float";

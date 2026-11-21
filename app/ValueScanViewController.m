@@ -67,7 +67,13 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
 @implementation ValueScanViewController
 
 - (int)type {
-    return (int)self.typeControl.selectedSegmentIndex;
+    switch (self.typeControl.selectedSegmentIndex) {
+        case 0: return MEMREAD_VALTYPE_AUTO;
+        case 2: return MEMREAD_VALTYPE_INT64;
+        case 3: return MEMREAD_VALTYPE_FLOAT;
+        case 4: return MEMREAD_VALTYPE_DOUBLE;
+        default: return MEMREAD_VALTYPE_INT32;
+    }
 }
 
 - (void)viewDidLoad {
@@ -95,7 +101,7 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
     UILabel *t = [self addLabel:@"数值类型" width:W y:&y];
     t.font = [UIFont boldSystemFontOfSize:13];
 
-    self.typeControl = [[UISegmentedControl alloc] initWithItems:@[@"int32", @"int64", @"float", @"double"]];
+    self.typeControl = [[UISegmentedControl alloc] initWithItems:@[@"auto", @"int32", @"int64", @"float", @"double"]];
     self.typeControl.frame = CGRectMake(20, y, W - 40, 36);
     self.typeControl.selectedSegmentIndex = 0;
     [self.typeControl addTarget:self action:@selector(onTypeChanged) forControlEvents:UIControlEventValueChanged];

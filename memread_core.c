@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 #include <time.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
@@ -996,6 +997,7 @@ int memread_find_ex(pid_t pid, const char *out_path, const char *needle,
 typedef struct {
     uint64_t addr;
     uint64_t prev;   // 上一轮原始位：int 零扩展存值；float/double 存位模式
+    int type;        // 该候选的类型（auto 扫描逐条记录；其余等于全局类型）
 } memread_valent_t;
 
 static memread_valent_t *g_valents = NULL;
@@ -1100,11 +1102,12 @@ int memread_valscan_first(pid_t pid, int rw_only, int type, double value, double
                           memread_region_cb cb, void *ctx,
                           unsigned long long *phits, volatile int *cancel) {
     if (phits) *phits = 0;
-    if (type < MEMREAD_VALTYPE_INT32 || type > MEMREAD_VALTYPE_DOUBLE) return -2;
+    if (type != MEMREAD_VALTYPE_AUTO &&
+        (type < MEMREAD_VALTYPE_INT32 || type > MEMREAD_VALTYPE_DOUBLE)) return -2;
     if (tol < 0) tol = -tol;
 
     memread_valscan_reset();
-    size_t sz = valsize(type);
+    size_t sz = (type == MEMREAD_VALTYPE_AUTO) ? 4 : valsize(type);
 
     task_t task = MACH_PORT_NULL;
     kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
@@ -1157,7 +1160,62 @@ int memread_valscan_first(pid_t pid, int rw_only, int type, double value, double
                     bytes += cur;
                     size_t i = 0;
                     size_t limit = (size_t)cur;
-                    if (sz == 4) {
+                    if (type == MEMREAD_VALTYPE_AUTO) {
+                        // 四种类型一起扫：4 字节位置同时看 int32 / float，8 字节对齐处再看 int64 / double
+                        for (; i + 4 <= limit; i += 4) {
+                            uint32_t v;
+                            memcpy(&v, buf + i, 4);
+
+                            double di = (double)(int32_t)v - value;
+                            if (di < 0) di = -di;
+                            if (di <= tol && count < MEMREAD_VALSCAN_MAX) {
+                                g_valents[count].addr = (uint64_t)(addr + off + i);
+                                g_valents[count].prev = (uint64_t)v;
+                                g_valents[count].type = MEMREAD_VALTYPE_INT32;
+                                count++;
+                            }
+
+                            float f;
+                            memcpy(&f, &v, 4);
+                            if (!isnan(f)) {
+                                double df = (double)f - value;
+                                if (df < 0) df = -df;
+                                if (df <= tol && count < MEMREAD_VALSCAN_MAX) {
+                                    g_valents[count].addr = (uint64_t)(addr + off + i);
+                                    g_valents[count].prev = (uint64_t)v;
+                                    g_valents[count].type = MEMREAD_VALTYPE_FLOAT;
+                                    count++;
+                                }
+                            }
+
+                            if ((i & 7) == 0 && i + 8 <= limit) {
+                                uint64_t raw;
+                                memcpy(&raw, buf + i, 8);
+
+                                double dq = (double)(int64_t)raw - value;
+                                if (dq < 0) dq = -dq;
+                                if (dq <= tol && count < MEMREAD_VALSCAN_MAX) {
+                                    g_valents[count].addr = (uint64_t)(addr + off + i);
+                                    g_valents[count].prev = raw;
+                                    g_valents[count].type = MEMREAD_VALTYPE_INT64;
+                                    count++;
+                                }
+
+                                double dd;
+                                memcpy(&dd, &raw, 8);
+                                if (!isnan(dd)) {
+                                    double e = dd - value;
+                                    if (e < 0) e = -e;
+                                    if (e <= tol && count < MEMREAD_VALSCAN_MAX) {
+                                        g_valents[count].addr = (uint64_t)(addr + off + i);
+                                        g_valents[count].prev = raw;
+                                        g_valents[count].type = MEMREAD_VALTYPE_DOUBLE;
+                                        count++;
+                                    }
+                                }
+                            }
+                        }
+                    } else if (sz == 4) {
                         for (; i + 4 <= limit; i += 4) {
                             uint32_t v;
                             memcpy(&v, buf + i, 4);
@@ -1169,6 +1227,7 @@ int memread_valscan_first(pid_t pid, int rw_only, int type, double value, double
                                 if (count < MEMREAD_VALSCAN_MAX) {
                                     g_valents[count].addr = (uint64_t)(addr + off + i);
                                     g_valents[count].prev = raw;
+                                    g_valents[count].type = type;
                                     count++;
                                 }
                             }
@@ -1184,6 +1243,7 @@ int memread_valscan_first(pid_t pid, int rw_only, int type, double value, double
                                 if (count < MEMREAD_VALSCAN_MAX) {
                                     g_valents[count].addr = (uint64_t)(addr + off + i);
                                     g_valents[count].prev = raw;
+                                    g_valents[count].type = type;
                                     count++;
                                 }
                             }
@@ -1218,7 +1278,8 @@ int memread_valscan_refine(pid_t pid, int type, int cond, double target,
                            memread_region_cb cb, void *ctx,
                            unsigned long long *phits, volatile int *cancel) {
     if (phits) *phits = 0;
-    if (type < MEMREAD_VALTYPE_INT32 || type > MEMREAD_VALTYPE_DOUBLE) return -2;
+    if (type != MEMREAD_VALTYPE_AUTO &&
+        (type < MEMREAD_VALTYPE_INT32 || type > MEMREAD_VALTYPE_DOUBLE)) return -2;
     if (!g_valents || g_valcount == 0) return 0;
 
     task_t task = MACH_PORT_NULL;
@@ -1234,27 +1295,31 @@ int memread_valscan_refine(pid_t pid, int type, int cond, double target,
     for (unsigned long long i = 0; i < n; i++) {
         if (cancel && *cancel) break;
         uint64_t raw = 0;
-        if (val_read_raw(task, g_valents[i].addr, type, &raw) != 0) {
+        int vt = g_valents[i].type;
+        if (vt < MEMREAD_VALTYPE_INT32 || vt > MEMREAD_VALTYPE_DOUBLE) vt = type;
+        if (vt < 0) vt = MEMREAD_VALTYPE_INT32;
+        if (val_read_raw(task, g_valents[i].addr, vt, &raw) != 0) {
             continue;  // 地址已不可读（内存被回收/释放），丢弃
         }
-        double cur = memread_valscan_raw2double(raw, type);
-        double prev = memread_valscan_raw2double(g_valents[i].prev, type);
+        double cur = memread_valscan_raw2double(raw, vt);
+        double prev = memread_valscan_raw2double(g_valents[i].prev, vt);
         int match = 0;
         switch (cond) {
-            case MEMREAD_VALCOND_EQUAL:     match = val_eq(cur, target, type); break;
-            case MEMREAD_VALCOND_NOT_EQUAL: match = !val_eq(cur, target, type); break;
+            case MEMREAD_VALCOND_EQUAL:     match = val_eq(cur, target, vt); break;
+            case MEMREAD_VALCOND_NOT_EQUAL: match = !val_eq(cur, target, vt); break;
             case MEMREAD_VALCOND_GREATER:   match = cur > target; break;
             case MEMREAD_VALCOND_LESS:      match = cur < target; break;
             case MEMREAD_VALCOND_INCREASED: match = cur > prev; break;
             case MEMREAD_VALCOND_DECREASED: match = cur < prev; break;
-            case MEMREAD_VALCOND_CHANGED:   match = !val_eq(cur, prev, type); break;
-            case MEMREAD_VALCOND_UNCHANGED: match = val_eq(cur, prev, type); break;
-            case MEMREAD_VALCOND_DELTA:     match = val_eq(cur - prev, target, type); break;
+            case MEMREAD_VALCOND_CHANGED:   match = !val_eq(cur, prev, vt); break;
+            case MEMREAD_VALCOND_UNCHANGED: match = val_eq(cur, prev, vt); break;
+            case MEMREAD_VALCOND_DELTA:     match = val_eq(cur - prev, target, vt); break;
             default: break;
         }
         if (match) {
             g_valents[kept].addr = g_valents[i].addr;
             g_valents[kept].prev = raw;
+            g_valents[kept].type = vt;
             kept++;
         }
         if (cb && ((i & 0x3FFF) == 0)) {
@@ -1274,7 +1339,8 @@ int memread_valscan_autorefine(pid_t pid, int type, int cond, double target,
                                unsigned long long *pleft, int *pchanged) {
     if (pleft) *pleft = g_valcount;
     if (pchanged) *pchanged = 0;
-    if (type < MEMREAD_VALTYPE_INT32 || type > MEMREAD_VALTYPE_DOUBLE) return -2;
+    if (type != MEMREAD_VALTYPE_AUTO &&
+        (type < MEMREAD_VALTYPE_INT32 || type > MEMREAD_VALTYPE_DOUBLE)) return -2;
     if (!g_valents || g_valcount == 0) return 0;
 
     task_t task = MACH_PORT_NULL;
@@ -1287,20 +1353,23 @@ int memread_valscan_autorefine(pid_t pid, int type, int cond, double target,
     unsigned long long step = (n > 4096) ? (n / 4096) : 1;
     for (unsigned long long i = 0; i < n; i += step) {
         uint64_t raw = 0;
-        if (val_read_raw(task, g_valents[i].addr, type, &raw) != 0) continue;
-        double cur = memread_valscan_raw2double(raw, type);
-        double prev = memread_valscan_raw2double(g_valents[i].prev, type);
+        int vt = g_valents[i].type;
+        if (vt < MEMREAD_VALTYPE_INT32 || vt > MEMREAD_VALTYPE_DOUBLE) vt = type;
+        if (vt < 0) vt = MEMREAD_VALTYPE_INT32;
+        if (val_read_raw(task, g_valents[i].addr, vt, &raw) != 0) continue;
+        double cur = memread_valscan_raw2double(raw, vt);
+        double prev = memread_valscan_raw2double(g_valents[i].prev, vt);
         // 只认「符合收敛方向」的变化：变小了就要求真的有人变小，
         // 否则无关地址的变大/抖动会把候选误判成全部不符合，一次清零。
         int want = 0;
         switch (cond) {
             case MEMREAD_VALCOND_DECREASED: want = (cur < prev); break;
             case MEMREAD_VALCOND_INCREASED: want = (cur > prev); break;
-            case MEMREAD_VALCOND_CHANGED:   want = !val_eq(cur, prev, type); break;
-            case MEMREAD_VALCOND_UNCHANGED: want = val_eq(cur, prev, type); break;
-            case MEMREAD_VALCOND_EQUAL:     want = val_eq(cur, target, type); break;
-            case MEMREAD_VALCOND_DELTA:     want = val_eq(cur - prev, target, type); break;
-            default:                        want = !val_eq(cur, prev, type); break;
+            case MEMREAD_VALCOND_CHANGED:   want = !val_eq(cur, prev, vt); break;
+            case MEMREAD_VALCOND_UNCHANGED: want = val_eq(cur, prev, vt); break;
+            case MEMREAD_VALCOND_EQUAL:     want = val_eq(cur, target, vt); break;
+            case MEMREAD_VALCOND_DELTA:     want = val_eq(cur - prev, target, vt); break;
+            default:                        want = !val_eq(cur, prev, vt); break;
         }
         if (want) { changed = 1; break; }
     }
@@ -1339,18 +1408,27 @@ int memread_valscan_peek(pid_t pid, int type, unsigned long long index,
     task_t task = MACH_PORT_NULL;
     kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
     if (kr != KERN_SUCCESS) return -2;
+    int vt = g_valents[index].type;
+    if (vt < MEMREAD_VALTYPE_INT32 || vt > MEMREAD_VALTYPE_DOUBLE) vt = type;
+    if (vt < 0) vt = MEMREAD_VALTYPE_INT32;
     uint64_t raw = 0;
-    int rc = val_read_raw(task, g_valents[index].addr, type, &raw);
+    int rc = val_read_raw(task, g_valents[index].addr, vt, &raw);
     mach_port_deallocate(mach_task_self(), task);
     if (rc != 0) return -3;
     if (out_addr) *out_addr = g_valents[index].addr;
-    if (out_value) *out_value = memread_valscan_raw2double(raw, type);
+    if (out_value) *out_value = memread_valscan_raw2double(raw, vt);
     return 0;
 }
 
 int memread_valscan_get(unsigned long long index, uint64_t *out_addr, uint64_t *out_prev) {
+    return memread_valscan_get_ex(index, out_addr, out_prev, NULL);
+}
+
+int memread_valscan_get_ex(unsigned long long index, uint64_t *out_addr,
+                           uint64_t *out_prev, int *out_type) {
     if (!g_valents || index >= g_valcount) return -1;
     if (out_addr) *out_addr = g_valents[index].addr;
     if (out_prev) *out_prev = g_valents[index].prev;
+    if (out_type) *out_type = g_valents[index].type;
     return 0;
 }

@@ -70,16 +70,16 @@
     }
 }
 
-- (NSString *)fmtDouble:(double)v {
-    if (self.type == MEMREAD_VALTYPE_INT32 || self.type == MEMREAD_VALTYPE_INT64) {
+- (NSString *)fmtDouble:(double)v type:(int)t {
+    if (t == MEMREAD_VALTYPE_INT32 || t == MEMREAD_VALTYPE_INT64) {
         return [NSString stringWithFormat:@"%lld", (long long)v];
     }
-    if (self.type == MEMREAD_VALTYPE_FLOAT) return [NSString stringWithFormat:@"%.4f", v];
+    if (t == MEMREAD_VALTYPE_FLOAT) return [NSString stringWithFormat:@"%.4f", v];
     return [NSString stringWithFormat:@"%.6f", v];
 }
 
-- (NSString *)fmtRaw:(uint64_t)raw {
-    return [self fmtDouble:memread_valscan_raw2double(raw, self.type)];
+- (NSString *)fmtRaw:(uint64_t)raw type:(int)t {
+    return [self fmtDouble:memread_valscan_raw2double(raw, t) type:t];
 }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
@@ -91,11 +91,12 @@
     if (!c) c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"v"];
     unsigned long long idx = [self.rows[ip.row] unsignedLongLongValue];
     uint64_t addr = 0, prev = 0;
-    if (memread_valscan_get(idx, &addr, &prev) == 0) {
-        c.textLabel.text = [NSString stringWithFormat:@"0x%llX", addr];
+    int vt = self.type;
+    if (memread_valscan_get_ex(idx, &addr, &prev, &vt) == 0) {
+        c.textLabel.text = [NSString stringWithFormat:@"0x%llX  %@", addr, [SavedAddressStore typeName:vt]];
         c.textLabel.font = [UIFont fontWithName:@"Menlo" size:13]
             ?: [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
-        c.detailTextLabel.text = [NSString stringWithFormat:@"上一轮值: %@", [self fmtRaw:prev]];
+        c.detailTextLabel.text = [NSString stringWithFormat:@"上一轮值: %@", [self fmtRaw:prev type:vt]];
         c.detailTextLabel.font = [UIFont systemFontOfSize:12];
         c.detailTextLabel.textColor = [UIColor secondaryLabelColor];
     } else {
@@ -110,6 +111,10 @@
     unsigned long long idx = [self.rows[ip.row] unsignedLongLongValue];
     pid_t pid = self.pid;
     int vt = self.type;
+    if (vt == MEMREAD_VALTYPE_AUTO) {
+        uint64_t a0 = 0, p0 = 0;
+        memread_valscan_get_ex(idx, &a0, &p0, &vt);
+    }
     __weak typeof(self) ws = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         uint64_t addr = 0;
@@ -120,7 +125,8 @@
             if (!self2) return;
             NSString *msg;
             if (rc == 0) {
-                msg = [NSString stringWithFormat:@"地址 0x%llX\n当前值: %@", addr, [self2 fmtDouble:cur]];
+                msg = [NSString stringWithFormat:@"地址 0x%llX\n类型: %@\n当前值: %@",
+                       addr, [SavedAddressStore typeName:vt], [self2 fmtDouble:cur type:vt]];
             } else {
                 msg = [NSString stringWithFormat:@"读取失败 rc=%d（地址可能已失效）", rc];
             }

@@ -68,6 +68,7 @@ int memread_proc_path(pid_t pid, char *buf, size_t bufsz);
 #define MEMREAD_VALTYPE_INT64  1
 #define MEMREAD_VALTYPE_FLOAT  2   // float32
 #define MEMREAD_VALTYPE_DOUBLE 3
+#define MEMREAD_VALTYPE_AUTO  -1   // 四种一起扫，逐条记类型
 
 // 收敛条件
 #define MEMREAD_VALCOND_EQUAL     0   // 当前值 == target
@@ -103,6 +104,10 @@ int memread_valscan_peek(pid_t pid, int type, unsigned long long index,
 
 // 取候选的地址与上一轮原始位（列表展示）；返回 0 成功
 int memread_valscan_get(unsigned long long index, uint64_t *out_addr, uint64_t *out_prev);
+
+// 同上，并回填该候选的类型（auto 扫描时逐条不同）
+int memread_valscan_get_ex(unsigned long long index, uint64_t *out_addr,
+                           uint64_t *out_prev, int *out_type);
 
 // 读任意地址的当前值（已保存地址刷新用）；返回 0 成功，-1 task_for_pid 失败，-3 地址不可读
 int memread_read_scalar(pid_t pid, uint64_t addr, int type, double *out_value);
