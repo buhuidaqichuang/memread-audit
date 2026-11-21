@@ -230,11 +230,34 @@ static int is_hexish(const char *s, size_t n) {
 }
 
 static int is_email(const char *s, size_t n) {
+    if (n < 6 || n > 254) return 0;
     const char *at = strchr(s, '@');
     if (!at || at == s) return 0;
-    if (strchr(at + 1, '.') == NULL) return 0;
-    if (strchr(s, ' ') || strchr(s, '\t')) return 0;
-    if (n < 6 || n > 254) return 0;
+    if (strchr(at + 1, '@')) return 0;                 // 只能有一个 @
+    for (const char *p = s; p < at; p++) {             // 本地部分：只允许合法字符
+        char c = *p;
+        int ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                 (c >= '0' && c <= '9') || c == '.' || c == '_' ||
+                 c == '%' || c == '+' || c == '-';
+        if (!ok) return 0;
+    }
+    const char *d = at + 1;                            // 域名部分
+    if (!*d) return 0;
+    const char *lastdot = NULL;
+    for (const char *p = d; *p; p++) {
+        char c = *p;
+        if (c == '.') { lastdot = p; continue; }
+        int ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                 (c >= '0' && c <= '9') || c == '-';
+        if (!ok) return 0;
+    }
+    if (!lastdot || lastdot == d) return 0;
+    const char *tld = lastdot + 1;
+    size_t tl = strlen(tld);
+    if (tl < 2 || tl > 10) return 0;
+    for (const char *p = tld; *p; p++) {               // TLD 必须是纯字母
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z'))) return 0;
+    }
     return 1;
 }
 
@@ -337,9 +360,10 @@ static int classify(const char *s, size_t n, const char *ctx, size_t ctxn,
         *conf = 0; *type = (n >= 32) ? "secret(hex/b64)" : "secret"; return 0;
     }
     if (is_email(s, n)) { *conf = 0; *type = "email"; return 1; }
-    if (is_cn_phone(s)) { *conf = 0; *type = "phone"; return 1; }
-    if (is_card_number(s)) { *conf = 0; *type = "card"; return 1; }
-    if (is_idcard(s)) { *conf = 0; *type = "idcard"; return 1; }
+    // 手机号 / 卡号 / 身份证：可直接定位到人或冒用（短信、支付），按高可信处理
+    if (is_cn_phone(s)) { *conf = 0; *type = "phone"; return 0; }
+    if (is_card_number(s)) { *conf = 0; *type = "card"; return 0; }
+    if (is_idcard(s)) { *conf = 0; *type = "idcard"; return 0; }
     // 自写密钥最常落在这一档：纯数字长串 / 字母数字混合长串
     if (is_digits_only(s, n)) { *conf = 2; *type = "digits"; return 2; }
     if (is_mixed_token(s, n)) { *conf = 2; *type = "mixed-token"; return 2; }
@@ -403,7 +427,7 @@ int memread_scan_ex(pid_t pid, const char *out_path, const char *label, int rw_o
             tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
     fprintf(f, "# app=%s\n", label ? label : "(unknown)");
     fprintf(f, "# mode=%s\n", rw_only ? "rw-only" : "all-readable");
-    fprintf(f, "# 分级：A=凭证/密钥类  B=身份类(邮箱/手机号/卡号/身份证)  "
+    fprintf(f, "# 分级：A=高可信(凭证/密钥/手机号/银行卡/身份证)  B=中等(邮箱等身份信息)  "
                "C=疑似值(URL/hex-base64 blob/纯数字长串/字母数字混合串)  D=普通字符串(只计数不列明细)\n\n");
 
     const mach_vm_size_t CHUNK = 4ULL * 1024 * 1024;
@@ -518,8 +542,8 @@ int memread_scan_ex(pid_t pid, const char *out_path, const char *label, int rw_o
     static const char tierc[4] = {'A', 'B', 'C', 'D'};
     static const char *confc[3] = {"high", "medium", "low"};
     static const char *tierTitle[3] = {
-        "A 档（高可信：密钥 / 凭证 / 身份证 / 银行卡等）",
-        "B 档（中等：邮箱 / 电话 / 地址 / 会话等）",
+        "A 档（高可信：密钥 / 凭证 / 手机号 / 银行卡 / 身份证）",
+        "B 档（中等：邮箱等个人身份信息）",
         "C 档（低可信：URL / 疑似 blob / 纯数字长串 / 字母数字混合串）"
     };
 
