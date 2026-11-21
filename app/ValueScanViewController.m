@@ -678,7 +678,7 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
             if (rc != 0) {
                 self2.statusLabel.text = [NSString stringWithFormat:@"快照失败 rc=%d", rc];
                 [self2 appendProgressLine:[NSString stringWithFormat:
-                    @"快照失败 rc=%d（-4 内存不足 / -5 超过 640MB 上限 / -1 取进程失败）", rc]];
+                    @"快照失败 rc=%d（-4 内存/映射失败 / -5 超 2GB 上限 / -7 写文件失败 / -8 磁盘空间不足 / -1 取进程失败）", rc]];
                 if (done) done(NO, 0, 0);
                 return;
             }

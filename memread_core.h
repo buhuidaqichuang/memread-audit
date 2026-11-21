@@ -115,7 +115,8 @@ int memread_valscan_get_ex(unsigned long long index, uint64_t *out_addr,
 int memread_read_scalar(pid_t pid, uint64_t addr, int type, double *out_value);
 
 // ============ 未知值扫描 / 坐标扫描 ============
-// 快照：把进程可写内存整块拷一份（上限 640MB），用于「不知道数值」时按变化收敛。
+// 快照：把进程可写内存整块写到 /var/mobile/Media/memread_snap.bin 再只读 mmap 回来
+// （不占常驻内存，上限 2GB；用完调 memread_snapshot_free 删除文件）
 int memread_unknown_snapshot(pid_t pid, unsigned long long *pbytes, unsigned long long *pregions);
 
 // 与快照比对，重建候选表；cond 支持 CHANGED / UNCHANGED / INCREASED / DECREASED

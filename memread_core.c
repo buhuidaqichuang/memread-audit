@@ -7,6 +7,11 @@
 #include <math.h>
 #include <time.h>
 #include <sys/sysctl.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <sys/statvfs.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <mach/mach.h>
 #include <mach/vm_map.h>
 #include <mach/vm_region.h>
@@ -1435,26 +1440,36 @@ int memread_valscan_get_ex(unsigned long long index, uint64_t *out_addr,
     return 0;
 }
 
-#pragma mark - 未知值扫描 / 坐标扫描（整块内存快照 + 变化比对）
-#define MEMREAD_SNAP_MAX_BYTES (640ULL * 1024 * 1024)
+#pragma mark - 未知值扫描 / 坐标扫描（磁盘快照 + 变化比对）
+
+// 快照放磁盘再 mmap 回来：整块可写内存往往 700MB~1.5GB，纯内存拷贝会被系统直接杀掉
+#define MEMREAD_SNAP_MAX_BYTES (2ULL * 1024 * 1024 * 1024)
 #define MEMREAD_COORD_MAX_TRIPLETS 4000
 #define MEMREAD_SNAP_REGION_MAX (512ULL * 1024 * 1024)
+#define MEMREAD_SNAP_PATH "/var/mobile/Media/memread_snap.bin"
 
 typedef struct {
     uint64_t addr;
     uint64_t size;
-    unsigned char *buf;
+    uint64_t off;            // 在快照文件里的偏移
+    unsigned char *buf;      // mmap 后的区域指针（= 映射基址 + off）
 } memread_snapreg_t;
 
 static memread_snapreg_t *g_sregs = NULL;
 static int g_sregn = 0;
 static unsigned long long g_sbytes = 0;
+static int g_sfd = -1;
+static void *g_smap = NULL;
+static size_t g_smaplen = 0;
 
 void memread_snapshot_free(void) {
-    if (g_sregs) {
-        for (int i = 0; i < g_sregn; i++) free(g_sregs[i].buf);
-        free(g_sregs);
-    }
+    if (g_smap) munmap(g_smap, g_smaplen);
+    if (g_sfd >= 0) close(g_sfd);
+    if (g_smap || g_sfd >= 0) unlink(MEMREAD_SNAP_PATH);
+    g_smap = NULL;
+    g_smaplen = 0;
+    g_sfd = -1;
+    if (g_sregs) free(g_sregs);
     g_sregs = NULL;
     g_sregn = 0;
     g_sbytes = 0;
@@ -1467,6 +1482,17 @@ static int snap_region_ok(vm_region_basic_info_data_64_t *info, mach_vm_size_t s
     if (info->shared) return 0;
     if (size > (mach_vm_size_t)MEMREAD_SNAP_REGION_MAX) return 0;
     return 1;
+}
+
+static int write_all(int fd, const void *p, size_t n) {
+    const unsigned char *b = (const unsigned char *)p;
+    size_t done = 0;
+    while (done < n) {
+        ssize_t w = write(fd, b + done, n - done);
+        if (w <= 0) return -1;
+        done += (size_t)w;
+    }
+    return 0;
 }
 
 int memread_unknown_snapshot(pid_t pid, unsigned long long *pbytes, unsigned long long *pregions) {
@@ -1511,16 +1537,45 @@ int memread_unknown_snapshot(pid_t pid, unsigned long long *pbytes, unsigned lon
         return -5;
     }
 
+    struct statvfs vfs;
+    if (statvfs("/var/mobile/Media", &vfs) == 0) {
+        unsigned long long freemb = (unsigned long long)vfs.f_bavail * (unsigned long long)vfs.f_frsize;
+        if (freemb < total + (256ULL * 1024 * 1024)) {
+            fprintf(stderr, "磁盘余量 %llu MB 不够快照 %llu MB\n",
+                    freemb / 1048576ULL, total / 1048576ULL);
+            mach_port_deallocate(mach_task_self(), task);
+            return -8;
+        }
+    }
+
     memread_snapreg_t *regs = (memread_snapreg_t *)calloc((size_t)cap, sizeof(memread_snapreg_t));
     if (!regs) {
         mach_port_deallocate(mach_task_self(), task);
         return -4;
     }
 
+    int fd = open(MEMREAD_SNAP_PATH, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        free(regs);
+        mach_port_deallocate(mach_task_self(), task);
+        return -7;
+    }
+
     const mach_vm_size_t CHUNK = 4ULL * 1024 * 1024;
+    unsigned char *tmp = (unsigned char *)malloc((size_t)CHUNK);
+    if (!tmp) {
+        close(fd);
+        unlink(MEMREAD_SNAP_PATH);
+        free(regs);
+        mach_port_deallocate(mach_task_self(), task);
+        return -4;
+    }
+
+    // 第二遍：逐区读出来，直接写到快照文件（不占内存）
     addr = 0;
     int idx = 0;
-    unsigned long long bytes = 0;
+    unsigned long long fileoff = 0;
+    int ioerr = 0;
     for (;;) {
         mach_vm_size_t size = 0;
         vm_region_basic_info_data_64_t info;
@@ -1531,43 +1586,72 @@ int memread_unknown_snapshot(pid_t pid, unsigned long long *pbytes, unsigned lon
         if (kr != KERN_SUCCESS || size == 0) break;
 
         if (idx < cap && snap_region_ok(&info, size)) {
-            unsigned char *rb = (unsigned char *)malloc((size_t)size);
-            if (!rb) {
-                for (int k = 0; k < idx; k++) free(regs[k].buf);
-                free(regs);
-                mach_port_deallocate(mach_task_self(), task);
-                return -4;
-            }
-            mach_vm_size_t off = 0;
+            uint64_t region_off = fileoff;
+            uint64_t off = 0;
             int ok = 1;
-            while (off < size) {
-                mach_vm_size_t cur = (size - off > CHUNK) ? CHUNK : (size - off);
+            while (off < (uint64_t)size) {
+                mach_vm_size_t cur = (size - off > CHUNK) ? CHUNK : (mach_vm_size_t)(size - off);
                 mach_vm_size_t got = 0;
                 kr = mach_vm_read_overwrite(task, addr + off, cur,
-                                            (mach_vm_address_t)(rb + off), &got);
+                                            (mach_vm_address_t)tmp, &got);
                 if (kr != KERN_SUCCESS || got != cur) { ok = 0; break; }
+                if (write_all(fd, tmp, (size_t)cur) != 0) { ok = 0; ioerr = 1; break; }
+                fileoff += cur;
                 off += cur;
             }
-            if (ok) {
+            if (!ok) {
+                // 回滚这块区域的半截数据，避免快照里出现空洞
+                if (ftruncate(fd, (off_t)region_off) != 0) ioerr = 1;
+                fileoff = region_off;
+                if (ioerr) break;
+            } else {
                 regs[idx].addr = (uint64_t)addr;
                 regs[idx].size = (uint64_t)size;
-                regs[idx].buf = rb;
+                regs[idx].off = region_off;
                 idx++;
-                bytes += (unsigned long long)size;
-            } else {
-                free(rb);
             }
         }
         addr += size;
     }
 
-    g_sregs = regs;
-    g_sregn = idx;
-    g_sbytes = bytes;
+    free(tmp);
     mach_port_deallocate(mach_task_self(), task);
 
-    fprintf(stderr, "内存快照: %d 个区域 %llu MB\n", idx, bytes / 1048576ULL);
-    if (pbytes) *pbytes = bytes;
+    if (ioerr || idx == 0) {
+        close(fd);
+        unlink(MEMREAD_SNAP_PATH);
+        free(regs);
+        return ioerr ? -7 : -6;
+    }
+
+    if (ftruncate(fd, (off_t)fileoff) != 0) {
+        close(fd);
+        unlink(MEMREAD_SNAP_PATH);
+        free(regs);
+        return -7;
+    }
+
+    void *map = mmap(NULL, (size_t)fileoff, PROT_READ, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED || !map) {
+        close(fd);
+        unlink(MEMREAD_SNAP_PATH);
+        free(regs);
+        return -4;
+    }
+
+    for (int i = 0; i < idx; i++) {
+        regs[i].buf = (unsigned char *)map + regs[i].off;
+    }
+
+    g_sregs = regs;
+    g_sregn = idx;
+    g_sbytes = fileoff;
+    g_sfd = fd;
+    g_smap = map;
+    g_smaplen = (size_t)fileoff;
+
+    fprintf(stderr, "内存快照(磁盘): %d 个区域 %llu MB\n", idx, fileoff / 1048576ULL);
+    if (pbytes) *pbytes = fileoff;
     if (pregions) *pregions = (unsigned long long)idx;
     return 0;
 }
@@ -1659,7 +1743,7 @@ int memread_unknown_diff(pid_t pid, int cond, int float_only,
                 g_valents[count].type = float_only ? MEMREAD_VALTYPE_FLOAT : MEMREAD_VALTYPE_INT32;
                 count++;
             }
-            memcpy(snap + off, buf, (size_t)cur);   // 快照推进到「现在」
+            // 快照保持只读（mmap PROT_READ），基线需要更新时由上层重新拍一次
             off += cur;
             if (cb) cb((unsigned long long)(base + off), cur, total, 0, ctx);
         }
