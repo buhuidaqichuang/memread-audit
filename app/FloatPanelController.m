@@ -70,12 +70,12 @@ static CVPixelBufferRef MemPixelBufferFromImage(CGImageRef img) {
     return pb;
 }
 
-static CMSampleBufferRef MemSampleBufferFromPixelBuffer(CVPixelBufferRef pb) {
+static CMSampleBufferRef MemSampleBufferFromPixelBuffer(CVPixelBufferRef pb, CMTime pts) {
     CMFormatDescriptionRef fmt = NULL;
     if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pb, &fmt) != noErr) return NULL;
     CMSampleTimingInfo t;
     t.duration = CMTimeMake(1, 30);
-    t.presentationTimeStamp = kCMTimeZero;
+    t.presentationTimeStamp = pts;
     t.decodeTimeStamp = kCMTimeInvalid;
     CMSampleBufferRef sb = NULL;
     if (CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, pb, fmt, &t, &sb) != noErr) sb = NULL;
@@ -281,7 +281,9 @@ static void MemDrawText(NSString *s, CGRect r, UIFont *font, UIColor *color) {
     if (!img) return;
     CVPixelBufferRef pb = MemPixelBufferFromImage(img.CGImage);
     if (!pb) return;
-    CMSampleBufferRef sb = MemSampleBufferFromPixelBuffer(pb);
+    CMTime pts = kCMTimeZero;
+    if (self.sbLayer.controlTimebase) pts = CMTimebaseGetTime(self.sbLayer.controlTimebase);
+    CMSampleBufferRef sb = MemSampleBufferFromPixelBuffer(pb, pts);
     if (sb) {
         if (self.sbLayer.status == AVQueuedSampleBufferRenderingStatusFailed) {
             [self.sbLayer flush];
