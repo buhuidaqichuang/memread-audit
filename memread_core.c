@@ -2288,8 +2288,40 @@ static int chain_module_slot(uint64_t addr, memread_modseg_t *out) {
     return 1;
 }
 
+// 浮点是否有限且在合理范围内（排除 NaN/Inf、垃圾数据）
+static int chain_float_ok(float f, float lim) {
+    if (!isfinite(f)) return 0;
+    if (f > lim || f < -lim) return 0;
+    return 1;
+}
+
+// 末跳地址是否像「FVector + FQuat」：3 个有限 float，紧跟 4 个分量构成模长≈1 的四元数
+// UE 的 USceneComponent 里 RelativeLocation(FVector, 12B) 之后就是旋转；FQuat 需 16B 对齐，
+// 所以旋转可能从 +12 开始，也可能跳 4 字节 padding 从 +16 开始，两处都试。
+static int chain_vec3_quat(task_t task, uint64_t addr) {
+    if ((addr & 3) != 0) return 0;
+    unsigned char buf[36];
+    mach_vm_size_t got = 0;
+    if (mach_vm_read_overwrite(task, addr, sizeof(buf),
+                               (mach_vm_address_t)buf, &got) != KERN_SUCCESS) return 0;
+    if (got < sizeof(buf)) return 0;
+    float v[3];
+    memcpy(v, buf, 12);
+    for (int i = 0; i < 3; i++) if (!chain_float_ok(v[i], 200000.0f)) return 0;
+    for (int off = 12; off <= 16; off += 4) {
+        float q[4];
+        memcpy(q, buf + off, 16);
+        int ok = 1;
+        for (int i = 0; i < 4; i++) if (!chain_float_ok(q[i], 1.001f)) { ok = 0; break; }
+        if (!ok) continue;
+        float n = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
+        if (n > 0.999f && n < 1.001f) return 1;
+    }
+    return 0;
+}
+
 static int chain_verify(task_t task, uint64_t slot, const int64_t *offs, int depth, uint64_t target,
-                        int *out_valid) {
+                        int *out_valid, int *out_flags) {
     uint64_t a = slot;
     int valid = 0;
     for (int i = 0; i < depth; i++) {
@@ -2300,7 +2332,9 @@ static int chain_verify(task_t task, uint64_t slot, const int64_t *offs, int dep
         a = (uint64_t)((int64_t)v + offs[i]);
     }
     if (out_valid) *out_valid = valid;
-    return (a == target) ? 0 : 1;
+    if (a != target) return 1;
+    if (out_flags && chain_vec3_quat(task, target)) *out_flags |= MEMREAD_CHAIN_FLAG_VEC3QUAT;
+    return 0;
 }
 
 static int chain_cmp(const void *pa, const void *pb) {
@@ -2308,6 +2342,10 @@ static int chain_cmp(const void *pa, const void *pb) {
     const memread_chain_t *b = (const memread_chain_t *)pb;
     // 对象校验通过的跳数多者优先：这才是“真对象路径”的主要判据
     if (a->valid_hops != b->valid_hops) return (b->valid_hops - a->valid_hops);
+    // 末跳是「FVector + 四元数」形态（坐标字段）者优先
+    int av = (a->flags & MEMREAD_CHAIN_FLAG_VEC3QUAT) ? 1 : 0;
+    int bv = (b->flags & MEMREAD_CHAIN_FLAG_VEC3QUAT) ? 1 : 0;
+    if (av != bv) return bv - av;
     if (a->depth != b->depth) return (a->depth < b->depth) ? -1 : 1;
     int am = (strcmp(a->name, "main") == 0);
     int bm = (strcmp(b->name, "main") == 0);
@@ -2375,7 +2413,8 @@ int memread_chain_scan(pid_t pid, uint64_t target, int max_depth,
                     p = nd->parent;
                 }
                 int valid_hops = 0;
-                if (chain_verify(task, lv[lvl][j].addr, offs, depth, target, &valid_hops) != 0) continue;
+                int flags = 0;
+                if (chain_verify(task, lv[lvl][j].addr, offs, depth, target, &valid_hops, &flags) != 0) continue;
                 memread_chain_t *c = &out[results];
                 memset(c, 0, sizeof(*c));
                 memcpy(c->uuid, seg.uuid, sizeof(c->uuid));
@@ -2383,6 +2422,7 @@ int memread_chain_scan(pid_t pid, uint64_t target, int max_depth,
                 c->static_off = lv[lvl][j].addr - seg.base;
                 c->depth = depth;
                 c->valid_hops = valid_hops;
+                c->flags = flags;
                 memcpy(c->offs, offs, sizeof(c->offs));
                 results++;
             }

@@ -510,6 +510,7 @@
                 @"off": @(chains[i].static_off),
                 @"offs": offs,
                 @"obj": @(chains[i].valid_hops),
+                @"vec": @((chains[i].flags & MEMREAD_CHAIN_FLAG_VEC3QUAT) ? 1 : 0),
                 @"depth": @(chains[i].depth)
             }];
         }
@@ -610,14 +611,16 @@
     }
 
     NSMutableString *msg = [NSMutableString stringWithFormat:
-        @"命中 %d 条（最短 %d 层），已按「对象校验跳数多 → 层数少 → main 模块 → 偏移小」排序，越靠前越可能是真路径。\n"
-        @"对象校验 = 每一跳的指针所指对象，开头 8 字节是模块内 vtable（UE 的 UObject 特征）。\n\n",
+        @"命中 %d 条（最短 %d 层），已按「对象校验跳数多 → 坐标形态 → 层数少 → main 模块 → 偏移小」排序，越靠前越可能是真路径。\n"
+        @"对象校验 = 每一跳的指针所指对象，开头 8 字节是模块内 vtable（UE 的 UObject 特征）。\n"
+        @"坐标✔ = 末跳地址后面紧跟一个模长≈1 的四元数，说明落在 FVector 坐标字段上。\n\n",
         (int)chains.count, depth];
     for (int i = 0; i < chains.count && i < 3; i++) {
         NSDictionary *c = chains[i];
-        [msg appendFormat:@"%@  （对象 %@/%@）\n",
+        [msg appendFormat:@"%@  （对象 %@/%@%@）\n",
          [self chainText:c[@"name"] staticOff:[c[@"off"] unsignedLongLongValue]
-                     offs:c[@"offs"] number:i + 1], c[@"obj"], c[@"depth"]];
+                     offs:c[@"offs"] number:i + 1], c[@"obj"], c[@"depth"],
+         [c[@"vec"] boolValue] ? @" · 坐标✔" : @""];
     }
     if (chains.count > 3) [msg appendFormat:@"…另 %d 条见下方列表", (int)chains.count - 3];
 
@@ -627,9 +630,10 @@
     __weak typeof(self) ws = self;
     for (int i = 0; i < chains.count; i++) {
         NSDictionary *c = chains[i];
-        NSString *title = [NSString stringWithFormat:@"#%d  %@ + 0x%llX  (%lu 层 · 对象 %@)",
+        NSString *title = [NSString stringWithFormat:@"#%d  %@ + 0x%llX  (%lu 层 · 对象 %@%@)",
                            i + 1, c[@"name"], [c[@"off"] unsignedLongLongValue],
-                           (unsigned long)((NSArray *)c[@"offs"]).count, c[@"obj"]];
+                           (unsigned long)((NSArray *)c[@"offs"]).count, c[@"obj"],
+                           [c[@"vec"] boolValue] ? @" · 坐标✔" : @""];
         [a addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *x) {
             [ws promptSaveChain:c type:vt];

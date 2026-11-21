@@ -162,12 +162,15 @@ void memread_valscan_reset(void);
 #define MEMREAD_CHAIN_MAX_DEPTH 6
 #define MEMREAD_CHAIN_OFF_WIN   0x10000   // 每跳偏移搜索窗口：0 ~ +64KB（UE 的 UObject 字段偏移常上万）
 
+#define MEMREAD_CHAIN_FLAG_VEC3QUAT 0x1   // 末跳地址形如「FVector + 模长≈1 的四元数」（场景坐标）
+
 typedef struct {
     char uuid[40];              // 模块 UUID（跨重启不变）
     char name[64];
     uint64_t static_off;        // 静态槽相对模块头的偏移
     int depth;                  // 解引用层数 1..6
     int valid_hops;             // 有多少跳通过了「对象头是模块内 vtable」校验
+    int flags;                  // MEMREAD_CHAIN_FLAG_*
     int64_t offs[MEMREAD_CHAIN_MAX_DEPTH];   // 每一跳偏移，offs[0] 最先加
 } memread_chain_t;
 
