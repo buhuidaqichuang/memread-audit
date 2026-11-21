@@ -44,7 +44,7 @@ static NSString *ReadLive(void) {
 - (void)onPan:(UIPanGestureRecognizer *)g {
     CGPoint t = [g translationInView:self.superview];
     self.center = CGPointMake(self.center.x + t.x, self.center.y + t.y);
-    [g setTranslation:CGPointZero inView:self.superview];
+    [g setTranslation:CGPointMake(0, 0) inView:self.superview];
 }
 - (void)onClose:(id)sender {
     gWin.hidden = YES;
