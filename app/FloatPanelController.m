@@ -156,7 +156,6 @@ static void MemDrawText(NSString *s, CGRect r, UIFont *font, UIColor *color) {
         }
     }
     self.sbLayer.frame = host.bounds;
-    self.sbLayer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
     if (self.sbLayer.superlayer != host.layer) {
         [host.layer addSublayer:self.sbLayer];
     }
@@ -265,7 +264,7 @@ static void MemDrawText(NSString *s, CGRect r, UIFont *font, UIColor *color) {
         if (memread_valscan_get(i, &addr, &prev) != 0) continue;
         int prc = memread_valscan_peek(pid, type, i, NULL, &cur);
         NSString *v = (prc == 0) ? [SavedAddressStore formatValue:cur type:type] : @"?";
-        [rows addObject:@{@"addr": addr, @"v": v}];
+        [rows addObject:@{@"addr": @(addr), @"v": v}];
     }
     self.lastLeft = left;
 
@@ -378,6 +377,12 @@ static void MemDrawText(NSString *s, CGRect r, UIFont *font, UIColor *color) {
 
 - (void)pictureInPictureController:(AVPictureInPictureController *)c
              didTransitionToRenderSize:(CMVideoDimensions)newRenderSize {
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController *)c
+                    skipByInterval:(CMTime)skipInterval
+                 completionHandler:(void (^)(void))completionHandler {
+    if (completionHandler) completionHandler();
 }
 
 @end

@@ -16,6 +16,7 @@
 @property (nonatomic, strong) UISegmentedControl *typeControl;
 @property (nonatomic, strong) UIActivityIndicatorView *spinner;
 @property (nonatomic, strong) UITextView *progressView;
+@property (nonatomic, strong) UIView *previewBox;
 @property (nonatomic, assign) pid_t currentPid;
 - (void)appendProgressLine:(NSString *)line;
 - (void)clearProgress;
@@ -142,6 +143,7 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
     previewBox.layer.cornerRadius = 6;
     previewBox.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
     [panel addSubview:previewBox];
+    self.previewBox = previewBox;
     [[FloatPanelController shared] attachPreviewTo:previewBox];
 
     self.progressView = [[UITextView alloc] initWithFrame:CGRectMake(10, 100, W - 20, panelH - 106)];
@@ -157,6 +159,13 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
 
     [self refreshCount];
     [self findPidNow];
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    if (self.previewBox) {
+        [[FloatPanelController shared] attachPreviewTo:self.previewBox];
+    }
 }
 
 - (UILabel *)addLabel:(NSString *)text width:(CGFloat)W y:(CGFloat *)y {
