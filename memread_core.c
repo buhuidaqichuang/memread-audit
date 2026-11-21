@@ -1045,6 +1045,55 @@ static int val_read_raw(task_t task, uint64_t addr, int type, uint64_t *out) {
     return 0;
 }
 
+// 按地址读一个标量：给"已保存地址"页面刷新当前值用，不依赖扫描候选表
+int memread_read_scalar(pid_t pid, uint64_t addr, int type, double *out_value) {
+    if (type < MEMREAD_VALTYPE_INT32 || type > MEMREAD_VALTYPE_DOUBLE) return -2;
+    task_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS) return -1;
+    uint64_t raw = 0;
+    if (val_read_raw(task, addr, type, &raw) != 0) return -3;
+    if (out_value) *out_value = memread_valscan_raw2double(raw, type);
+    return 0;
+}
+
+// 预统计与首扫完全相同的区域过滤条件，得到总量用于进度百分比（只枚举，不读内存）
+int memread_writable_bytes(pid_t pid, int rw_only,
+                           unsigned long long *out_bytes, unsigned long long *out_regions) {
+    if (out_bytes) *out_bytes = 0;
+    if (out_regions) *out_regions = 0;
+
+    task_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS) return -1;
+
+    unsigned long long bytes = 0;
+    unsigned long long regions = 0;
+    mach_vm_address_t addr = 0;
+    while (1) {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        kr = mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t)&info, &cnt, &obj);
+        if (kr != KERN_SUCCESS || size == 0) break;
+
+        int readable = (info.protection & VM_PROT_READ) != 0;
+        int writable = (info.protection & VM_PROT_WRITE) != 0;
+        if (readable && !info.shared && (!rw_only || writable) &&
+            size <= (mach_vm_size_t)(512ULL * 1024 * 1024)) {
+            bytes += size;
+            regions++;
+        }
+        addr += size;
+    }
+
+    if (out_bytes) *out_bytes = bytes;
+    if (out_regions) *out_regions = regions;
+    return 0;
+}
+
 int memread_valscan_first(pid_t pid, int rw_only, int type, double value, double tol,
                           memread_region_cb cb, void *ctx,
                           unsigned long long *phits, volatile int *cancel) {

@@ -1,4 +1,5 @@
 #import "ValueListViewController.h"
+#import "SavedAddressStore.h"
 #import "memread_core.h"
 
 @interface ValueListViewController () <UITableViewDataSource, UITableViewDelegate>
@@ -28,8 +29,23 @@
         [a addObject:@(i)];
     }
     self.rows = a;
+
+    // 用可换行表头，避免 navigationItem.prompt 被系统截断成省略号
     if (n > shown) {
-        self.navigationItem.prompt = [NSString stringWithFormat:@"共 %llu 个候选，只显示前 %llu 个", n, shown];
+        CGFloat w = self.view.bounds.size.width;
+        UILabel *head = [[UILabel alloc] initWithFrame:CGRectMake(12, 8, w - 24, 0)];
+        head.text = [NSString stringWithFormat:@"共 %llu 个候选，列表只显示前 %llu 个", n, shown];
+        head.numberOfLines = 0;
+        head.lineBreakMode = NSLineBreakByWordWrapping;
+        head.font = [UIFont systemFontOfSize:12];
+        head.textColor = [UIColor secondaryLabelColor];
+        head.textAlignment = NSTextAlignmentCenter;
+        CGSize fit = [head sizeThatFits:CGSizeMake(w - 24, CGFLOAT_MAX)];
+        head.frame = CGRectMake(12, 8, w - 24, ceil(fit.height));
+
+        UIView *h = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, head.frame.size.height + 16)];
+        [h addSubview:head];
+        self.table.tableHeaderView = h;
     }
 }
 
@@ -55,13 +71,16 @@
     unsigned long long idx = [self.rows[ip.row] unsignedLongLongValue];
     uint64_t addr = 0, prev = 0;
     if (memread_valscan_get(idx, &addr, &prev) == 0) {
-        c.textLabel.text = [NSString stringWithFormat:@"0x%016llX", addr];
+        c.textLabel.text = [NSString stringWithFormat:@"0x%llX", addr];
+        c.textLabel.font = [UIFont fontWithName:@"Menlo" size:13]
+            ?: [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
         c.detailTextLabel.text = [NSString stringWithFormat:@"上一轮值: %@", [self fmtRaw:prev]];
+        c.detailTextLabel.font = [UIFont systemFontOfSize:12];
+        c.detailTextLabel.textColor = [UIColor secondaryLabelColor];
     } else {
         c.textLabel.text = @"—";
         c.detailTextLabel.text = @"—";
     }
-    c.textLabel.font = [UIFont fontWithName:@"Menlo" size:13] ?: [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
     return c;
 }
 
@@ -76,19 +95,51 @@
         double cur = 0;
         int rc = memread_valscan_peek(pid, vt, idx, &addr, &cur);
         dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) self2 = ws;
+            if (!self2) return;
             NSString *msg;
             if (rc == 0) {
-                msg = [NSString stringWithFormat:@"地址 0x%016llX\n当前值: %@", addr, [ws fmtDouble:cur]];
+                msg = [NSString stringWithFormat:@"地址 0x%llX\n当前值: %@", addr, [self2 fmtDouble:cur]];
             } else {
                 msg = [NSString stringWithFormat:@"读取失败 rc=%d（地址可能已失效）", rc];
             }
             UIAlertController *al = [UIAlertController alertControllerWithTitle:@"读当前值"
                                                                         message:msg
                                                                  preferredStyle:UIAlertControllerStyleAlert];
-            [al addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-            [ws presentViewController:al animated:YES completion:nil];
+            [al addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+            if (rc == 0) {
+                [al addAction:[UIAlertAction actionWithTitle:@"保存为标签" style:UIAlertActionStyleDefault
+                                                    handler:^(UIAlertAction *x) {
+                    [self2 promptSaveAddr:addr type:vt];
+                }]];
+            }
+            [self2 presentViewController:al animated:YES completion:nil];
         });
     });
+}
+
+- (void)promptSaveAddr:(uint64_t)addr type:(int)vt {
+    NSString *typeName = [SavedAddressStore typeName:vt];
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"保存为标签"
+                                                               message:[NSString stringWithFormat:@"0x%llX · %@", addr, typeName]
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"标签名，如 当前弹匣 / 玩家HP";
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) ws = self;
+    [a addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) {
+        NSString *label = a.textFields.firstObject.text;
+        [[SavedAddressStore shared] addAddr:addr type:vt label:label note:@""];
+        UIAlertController *ok = [UIAlertController alertControllerWithTitle:@"已保存"
+                                                                   message:[NSString stringWithFormat:@"%@ → %@", label.length ? label : @"未命名", [SavedAddressStore typeName:vt]]
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+        [ok addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [ws presentViewController:ok animated:YES completion:nil];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 @end

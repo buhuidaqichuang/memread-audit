@@ -2,6 +2,7 @@
 #import "FilesViewController.h"
 #import "FileTextViewController.h"
 #import "ValueScanViewController.h"
+#import "SavedViewController.h"
 #import "memread_core.h"
 
 @interface DetailViewController ()
@@ -79,6 +80,7 @@ static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
     [self addButton:@"扫描敏感数据 (不落盘, 出报告)" width:W y:&y sel:@selector(onScan)];
     [self addButton:@"验证写入：搜关键词 (文本 / hex)" width:W y:&y sel:@selector(onFindKeyword)];
     [self addButton:@"数值扫描 (找血量/子弹等数值)" width:W y:&y sel:@selector(onValueScan)];
+    [self addButton:@"已保存地址（自定义标签）" width:W y:&y sel:@selector(onSavedAddresses)];
     [self addButton:@"从剪贴板取 PID 读取" width:W y:&y sel:@selector(onManualPid)];
     [self addButton:@"把信息写入 Media" width:W y:&y sel:@selector(onSave)];
     [self addButton:@"查看结果文件（dump / 报告）" width:W y:&y sel:@selector(onShowFiles)];
@@ -110,11 +112,15 @@ static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
 }
 
 - (UILabel *)addLabel:(NSString *)text width:(CGFloat)W y:(CGFloat *)y {
-    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(20, *y, W - 40, 0)];
+    CGFloat w = W - 40;
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(20, *y, w, 0)];
     l.text = text;
     l.font = [UIFont systemFontOfSize:14];
     l.numberOfLines = 0;
-    [l sizeToFit];
+    l.lineBreakMode = NSLineBreakByWordWrapping;
+    l.preferredMaxLayoutWidth = w;
+    CGSize fit = [l sizeThatFits:CGSizeMake(w, CGFLOAT_MAX)];
+    l.frame = CGRectMake(20, *y, w, ceil(fit.height));
     [self.scroll addSubview:l];
     *y += l.frame.size.height + 8;
     return l;
@@ -488,6 +494,14 @@ static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
 - (void)onValueScan {
     ValueScanViewController *vc = [[ValueScanViewController alloc] init];
     vc.info = self.info;
+    [self.navigationController pushViewController:vc animated:YES];
+}
+
+// 已保存地址：自定义标签的地址池，可随时刷新当前值
+- (void)onSavedAddresses {
+    [self onFind];
+    SavedViewController *vc = [[SavedViewController alloc] init];
+    vc.pid = self.currentPid;
     [self.navigationController pushViewController:vc animated:YES];
 }
 

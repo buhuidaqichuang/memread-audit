@@ -99,6 +99,13 @@ int memread_valscan_peek(pid_t pid, int type, unsigned long long index,
 // 取候选的地址与上一轮原始位（列表展示）；返回 0 成功
 int memread_valscan_get(unsigned long long index, uint64_t *out_addr, uint64_t *out_prev);
 
+// 读任意地址的当前值（已保存地址刷新用）；返回 0 成功，-1 task_for_pid 失败，-3 地址不可读
+int memread_read_scalar(pid_t pid, uint64_t addr, int type, double *out_value);
+
+// 预统计可写区域总量（进度百分比用，不读内存，只枚举 region）；返回 0 成功
+int memread_writable_bytes(pid_t pid, int rw_only,
+                           unsigned long long *out_bytes, unsigned long long *out_regions);
+
 // 原始位 -> 数值（供 UI 把上一轮原始位显示成可读数字）
 double memread_valscan_raw2double(uint64_t raw, int type);
 

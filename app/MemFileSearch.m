@@ -16,15 +16,17 @@ static NSData *MemLowerASCII(NSData *d) {
     return m;
 }
 
-// 取命中前后同一行的可读文本做摘要
+// 取命中前后同一行的可读文本做摘要：以命中位置为中心截窗，只在真被截断的一侧加省略号
 static NSString *MemSnippetInData(NSData *win, NSUInteger loc, NSUInteger len) {
     const uint8_t *p = win.bytes;
     NSUInteger n = win.length;
+    NSUInteger ls = loc, le = MIN(loc + len, n);
+    while (ls > 0 && p[ls - 1] != '\n') ls--;
+    while (le < n && p[le] != '\n' && p[le] != '\r') le++;
+
     NSUInteger s = loc, e = MIN(loc + len, n);
-    NSUInteger back = 0;
-    while (s > 0 && back < 160 && p[s - 1] != '\n') { s--; back++; }
-    NSUInteger fwd = 0;
-    while (e < n && fwd < 160 && p[e] != '\n' && p[e] != '\r') { e++; fwd++; }
+    if (loc > ls + 60) s = loc - 60; else s = ls;
+    if (e + 60 < le) e = e + 60; else e = le;
 
     NSMutableString *str = [NSMutableString stringWithCapacity:(e > s ? e - s : 0)];
     for (NSUInteger i = s; i < e; i++) {
@@ -34,8 +36,11 @@ static NSString *MemSnippetInData(NSData *win, NSUInteger loc, NSUInteger len) {
         else [str appendString:@" "];
     }
     NSString *t = [str stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-    if (t.length > 140) t = [[t substringToIndex:140] stringByAppendingString:@"…"];
-    return t.length ? t : @"(无上下文)";
+    if (!t.length) t = @"(无上下文)";
+
+    NSString *pre = (s > ls) ? @"…" : @"";
+    NSString *suf = (e < le) ? @"…" : @"";
+    return [NSString stringWithFormat:@"%@%@%@", pre, t, suf];
 }
 
 @implementation MemFileSearch
