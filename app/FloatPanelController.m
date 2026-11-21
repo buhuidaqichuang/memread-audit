@@ -53,6 +53,7 @@ static CVPixelBufferRef MemPixelBufferFromImage(CGImageRef img) {
     size_t w = CGImageGetWidth(img), h = CGImageGetHeight(img);
     CVPixelBufferRef pb = NULL;
     NSDictionary *attrs = @{
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
         (id)kCVPixelBufferCGImageCompatibilityKey: @YES,
         (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES
     };
@@ -82,6 +83,11 @@ static CMSampleBufferRef MemSampleBufferFromPixelBuffer(CVPixelBufferRef pb, CMT
     t.decodeTimeStamp = kCMTimeInvalid;
     CMSampleBufferRef sb = NULL;
     if (CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, pb, fmt, &t, &sb) != noErr) sb = NULL;
+    if (sb) {
+        // 立即显示，避免按时间轴排期导致画面空白
+        CMSetAttachment(sb, kCMSampleAttachmentKey_DisplayImmediately,
+                        kCFBooleanTrue, kCMAttachmentMode_ShouldPropagate);
+    }
     CFRelease(fmt);
     return sb;
 }
@@ -121,6 +127,7 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
 @property (nonatomic, assign) double interval;
 @property (nonatomic, assign) BOOL paused;
 @property (nonatomic, assign) BOOL watchSaved;   // YES：监控已保存地址；NO：收敛候选
+@property (nonatomic, assign) BOOL autoRefine;   // NO：只显示，不自动收敛
 @property (nonatomic, assign) BOOL retried;
 @property (nonatomic, assign) int frames;
 @property (nonatomic, assign) BOOL kvoAdded;
@@ -235,12 +242,28 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
 - (BOOL)startWithPid:(pid_t)pid type:(int)type cond:(int)cond interval:(double)interval {
     if (![self beginWithPid:pid interval:interval]) return NO;
     self.watchSaved = NO;
+    self.autoRefine = YES;
     self.vtype = type;
     self.cond = cond;
     self.lastLeft = memread_valscan_count();
     [self renderLeft:self.lastLeft changed:0 rows:@[]];
     [self.pip startPictureInPicture];
     [self logMsg:@"已请求 startPictureInPicture（候选模式）active=%d possible=%d",
+             (int)self.pip.isPictureInPictureActive, (int)self.pip.isPictureInPicturePossible];
+    [self startTimer];
+    return YES;
+}
+
+- (BOOL)startMonitorWithPid:(pid_t)pid type:(int)type interval:(double)interval {
+    if (![self beginWithPid:pid interval:interval]) return NO;
+    self.watchSaved = NO;
+    self.autoRefine = NO;
+    self.vtype = type;
+    self.cond = MEMREAD_VALCOND_CHANGED;
+    self.lastLeft = memread_valscan_count();
+    [self renderLeft:self.lastLeft changed:0 rows:@[]];
+    [self.pip startPictureInPicture];
+    [self logMsg:@"已请求 startPictureInPicture（只看模式）active=%d possible=%d",
              (int)self.pip.isPictureInPictureActive, (int)self.pip.isPictureInPicturePossible];
     [self startTimer];
     return YES;
@@ -358,13 +381,17 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
 
     unsigned long long left = memread_valscan_count();
     int changed = 0;
-    int rc = memread_valscan_autorefine(pid, type, cond, 0, &left, &changed);
-    self.ticks++;
-    if (self.ticks % 10 == 0 || changed) {
-        [self logMsg:@"tick#%d 候选=%llu changed=%d rc=%d type=%d cond=%d",
-                 self.ticks, left, changed, rc, type, cond];
+    if (self.autoRefine) {
+        int rc = memread_valscan_autorefine(pid, type, cond, 0, &left, &changed);
+        self.ticks++;
+        if (self.ticks % 10 == 0 || changed) {
+            [self logMsg:@"tick#%d 候选=%llu changed=%d rc=%d type=%d cond=%d",
+                     self.ticks, left, changed, rc, type, cond];
+        }
+        if (rc != 0) return;
+    } else {
+        self.ticks++;
     }
-    if (rc != 0) return;
 
     NSMutableArray *rows = [NSMutableArray array];
     unsigned long long n = memread_valscan_count();
@@ -465,8 +492,10 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
         NSString *condName = @"变小了";
         if (self.cond == MEMREAD_VALCOND_INCREASED) condName = @"变大了";
         else if (self.cond == MEMREAD_VALCOND_CHANGED) condName = @"变了";
-        MemDrawText([NSString stringWithFormat:@"条件 %@   每 %.1f 秒一轮", condName, self.interval],
-                    CGRectMake(24, 128, 560, 22),
+        NSString *line2 = self.autoRefine
+            ? [NSString stringWithFormat:@"条件 %@   每 %.1f 秒一轮", condName, self.interval]
+            : [NSString stringWithFormat:@"只看模式   每 %.1f 秒刷新", self.interval];
+        MemDrawText(line2, CGRectMake(24, 128, 560, 22),
                     [UIFont systemFontOfSize:16],
                     [UIColor colorWithWhite:0.55 alpha:1]);
 
@@ -484,7 +513,10 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
             i++;
         }
 
-        NSString *foot = changed ? [NSString stringWithFormat:@"刚收敛，剩余 %llu", left] : @"等待数值变化，候选保持不动";
+        NSString *foot = !self.autoRefine
+            ? @"不自动收敛，回 App 手动点收敛"
+            : (changed ? [NSString stringWithFormat:@"刚收敛，剩余 %llu", left]
+                       : @"等待数值变化，候选保持不动");
         MemDrawText(foot, CGRectMake(24, 324, 580, 22),
                     [UIFont systemFontOfSize:15],
                     [UIColor colorWithWhite:0.5 alpha:1]);

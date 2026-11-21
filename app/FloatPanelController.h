@@ -20,6 +20,9 @@
 // 监控「已保存地址」：不同枪的弹匣地址不同，各自存一条标签后一起看
 - (BOOL)startWatchSavedWithPid:(pid_t)pid interval:(double)interval;
 
+// 只看候选数与数值，不做自动收敛（要收敛回 App 手动点）
+- (BOOL)startMonitorWithPid:(pid_t)pid type:(int)type interval:(double)interval;
+
 - (void)stop;
 
 @end

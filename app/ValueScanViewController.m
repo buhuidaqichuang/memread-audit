@@ -503,8 +503,40 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
     addCond(@"变小了", MEMREAD_VALCOND_DECREASED);
     addCond(@"变大了", MEMREAD_VALCOND_INCREASED);
     addCond(@"变了", MEMREAD_VALCOND_CHANGED);
+    [a addAction:[UIAlertAction actionWithTitle:@"只看候选数（不自动收敛）" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) { [ws askMonitorInterval]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)askMonitorInterval {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"刷新间隔"
+                                                               message:@"只看模式不会动候选，收敛仍回 App 手动点"
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    __weak typeof(self) ws = self;
+    NSArray<NSString *> *names = @[@"0.5 秒", @"1 秒", @"2 秒", @"3 秒"];
+    NSArray<NSNumber *> *vals = @[@0.5, @1.0, @2.0, @3.0];
+    for (NSUInteger i = 0; i < names.count; i++) {
+        [a addAction:[UIAlertAction actionWithTitle:names[i] style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *x) {
+            [ws startFloatMonitor:[vals[i] doubleValue]];
+        }]];
+    }
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)startFloatMonitor:(double)iv {
+    pid_t pid = [self ensurePid];
+    if (pid <= 0) return;
+    BOOL ok = [[FloatPanelController shared] startMonitorWithPid:pid type:[self type] interval:iv];
+    if (ok) {
+        self.statusLabel.text = @"只看模式已开启，直接切到游戏";
+        [self appendProgressLine:[NSString stringWithFormat:@"画中画已开启：只看候选数与数值，每 %.1f 秒刷新", iv]];
+    } else {
+        self.statusLabel.text = @"悬浮窗启动失败：设备不支持画中画或预览层未就绪";
+        [self appendProgressLine:@"画中画启动失败"];
+    }
 }
 
 - (void)askSavedInterval {

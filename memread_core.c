@@ -1290,7 +1290,19 @@ int memread_valscan_autorefine(pid_t pid, int type, int cond, double target,
         if (val_read_raw(task, g_valents[i].addr, type, &raw) != 0) continue;
         double cur = memread_valscan_raw2double(raw, type);
         double prev = memread_valscan_raw2double(g_valents[i].prev, type);
-        if (!val_eq(cur, prev, type)) { changed = 1; break; }
+        // 只认「符合收敛方向」的变化：变小了就要求真的有人变小，
+        // 否则无关地址的变大/抖动会把候选误判成全部不符合，一次清零。
+        int want = 0;
+        switch (cond) {
+            case MEMREAD_VALCOND_DECREASED: want = (cur < prev); break;
+            case MEMREAD_VALCOND_INCREASED: want = (cur > prev); break;
+            case MEMREAD_VALCOND_CHANGED:   want = !val_eq(cur, prev, type); break;
+            case MEMREAD_VALCOND_UNCHANGED: want = val_eq(cur, prev, type); break;
+            case MEMREAD_VALCOND_EQUAL:     want = val_eq(cur, target, type); break;
+            case MEMREAD_VALCOND_DELTA:     want = val_eq(cur - prev, target, type); break;
+            default:                        want = !val_eq(cur, prev, type); break;
+        }
+        if (want) { changed = 1; break; }
     }
     mach_port_deallocate(mach_task_self(), task);
 
@@ -1299,7 +1311,26 @@ int memread_valscan_autorefine(pid_t pid, int type, int cond, double target,
         if (pleft) *pleft = n;
         return 0;
     }
-    return memread_valscan_refine(pid, type, cond, target, NULL, NULL, pleft, NULL);
+
+    // 候选不多时先备份：万一这轮谁都不符合方向，保留原候选，不要清零
+    memread_valent_t *backup = NULL;
+    if (n <= 50000) {
+        backup = (memread_valent_t *)malloc(n * sizeof(memread_valent_t));
+        if (backup) memcpy(backup, g_valents, n * sizeof(memread_valent_t));
+    }
+
+    unsigned long long left = 0;
+    int rc = memread_valscan_refine(pid, type, cond, target, NULL, NULL, &left, NULL);
+    if (rc == 0 && backup && left == 0) {
+        memcpy(g_valents, backup, n * sizeof(memread_valent_t));
+        g_valcount = n;
+        left = n;
+        if (pchanged) *pchanged = 0;
+        fprintf(stderr, "自动收敛无符合项，保留原候选 %llu\n", n);
+    }
+    if (backup) free(backup);
+    if (pleft) *pleft = left;
+    return rc;
 }
 
 int memread_valscan_peek(pid_t pid, int type, unsigned long long index,
