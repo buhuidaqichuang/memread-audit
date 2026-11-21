@@ -121,14 +121,26 @@
     uint64_t addr = 0, prev = 0;
     int vt = self.type;
     if (memread_valscan_get_ex(idx, &addr, &prev, &vt) == 0) {
-        c.textLabel.text = [NSString stringWithFormat:@"0x%llX  %@", addr, [SavedAddressStore typeName:vt]];
+        if (self.vec3 && vt == MEMREAD_VALTYPE_FLOAT) {
+            // 坐标候选：一行里直接读 (x, y, z)，别只显示第一个 float
+            float t3[3] = {0, 0, 0};
+            if (memread_read_vec3(self.pid, addr, t3) == 0) {
+                c.textLabel.text = [NSString stringWithFormat:@"0x%llX  (%.1f, %.1f, %.1f)",
+                                    addr, t3[0], t3[1], t3[2]];
+            } else {
+                c.textLabel.text = [NSString stringWithFormat:@"0x%llX  (读不到)", addr];
+            }
+        } else {
+            c.textLabel.text = [NSString stringWithFormat:@"0x%llX  %@", addr, [SavedAddressStore typeName:vt]];
+        }
         c.textLabel.font = [UIFont fontWithName:@"Menlo" size:13]
             ?: [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
         NSString *now = self.latest[@(idx)];
         if (now.length) {
             c.detailTextLabel.text = [NSString stringWithFormat:@"最新: %@   上一轮: %@", now, [self fmtRaw:prev type:vt]];
         } else {
-            c.detailTextLabel.text = [NSString stringWithFormat:@"上一轮值: %@", [self fmtRaw:prev type:vt]];
+            c.detailTextLabel.text = self.vec3 ? @"坐标候选 · 点『链』找跨重启路径"
+                                               : [NSString stringWithFormat:@"上一轮值: %@", [self fmtRaw:prev type:vt]];
         }
         c.detailTextLabel.font = [UIFont systemFontOfSize:12];
         c.detailTextLabel.textColor = [UIColor secondaryLabelColor];
@@ -181,12 +193,21 @@
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         uint64_t addr = 0;
         double cur = 0;
+        float t3[3] = {0, 0, 0};
+        int rc3 = self.vec3 ? memread_read_vec3(pid, a0, t3) : -1;
         int rc = memread_valscan_peek(pid, vt, idx, &addr, &cur);
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(ws) self2 = ws;
             if (!self2) return;
             sender.enabled = YES;
-            if (rc == 0) {
+            if (rc3 == 0) {
+                self2.latest[@(idx)] = [NSString stringWithFormat:@"(%.1f, %.1f, %.1f)", t3[0], t3[1], t3[2]];
+                NSUInteger row = [self2.rows indexOfObject:@(idx)];
+                if (row != NSNotFound) {
+                    [self2.table reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:(NSInteger)row inSection:0]]
+                                        withRowAnimation:UITableViewRowAnimationNone];
+                }
+            } else if (rc == 0) {
                 self2.latest[@(idx)] = [NSString stringWithFormat:@"%@ (%@)",
                                         [self2 fmtDouble:cur type:vt], [SavedAddressStore typeName:vt]];
                 // 找到该候选当前所在的行再刷新

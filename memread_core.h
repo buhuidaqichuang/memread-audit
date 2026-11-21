@@ -116,6 +116,9 @@ int memread_valscan_get_ex(unsigned long long index, uint64_t *out_addr,
 // 读任意地址的当前值（已保存地址刷新用）；返回 0 成功，-1 task_for_pid 失败，-3 地址不可读
 int memread_read_scalar(pid_t pid, uint64_t addr, int type, double *out_value);
 
+// 读 3 个连续 float（坐标三元组）；0 成功，-1 取进程失败，-3 不可读
+int memread_read_vec3(pid_t pid, uint64_t addr, float *out3);
+
 // ============ 模块基址 + 偏移（跨进程重启定位模块内地址） ============
 // 判断 addr 落在哪个 Mach-O 模块里；命中回填模块 UUID / 名字 / 基址 / 偏移
 // 返回 0 命中，1 不在任何模块（堆地址），-1 取进程失败
@@ -172,7 +175,7 @@ int memread_coord_diff(const memread_coord_hit_t *a, int na,
                        float min_len, float max_len);
 
 // 用一批地址覆盖候选表（供列表页直接点『链』）
-int memread_valscan_set(const uint64_t *addrs, int n, int type);
+int memread_valscan_set(pid_t pid, const uint64_t *addrs, int n, int type);
 
 // 取链上第 hop 跳读出的对象指针（hop 从 0 起，0 = 静态槽里的值）
 int memread_chain_hop_object(pid_t pid, const char *uuid, uint64_t static_off,

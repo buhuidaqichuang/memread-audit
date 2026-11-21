@@ -1066,6 +1066,21 @@ int memread_read_scalar(pid_t pid, uint64_t addr, int type, double *out_value) {
     return 0;
 }
 
+// 按地址读 3 个连续 float（坐标三元组），用来在候选列表里显示 (x, y, z)
+int memread_read_vec3(pid_t pid, uint64_t addr, float *out3) {
+    if (!out3) return -2;
+    task_t task = MACH_PORT_NULL;
+    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
+    unsigned char b[12] = {0};
+    mach_vm_size_t got = 0;
+    kern_return_t kr = mach_vm_read_overwrite(task, (mach_vm_address_t)addr, 12,
+                                              (mach_vm_address_t)b, &got);
+    mach_port_deallocate(mach_task_self(), task);
+    if (kr != KERN_SUCCESS || got != 12) return -3;
+    memcpy(out3, b, 12);
+    return 0;
+}
+
 // 预统计与首扫完全相同的区域过滤条件，得到总量用于进度百分比（只枚举，不读内存）
 int memread_writable_bytes(pid_t pid, int rw_only,
                            unsigned long long *out_bytes, unsigned long long *out_regions) {
@@ -2505,17 +2520,28 @@ int memread_coord_diff(const memread_coord_hit_t *a, int na,
 }
 
 // 把一批地址直接灌进候选表（坐标结构扫描命中后用，供列表里点『链』）
-int memread_valscan_set(const uint64_t *addrs, int n, int type) {
+int memread_valscan_set(pid_t pid, const uint64_t *addrs, int n, int type) {
     if (!addrs || n <= 0) return -2;
     if (n > MEMREAD_VALSCAN_MAX) n = MEMREAD_VALSCAN_MAX;
     memread_valscan_reset();
     g_valents = (memread_valent_t *)calloc(MEMREAD_VALSCAN_MAX, sizeof(memread_valent_t));
     if (!g_valents) return -4;
+    // 顺手把当前值读出来当「上一轮值」，否则列表里全是 0
+    task_t task = MACH_PORT_NULL;
+    int have_task = 0;
+    if (pid > 0 && task_for_pid(mach_task_self(), pid, &task) == KERN_SUCCESS) {
+        have_task = 1;
+    }
     for (int i = 0; i < n; i++) {
         g_valents[i].addr = addrs[i];
         g_valents[i].prev = 0;
         g_valents[i].type = type;
+        uint64_t raw = 0;
+        if (have_task && val_read_raw(task, addrs[i], type, &raw) == 0) {
+            g_valents[i].prev = raw;
+        }
     }
+    if (have_task) mach_port_deallocate(mach_task_self(), task);
     g_valcount = (unsigned long long)n;
     return 0;
 }

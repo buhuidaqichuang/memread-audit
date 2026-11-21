@@ -23,6 +23,7 @@
 @property (nonatomic, assign) int coordAn;
 @property (nonatomic, assign) void *coordB;      // 走动对比后的候选
 @property (nonatomic, assign) int coordBn;
+@property (nonatomic, assign) BOOL coordCandidates;   // 当前候选来自坐标扫描（列表按三元组显示）
 - (void)appendProgressLine:(NSString *)line;
 - (void)clearProgress;
 @end
@@ -328,6 +329,7 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
 - (void)onFirst {
     pid_t pid = [self ensurePid];
     if (pid <= 0) return;
+    self.coordCandidates = NO;
 
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"首扫：找当前值"
         message:@"值：要搜的数值；容差：允许误差（int 填 0，float 可填 0.5）"
@@ -450,6 +452,7 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
 
 - (void)runRefine:(int)cond target:(double)t {
     if (self.currentPid <= 0) return;
+    self.coordCandidates = NO;
     int vt = [self type];
     pid_t pid = self.currentPid;
     unsigned long long before = memread_valscan_count();
@@ -503,6 +506,7 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
     ValueListViewController *vc = [[ValueListViewController alloc] init];
     vc.pid = self.currentPid;
     vc.type = [self type];
+    vc.vec3 = self.coordCandidates;
     [self.navigationController pushViewController:vc animated:YES];
 }
 
@@ -882,8 +886,9 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
 
             uint64_t *addrs = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)found);
             for (int i = 0; i < found; i++) addrs[i] = buf[i].addr;
-            memread_valscan_set(addrs, found, MEMREAD_VALTYPE_FLOAT);
+            memread_valscan_set(pid, addrs, found, MEMREAD_VALTYPE_FLOAT);
             free(addrs);
+            self2.coordCandidates = YES;
 
             // 这批候选留作 ③ 静止过滤的基准
             memread_coord_hit_t *oldb = (memread_coord_hit_t *)self2.coordB;
@@ -965,8 +970,9 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
 
             uint64_t *addrs = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)m);
             for (int i = 0; i < m; i++) addrs[i] = out[i].addr;
-            memread_valscan_set(addrs, m, MEMREAD_VALTYPE_FLOAT);
+            memread_valscan_set(pid, addrs, m, MEMREAD_VALTYPE_FLOAT);
             free(addrs);
+            self2.coordCandidates = YES;
 
             NSString *line = [NSString stringWithFormat:@"静止过滤后：%d 个稳定候选", m];
             self2.statusLabel.text = line;
