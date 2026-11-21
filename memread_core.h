@@ -3,6 +3,7 @@
 
 #include <sys/types.h>
 #include <stddef.h>
+#include <stdint.h>
 
 // libproc 是 iOS 私有头，但符号在 libSystem 里，手动声明
 extern int proc_pidpath(int pid, void *buffer, unsigned int buffersize);
