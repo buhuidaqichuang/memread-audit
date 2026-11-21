@@ -195,13 +195,16 @@
         double cur = 0;
         float t3[3] = {0, 0, 0};
         int rc3 = self.vec3 ? memread_read_vec3(pid, a0, t3) : -1;
+        NSString *triple = (rc3 == 0)
+            ? [NSString stringWithFormat:@"(%.1f, %.1f, %.1f)", t3[0], t3[1], t3[2]]
+            : nil;
         int rc = memread_valscan_peek(pid, vt, idx, &addr, &cur);
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(ws) self2 = ws;
             if (!self2) return;
             sender.enabled = YES;
-            if (rc3 == 0) {
-                self2.latest[@(idx)] = [NSString stringWithFormat:@"(%.1f, %.1f, %.1f)", t3[0], t3[1], t3[2]];
+            if (triple.length) {
+                self2.latest[@(idx)] = triple;
                 NSUInteger row = [self2.rows indexOfObject:@(idx)];
                 if (row != NSNotFound) {
                     [self2.table reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:(NSInteger)row inSection:0]]
