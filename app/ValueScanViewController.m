@@ -793,12 +793,25 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
     }
     [self.spinner startAnimating];
     self.statusLabel.text = second ? @"结构扫描：对比中…" : @"结构扫描：读内存中…";
+    memread_coord_hit_t *base = (memread_coord_hit_t *)self.coordA;
+    int nbase = self.coordAn;
     __weak typeof(self) ws = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         int found = 0;
         int cap = MEMREAD_COORD_HIT_CAP;
+        int common = 0, moved = 0;
+        float maxdelta = 0;
         memread_coord_hit_t *buf = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * (size_t)cap);
-        int rc = buf ? memread_coord_probe(pid, buf, cap, &found, NULL, NULL, NULL) : -4;
+        int rc;
+        if (!second) {
+            rc = buf ? memread_coord_probe(pid, buf, cap, &found, NULL, NULL, NULL) : -4;
+        } else {
+            int m = 0;
+            rc = buf ? memread_coord_probe_diff(pid, base, nbase,
+                                                buf, cap, &m, &common, &moved, &maxdelta,
+                                                1.0f, 20000.0f, NULL, NULL, NULL) : -4;
+            found = m;
+        }
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(ws) self2 = ws;
             if (!self2) { free(buf); return; }
@@ -818,7 +831,8 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
                 if (old) free(old);
                 self2.coordA = buf;
                 self2.coordAn = found;
-                NSString *line = [NSString stringWithFormat:@"基准已记录：%d 个候选（只算结构合法的位置）", found];
+                NSString *line = [NSString stringWithFormat:@"基准已记录：%d 个候选%@",
+                                  found, (found >= cap) ? @"（已到上限，可能被截断）" : @""];
                 self2.statusLabel.text = line;
                 [self2 appendProgressLine:line];
                 UIAlertController *ok = [UIAlertController alertControllerWithTitle:@"基准已记录"
@@ -829,44 +843,52 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
                 return;
             }
 
-            memread_coord_hit_t *out = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * (size_t)cap);
-            int m = 0;
-            if (out) {
-                memread_coord_diff((memread_coord_hit_t *)self2.coordA, self2.coordAn,
-                                   buf, found, out, cap, &m, 2.0f, 5000.0f);
-            }
-            free(buf);
-            if (!out) {
-                self2.statusLabel.text = @"内存不足";
-                return;
-            }
+            NSString *diag = [NSString stringWithFormat:
+                @"基准 %d 个 · 本次 %d 个 · 同地址 %d 个 · 位移非零 %d 个 · 最大位移 %.1f",
+                self2.coordAn, found, common, moved, maxdelta];
+            [self2 appendProgressLine:diag];
 
-            if (m <= 0) {
-                free(out);
+            if (found <= 0) {
+                free(buf);
+                NSString *why;
+                if (common == 0) {
+                    why = @"两次扫描没有一个地址重合：基准候选被上限截断了（噪声太多），或者两次之间游戏重启了。";
+                } else if (moved == 0) {
+                    why = @"同地址的候选完全没变：两次扫描之间角色没动，或者游戏在后台被挂起了。走动时先让游戏在前台跑几秒。";
+                } else {
+                    why = @"有变化但位移不在 1~20000 之间（可能单位很大或只是抖动）。";
+                }
                 self2.statusLabel.text = @"没匹配上";
-                [self2 appendProgressLine:@"没匹配上：走动幅度太小，或两次扫描之间角色没动。走远点（5~10 步）再试"];
+                [self2 appendProgressLine:why];
+                [self2 appendProgressLine:diag];
+                UIAlertController *e = [UIAlertController alertControllerWithTitle:@"没匹配上"
+                                                                           message:[why stringByAppendingFormat:@"\n\n%@", diag]
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+                [e addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+                [self2 presentViewController:e animated:YES completion:nil];
                 return;
             }
 
-            uint64_t *addrs = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)m);
-            for (int i = 0; i < m; i++) addrs[i] = out[i].addr;
-            memread_valscan_set(addrs, m, MEMREAD_VALTYPE_FLOAT);
+            uint64_t *addrs = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)found);
+            for (int i = 0; i < found; i++) addrs[i] = buf[i].addr;
+            memread_valscan_set(addrs, found, MEMREAD_VALTYPE_FLOAT);
             free(addrs);
 
-            NSString *line = [NSString stringWithFormat:@"结构扫描匹配：%d 个（位移从大到小）", m];
+            NSString *line = [NSString stringWithFormat:@"结构扫描匹配：%d 个（位移从大到小）", found];
             self2.statusLabel.text = line;
             [self2 appendProgressLine:line];
+            [self2 appendProgressLine:diag];
             [self2 refreshCount];
 
             NSMutableString *msg = [NSMutableString stringWithFormat:
-                @"%d 个坐标字段跟着你动了。位移最大的最可能是人物根组件（相机/挂点也会动）。\n\n", m];
-            for (int i = 0; i < m && i < 3; i++) {
+                @"%@\n\n位移最大的最可能是人物根组件（相机/挂点也会动）。\n\n", diag];
+            for (int i = 0; i < found && i < 3; i++) {
                 [msg appendFormat:@"%d) 0x%llX  (%.2f, %.2f, %.2f)%@\n", i + 1,
-                 (unsigned long long)out[i].addr,
-                 out[i].v[0], out[i].v[1], out[i].v[2],
-                 (out[i].quat_off < 0) ? @"  平凡旋转" : @"  有旋转"];
+                 (unsigned long long)buf[i].addr,
+                 buf[i].v[0], buf[i].v[1], buf[i].v[2],
+                 (buf[i].quat_off == 100) ? @"  角度旋转" : ((buf[i].quat_off < 0) ? @"  平凡旋转" : @"  有旋转")];
             }
-            free(out);
+            free(buf);
 
             UIAlertController *ok = [UIAlertController alertControllerWithTitle:@"已锁定坐标候选"
                                                                        message:msg

@@ -147,15 +147,23 @@ int memread_coord_lock(pid_t pid, int *ptriplets, unsigned long long *pcands,
 
 // ---- 坐标结构扫描（不依赖知道坐标值）----
 // 判据：某处连续 3 个 float 是合理坐标，紧跟（+12 或 +16）4 个 float 构成模长≈1 的四元数
-#define MEMREAD_COORD_HIT_CAP 20000
+#define MEMREAD_COORD_HIT_CAP 300000
 typedef struct {
     uint64_t addr;      // FVector 起始地址（4 字节对齐）
     float v[3];
-    int quat_off;       // 12 / 16；-12 / -16 表示该四元数是平凡值(0,0,0,1)
+    int quat_off;       // 12/16 = 后面是四元数；-12/-16 = 平凡四元数；0 = 前面是四元数(FTransform)；100 = 后面是 FRotator
 } memread_coord_hit_t;
 
 int memread_coord_probe(pid_t pid, memread_coord_hit_t *out, int cap, int *found,
                         volatile int *cancel, memread_region_cb cb, void *ctx);
+
+// 一次扫描直接与基准比对（基准按地址查找），顺带给出共同地址数 / 位移非零数
+int memread_coord_probe_diff(pid_t pid, const memread_coord_hit_t *base, int nbase,
+                             memread_coord_hit_t *out, int cap, int *found,
+                             int *pcommon, int *pmoved, float *pmaxdelta,
+                             float min_len, float max_len,
+                             volatile int *cancel, memread_region_cb cb, void *ctx);
+
 
 // 两次探测按地址求差：位移长度落在 [min_len, max_len] 的留下，按位移大小排序
 int memread_coord_diff(const memread_coord_hit_t *a, int na,

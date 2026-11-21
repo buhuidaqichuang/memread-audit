@@ -2159,22 +2159,72 @@ static int coord_quat_unit(const float *q, int *trivial) {
     return 1;
 }
 
-// 在 p 处试匹配：3 个 float 坐标 + 后随单位四元数
-static int coord_try(const unsigned char *p, float v[3], int *quat_off) {
-    float q[4];
-    memcpy(v, p, 12);
+static int coord_ptr_ok(uint64_t p) {
+    return p > 0x100000000ULL && p < 0x8000000000ULL && (p & 7) == 0;
+}
+
+static int coord_vec_ok(const float *v) {
     for (int i = 0; i < 3; i++) {
         if (!isfinite(v[i])) return 0;
-        float lim = (i == 2) ? 5000.0f : 200000.0f;   // 高度范围更小，能砍掉一堆噪声
+        float lim = (i == 2) ? 8000.0f : 500000.0f;
         if (v[i] > lim || v[i] < -lim) return 0;
     }
     if (v[0] == 0.0f && v[1] == 0.0f && v[2] == 0.0f) return 0;
-    for (int off = 12; off <= 16; off += 4) {
-        memcpy(q, p + off, 16);
+    return 1;
+}
+
+// 三种 UE 常见排布都认：
+//  ① FVector 在前，四元数在 +12/+16（组件字段）
+//  ② FVector 在前，FRotator 在 +12（老版本组件用角度），要求前面 8 字节像指针压噪声
+//  ③ FQuat 在 -16…即四元数在前、FVector 在 +16（FTransform：Rotation/Translation/Scale3D）
+static int coord_try(const unsigned char *p, float v[3], int *quat_off, int *vec_off) {
+    float a[3];
+    memcpy(a, p, 12);
+    if (coord_vec_ok(a)) {
+        for (int off = 12; off <= 16; off += 4) {
+            float q[4];
+            memcpy(q, p + off, 16);
+            int triv = 0;
+            if (coord_quat_unit(q, &triv)) {
+                memcpy(v, a, 12);
+                *quat_off = triv ? -off : off;
+                *vec_off = 0;
+                return 1;
+            }
+        }
+        uint64_t before = 0;
+        memcpy(&before, p - 8, 8);
+        if (coord_ptr_ok(before)) {
+            float r[3];
+            memcpy(r, p + 12, 12);
+            int ok = 1, nz = 0;
+            for (int i = 0; i < 3; i++) {
+                if (!isfinite(r[i]) || r[i] > 1080.0f || r[i] < -1080.0f) { ok = 0; break; }
+                if (fabsf(r[i]) > 1e-4f) nz++;
+            }
+            if (ok && nz > 0) {
+                memcpy(v, a, 12);
+                *quat_off = 100;
+                *vec_off = 0;
+                return 1;
+            }
+        }
+    }
+    // FTransform：四元数在前
+    {
+        float q[4];
+        memcpy(q, p, 16);
         int triv = 0;
-        if (!coord_quat_unit(q, &triv)) continue;
-        *quat_off = triv ? -off : off;
-        return 1;
+        if (coord_quat_unit(q, &triv)) {
+            float b[3];
+            memcpy(b, p + 16, 12);
+            if (coord_vec_ok(b)) {
+                memcpy(v, b, 12);
+                *quat_off = 0;
+                *vec_off = 16;
+                return 1;
+            }
+        }
     }
     return 0;
 }
@@ -2195,10 +2245,11 @@ static int coord_addr_cmp(const void *pa, const void *pb) {
     return (a->addr < b->addr) ? -1 : 1;
 }
 
-int memread_coord_probe(pid_t pid, memread_coord_hit_t *out, int cap, int *found,
-                        volatile int *cancel, memread_region_cb cb, void *ctx) {
-    if (found) *found = 0;
-    if (!out || cap <= 0) return -2;
+// 全内存扫一遍，每个命中交给 visit；visit 返回 1 表示停止
+static int coord_scan(pid_t pid, int (*visit)(const memread_coord_hit_t *, void *), void *vctx,
+                      unsigned long long *pscanned, volatile int *cancel,
+                      memread_region_cb cb, void *ctx) {
+    if (pscanned) *pscanned = 0;
     task_t task = MACH_PORT_NULL;
     if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
 
@@ -2208,7 +2259,7 @@ int memread_coord_probe(pid_t pid, memread_coord_hit_t *out, int cap, int *found
         mach_port_deallocate(mach_task_self(), task);
         return -4;
     }
-    int n = 0;
+    int stop = 0;
     unsigned long long scanned = 0;
     mach_vm_address_t addr = 0;
     for (;;) {
@@ -2222,7 +2273,7 @@ int memread_coord_probe(pid_t pid, memread_coord_hit_t *out, int cap, int *found
         if (snap_region_ok(&info, size)) {
             uint64_t off = 0;
             while (off + 32 <= (uint64_t)size) {
-                if (cancel && *cancel) break;
+                if (cancel && *cancel) { stop = 1; break; }
                 mach_vm_size_t cur = (mach_vm_size_t)((size - off > CHUNK) ? CHUNK : (size - off));
                 cur -= (cur % 8);
                 if (cur == 0) break;
@@ -2230,31 +2281,122 @@ int memread_coord_probe(pid_t pid, memread_coord_hit_t *out, int cap, int *found
                 kr = mach_vm_read_overwrite(task, addr + off, cur,
                                            (mach_vm_address_t)buf, &got);
                 if (kr == KERN_SUCCESS && got == cur) {
-                    for (mach_vm_size_t o = 0; o + 32 <= cur; o += 4) {
-                        if (n >= cap) break;
+                    for (mach_vm_size_t o = 8; o + 32 <= cur; o += 4) {
                         float v[3];
-                        int qo = 0;
-                        if (!coord_try(buf + o, v, &qo)) continue;
-                        out[n].addr = (uint64_t)addr + off + o;
-                        out[n].v[0] = v[0]; out[n].v[1] = v[1]; out[n].v[2] = v[2];
-                        out[n].quat_off = qo;
-                        n++;
+                        int qo = 0, vo = 0;
+                        if (!coord_try(buf + o, v, &qo, &vo)) continue;
+                        memread_coord_hit_t h;
+                        h.addr = (uint64_t)addr + off + o + (uint64_t)vo;
+                        h.v[0] = v[0]; h.v[1] = v[1]; h.v[2] = v[2];
+                        h.quat_off = qo;
+                        if (visit(&h, vctx)) { stop = 1; break; }
                     }
-                    if (n >= cap) break;
+                    if (stop) break;
                     scanned += cur;
-                    if (cb && ((scanned & 0x3FFFFFFF) == 0)) cb(scanned, cur, scanned, 0, ctx);
                 }
                 off += cur;
             }
         }
-        if (n >= cap) break;
+        if (stop) break;
         addr += size;
     }
     free(buf);
     mach_port_deallocate(mach_task_self(), task);
-    qsort(out, (size_t)n, sizeof(memread_coord_hit_t), coord_hit_cmp);
-    if (found) *found = n;
-    fprintf(stderr, "坐标结构扫描: %d 个候选（%llu 字节）\n", n, scanned);
+    if (pscanned) *pscanned = scanned;
+    return 0;
+}
+
+typedef struct {
+    memread_coord_hit_t *out;
+    int cap, n;
+} coord_collect_t;
+
+static int coord_collect_visit(const memread_coord_hit_t *h, void *vctx) {
+    coord_collect_t *c = (coord_collect_t *)vctx;
+    if (c->n >= c->cap) return 1;
+    c->out[c->n++] = *h;
+    return 0;
+}
+
+int memread_coord_probe(pid_t pid, memread_coord_hit_t *out, int cap, int *found,
+                        volatile int *cancel, memread_region_cb cb, void *ctx) {
+    if (found) *found = 0;
+    if (!out || cap <= 0) return -2;
+    coord_collect_t c = { out, cap, 0 };
+    unsigned long long scanned = 0;
+    int rc = coord_scan(pid, coord_collect_visit, &c, &scanned, cancel, cb, ctx);
+    if (rc != 0) return rc;
+    qsort(out, (size_t)c.n, sizeof(memread_coord_hit_t), coord_hit_cmp);
+    if (found) *found = c.n;
+    fprintf(stderr, "坐标结构扫描: %d 个候选（%llu 字节）\n", c.n, scanned);
+    return 0;
+}
+
+typedef struct {
+    const memread_coord_hit_t *base;
+    int nbase;
+    memread_coord_hit_t *out;
+    int cap, n;
+    int common, moved;
+    float maxdelta;
+    float minlen, maxlen;
+    int tooSmall;
+} coord_diff_t;
+
+static int coord_diff_visit(const memread_coord_hit_t *h, void *vctx) {
+    coord_diff_t *d = (coord_diff_t *)vctx;
+    memread_coord_hit_t key;
+    key.addr = h->addr;
+    const memread_coord_hit_t *hit =
+        (const memread_coord_hit_t *)bsearch(&key, d->base, (size_t)d->nbase,
+                                             sizeof(memread_coord_hit_t), coord_addr_cmp);
+    if (!hit) return 0;
+    d->common++;
+    float dx = h->v[0] - hit->v[0];
+    float dy = h->v[1] - hit->v[1];
+    float dz = h->v[2] - hit->v[2];
+    float len = sqrtf(dx * dx + dy * dy + dz * dz);
+    if (len > 1e-3f) d->moved++;
+    if (len > d->maxdelta) d->maxdelta = len;
+    if (len < d->minlen || len > d->maxlen) return 0;
+    if (d->n >= d->cap) { d->tooSmall = 1; return 0; }
+    d->out[d->n++] = *h;
+    return 0;
+}
+
+int memread_coord_probe_diff(pid_t pid, const memread_coord_hit_t *base, int nbase,
+                             memread_coord_hit_t *out, int cap, int *found,
+                             int *pcommon, int *pmoved, float *pmaxdelta,
+                             float min_len, float max_len,
+                             volatile int *cancel, memread_region_cb cb, void *ctx) {
+    if (found) *found = 0;
+    if (pcommon) *pcommon = 0;
+    if (pmoved) *pmoved = 0;
+    if (pmaxdelta) *pmaxdelta = 0;
+    if (!base || nbase <= 0) return -2;
+
+    memread_coord_hit_t *sorted = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * (size_t)nbase);
+    if (!sorted) return -4;
+    memcpy(sorted, base, sizeof(memread_coord_hit_t) * (size_t)nbase);
+    qsort(sorted, (size_t)nbase, sizeof(memread_coord_hit_t), coord_addr_cmp);
+
+    coord_diff_t d;
+    memset(&d, 0, sizeof(d));
+    d.base = sorted; d.nbase = nbase;
+    d.out = out; d.cap = cap; d.n = 0;
+    d.minlen = min_len; d.maxlen = max_len;
+
+    unsigned long long scanned = 0;
+    int rc = coord_scan(pid, coord_diff_visit, &d, &scanned, cancel, cb, ctx);
+    free(sorted);
+    if (rc != 0) return rc;
+
+    if (found) *found = d.n;
+    if (pcommon) *pcommon = d.common;
+    if (pmoved) *pmoved = d.moved;
+    if (pmaxdelta) *pmaxdelta = d.maxdelta;
+    fprintf(stderr, "坐标对比: 共同 %d，位移非零 %d，命中 %d（最大位移 %.2f）\n",
+            d.common, d.moved, d.n, d.maxdelta);
     return 0;
 }
 
