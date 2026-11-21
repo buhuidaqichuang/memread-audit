@@ -123,3 +123,54 @@ jobs:
           name: MemRead latest
           prerelease: true
           files: build/memread.ipa
+
+  # 形态三：SpringBoard 悬浮窗（ElleKit tweak）
+  float:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compile floating panel dylib
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          mkdir -p build/float
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -O2 \
+            -fobjc-arc \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=15.0 \
+            -dynamiclib \
+            -framework UIKit -framework Foundation \
+            -o build/float/MemReadFloat.dylib \
+            float/MemReadFloat.m
+          cp float/MemReadFloat.plist build/float/
+          file build/float/MemReadFloat.dylib
+          ls -l build/float
+
+      - name: Ad-hoc sign
+        run: |
+          codesign -s - -f build/float/MemReadFloat.dylib || echo "sign skipped"
+
+      - name: Package
+        run: |
+          cd build
+          zip -qr MemReadFloat.zip float
+          ls -l MemReadFloat.zip
+
+      - name: Upload float artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: memread-float
+          path: build/MemReadFloat.zip
+          if-no-files-found: error
+
+      - name: Publish float asset
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          prerelease: true
+          files: build/MemReadFloat.zip

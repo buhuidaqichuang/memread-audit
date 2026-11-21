@@ -175,6 +175,19 @@ static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
 
 - (void)appendLogLine:(unsigned long long)addr chunk:(unsigned long long)chunk
                 total:(unsigned long long)total skipped:(int)skipped {
+    // 供系统级悬浮窗（SpringBoard 内）读取的实时状态：节流写盘，避免每块都碰 I/O
+    static CFAbsoluteTime lastLive = 0;
+    CFAbsoluteTime nowT = CFAbsoluteTimeGetCurrent();
+    if (nowT - lastLive > 0.35) {
+        lastLive = nowT;
+        NSString *live = [NSString stringWithFormat:
+            @"pid %d\n地址 0x%08llX\n块 %.1f MB\n累计 %.1f MB\n%@",
+            self.currentPid, addr, chunk / 1048576.0, total / 1048576.0,
+            skipped ? @"整块零页跳过" : @"读取中"];
+        [live writeToFile:@"/var/mobile/Media/memread_live.txt"
+                 atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!self.isViewLoaded) return;
         NSString *line = [NSString stringWithFormat:@"0x%08llX  +%.1fMB  %@累计 %.1fMB\n",
