@@ -166,7 +166,7 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
         [self.searchButton addTarget:self action:@selector(onSearchTapped) forControlEvents:UIControlEventTouchUpInside];
         [self.view addSubview:self.searchButton];
 
-        self.keyboard = [[MemKeyboardView alloc] initWithFrame:CGRectZero];
+        self.keyboard = [[MemKeyboardView alloc] initWithFrame:CGRectMake(0, 0, 0, 0)];
         __weak typeof(self) weakSelf = self;
         self.keyboard.onKey = ^(NSString *key) { [weakSelf onKey:key]; };
         [self.view addSubview:self.keyboard];
