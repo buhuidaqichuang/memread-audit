@@ -158,7 +158,6 @@ int memread_dump(pid_t pid, const char *out_path, int rw_only,
 #define SCAN_MAX_STR 400
 #define SCAN_CTX 64
 #define SCAN_MAX_DETAIL 2000
-#define DEDUP_N 8192
 
 static int ascii_printable(unsigned char c) {
     return c >= 0x20 && c < 0x7F;
@@ -354,6 +353,31 @@ static int classify(const char *s, size_t n, const char *ctx, size_t ctxn,
     return 3;
 }
 
+// ---- 扫描结果收集：同一个值只留一条并记出现次数，扫完按“独特程度”排序输出 ----
+#define SCAN_HASH_N 16384
+#define SCAN_ENTS_MAX (SCAN_MAX_DETAIL * 3)
+
+typedef struct {
+    int tier;
+    int conf;
+    const char *type;
+    unsigned long long addr;
+    size_t len;
+    unsigned count;
+    char *val;
+} scan_ent_t;
+
+static scan_ent_t *g_scanEnts = NULL;
+
+static int scan_ent_cmp(const void *a, const void *b) {
+    int ia = *(const int *)a, ib = *(const int *)b;
+    const scan_ent_t *x = &g_scanEnts[ia];
+    const scan_ent_t *y = &g_scanEnts[ib];
+    if (x->count != y->count) return (x->count < y->count) ? -1 : 1;  // 只出现 1 次的更可能是“独有值”
+    if (x->len != y->len) return (x->len > y->len) ? -1 : 1;          // 同频次时长的在前
+    return 0;
+}
+
 int memread_scan_ex(pid_t pid, const char *out_path, const char *label, int rw_only,
                     memread_region_cb cb, void *ctx,
                     unsigned long long hits[4]) {
@@ -369,14 +393,7 @@ int memread_scan_ex(pid_t pid, const char *out_path, const char *label, int rw_o
     FILE *f = fopen(out_path, "w");
     if (!f) { perror("fopen"); return -2; }
 
-    // 分档临时文件：扫描时各档分别落盘，结束后按 A→B→C 顺序拼进报告
-    char tp[3][1024];
-    FILE *ft[3] = {NULL, NULL, NULL};
-    for (int t = 0; t < 3; t++) {
-        snprintf(tp[t], sizeof(tp[t]), "%s.t%d", out_path, t);
-        ft[t] = fopen(tp[t], "wb");
-    }
-
+    // 分档临时文件不再使用：结果先在内存里去重收集，扫完统一排序写盘
     struct tm tmv;
     time_t now = time(NULL);
     localtime_r(&now, &tmv);
@@ -393,9 +410,12 @@ int memread_scan_ex(pid_t pid, const char *out_path, const char *label, int rw_o
     unsigned char *buf = (unsigned char *)malloc((size_t)CHUNK);
     if (!buf) { fclose(f); return -4; }
 
-    static uint64_t dedup[DEDUP_N];
-    memset(dedup, 0, sizeof(dedup));
-    unsigned long long written_tier[3] = {0, 0, 0};
+    scan_ent_t *ents = (scan_ent_t *)calloc(SCAN_ENTS_MAX, sizeof(scan_ent_t));
+    if (!ents) { free(buf); fclose(f); return -4; }
+    static uint32_t htab[SCAN_HASH_N];
+    memset(htab, 0, sizeof(htab));
+    int entCount = 0;
+    unsigned long long tierCap[3] = {0, 0, 0};
     unsigned long long bytes = 0;
     int regions = 0;
     mach_vm_address_t addr = 0;
@@ -453,26 +473,34 @@ int memread_scan_ex(pid_t pid, const char *out_path, const char *label, int rw_o
                             int tier = classify(tmp, n, cbuf, cn, &conf, &type);
                             if (hits) hits[tier]++;
 
-                            if (tier < 3 && written_tier[tier] < SCAN_MAX_DETAIL) {
+                            // A/B/C 档收集进内存（按值去重，记次数）；D 档只计数
+                            if (tier < 3) {
                                 uint64_t h = fnv1a(tmp, n);
-                                int seen = 0;
-                                for (int k = 0; k < 64; k++) {
-                                    size_t idx = (size_t)((h + (uint64_t)k) % DEDUP_N);
-                                    if (dedup[idx] == 0) {
-                                        dedup[idx] = h ? h : 1;
+                                uint32_t slot = (uint32_t)(h & (SCAN_HASH_N - 1));
+                                for (int k = 0; k < 256; k++) {
+                                    uint32_t s2 = (uint32_t)((slot + (uint32_t)k) & (SCAN_HASH_N - 1));
+                                    if (htab[s2] == 0) {
+                                        if (tierCap[tier] >= (unsigned long long)SCAN_MAX_DETAIL) break;
+                                        scan_ent_t *e = &ents[entCount];
+                                        e->tier = tier;
+                                        e->conf = conf;
+                                        e->type = type;
+                                        e->addr = (unsigned long long)(addr + off + i);
+                                        e->len = n;
+                                        e->count = 1;
+                                        e->val = (char *)malloc(n + 1);
+                                        if (!e->val) break;
+                                        memcpy(e->val, tmp, n + 1);
+                                        htab[s2] = (uint32_t)(entCount + 1);
+                                        entCount++;
+                                        tierCap[tier]++;
                                         break;
                                     }
-                                    if (dedup[idx] == h) { seen = 1; break; }
-                                }
-                                if (!seen) {
-                                    static const char tierc[4] = {'A', 'B', 'C', 'D'};
-                                    static const char *confc[3] = {"high", "medium", "low"};
-                                    FILE *dst = ft[tier] ? ft[tier] : f;
-                                    fprintf(dst, "[%c/%s] 0x%08llX len=%zu %s\n    %s\n",
-                                            tierc[tier], confc[conf],
-                                            (unsigned long long)(addr + off + i),
-                                            len, type, tmp);
-                                    written_tier[tier]++;
+                                    scan_ent_t *e2 = &ents[htab[s2] - 1];
+                                    if (e2->len == n && memcmp(e2->val, tmp, n) == 0) {
+                                        e2->count++;
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -486,43 +514,94 @@ int memread_scan_ex(pid_t pid, const char *out_path, const char *label, int rw_o
         addr += size;
     }
 
-    // 按 A → B → C 顺序把各档明细拼进报告，保证报告里是高可信在前
+    // 扫完统一输出：按 A → B → C 分节，节内按“出现次数少、长度长”排序（独特值排最前）
+    static const char tierc[4] = {'A', 'B', 'C', 'D'};
+    static const char *confc[3] = {"high", "medium", "low"};
     static const char *tierTitle[3] = {
         "A 档（高可信：密钥 / 凭证 / 身份证 / 银行卡等）",
         "B 档（中等：邮箱 / 电话 / 地址 / 会话等）",
-        "C 档（低可信：URL / 疑似 blob / 普通字符串）"
+        "C 档（低可信：URL / 疑似 blob / 纯数字长串 / 字母数字混合串）"
     };
+
+    unsigned long long written_total = 0;
+    int *idxs = (int *)malloc(sizeof(int) * (size_t)SCAN_MAX_DETAIL);
+    g_scanEnts = ents;
+
     for (int t = 0; t < 3; t++) {
-        if (ft[t]) { fclose(ft[t]); ft[t] = NULL; }
         fprintf(f, "\n========== %s ==========\n", tierTitle[t]);
-        FILE *in = fopen(tp[t], "rb");
-        if (in) {
-            char rb[4096];
-            size_t rn;
-            while ((rn = fread(rb, 1, sizeof(rb), in)) > 0) {
-                fwrite(rb, 1, rn, f);
-            }
-            fclose(in);
+        if (tierCap[t] == 0) {
+            fprintf(f, "（本档无命中）\n");
+            continue;
         }
-        remove(tp[t]);
+        int ni = 0;
+        for (int i = 0; i < entCount && ni < SCAN_MAX_DETAIL; i++) {
+            if (ents[i].tier == t) idxs[ni++] = i;
+        }
+        if (idxs) qsort(idxs, (size_t)ni, sizeof(int), scan_ent_cmp);
+        for (int k = 0; k < ni; k++) {
+            scan_ent_t *e = &ents[idxs[k]];
+            fprintf(f, "[%c/%s] 0x%016llX len=%zu 出现%u次  %s\n    %s\n",
+                    tierc[t], confc[e->conf], e->addr, e->len, e->count, e->type, e->val);
+            written_total++;
+        }
+    }
+    if (idxs) free(idxs);
+
+    // 类型汇总：一眼看出这堆东西都是什么，不用逐条翻
+    {
+        const char *tnames[64];
+        unsigned long long tcnt[64], tex[64];
+        int tn = 0;
+        for (int i = 0; i < entCount; i++) {
+            int found = -1;
+            for (int j = 0; j < tn; j++) {
+                if (strcmp(tnames[j], ents[i].type) == 0) { found = j; break; }
+            }
+            if (found < 0 && tn < 64) {
+                tnames[tn] = ents[i].type;
+                tcnt[tn] = 0;
+                tex[tn] = 0;
+                found = tn++;
+            }
+            if (found >= 0) {
+                tcnt[found]++;
+                if (ents[i].count == 1) tex[found]++;
+            }
+        }
+        fprintf(f, "\n========== 类型汇总（unique = 只出现 1 次的条数，通常最值得看）==========\n");
+        for (int i = 0; i < tn; i++) {
+            for (int j = i + 1; j < tn; j++) {
+                if (tcnt[j] > tcnt[i]) {
+                    const char *tn2 = tnames[i]; tnames[i] = tnames[j]; tnames[j] = tn2;
+                    unsigned long long tc = tcnt[i]; tcnt[i] = tcnt[j]; tcnt[j] = tc;
+                    unsigned long long te = tex[i]; tex[i] = tex[j]; tex[j] = te;
+                }
+            }
+        }
+        for (int i = 0; i < tn; i++) {
+            fprintf(f, "  %-14s %5llu 条   unique=%llu\n", tnames[i], tcnt[i], tex[i]);
+        }
     }
 
-    fprintf(f, "\n# scanned=%llu bytes  regions=%d  A=%llu B=%llu C=%llu D=%llu  detail=%llu\n",
+    fprintf(f, "\n# scanned=%llu bytes  regions=%d  A=%llu B=%llu C=%llu D=%llu  detail=%llu  unique_values=%d\n",
             bytes, regions,
             (unsigned long long)(hits ? hits[0] : 0),
             (unsigned long long)(hits ? hits[1] : 0),
             (unsigned long long)(hits ? hits[2] : 0),
             (unsigned long long)(hits ? hits[3] : 0),
-            written_tier[0] + written_tier[1] + written_tier[2]);
+            written_total, entCount);
 
+    for (int i = 0; i < entCount; i++) if (ents[i].val) free(ents[i].val);
+    free(ents);
     free(buf);
     fclose(f);
-    fprintf(stderr, "扫描完成: %llu 字节, %d 区域, A=%llu B=%llu C=%llu -> %s\n",
+    fprintf(stderr, "扫描完成: %llu 字节, %d 区域, A=%llu B=%llu C=%llu D=%llu, 唯一值 %d -> %s\n",
             bytes, regions,
             (unsigned long long)(hits ? hits[0] : 0),
             (unsigned long long)(hits ? hits[1] : 0),
             (unsigned long long)(hits ? hits[2] : 0),
-            out_path);
+            (unsigned long long)(hits ? hits[3] : 0),
+            entCount, out_path);
     return 0;
 }
 
