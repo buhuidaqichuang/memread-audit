@@ -125,6 +125,8 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    self.edgesForExtendedLayout = UIRectEdgeNone;
+    self.extendedLayoutIncludesOpaqueBars = NO;
     self.title = @"选择要读取的 App";
     self.allApps = [NSMutableArray array];
     self.filtered = [NSMutableArray array];
