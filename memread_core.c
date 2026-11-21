@@ -2150,6 +2150,12 @@ int memread_coord_lock(pid_t pid, int *ptriplets, unsigned long long *pcands,
 
 #define MEMREAD_CHAIN_NODE_CAP 120000    // 每层最多保留的候选槽
 
+static volatile int g_chain_level = 0;
+static volatile unsigned long long g_chain_bytes = 0;
+static volatile unsigned long long g_chain_total = 0;
+static volatile int g_chain_nodes = 0;
+static volatile int g_chain_results = 0;
+
 typedef struct {
     uint64_t addr;       // 槽地址
     int32_t off;         // 本跳偏移：槽内容 + off = 上一层要解释的地址
@@ -2209,6 +2215,7 @@ static int chain_scan_level(task_t task, const uint64_t *front, int fn,
                 cur -= (cur % 8);
                 if (cur == 0) break;
                 mach_vm_size_t got = 0;
+                g_chain_bytes += (unsigned long long)cur;
                 kr = mach_vm_read_overwrite(task, addr + off, cur,
                                            (mach_vm_address_t)buf, &got);
                 if (kr != KERN_SUCCESS || got != cur) {
@@ -2266,6 +2273,21 @@ static int chain_verify(task_t task, uint64_t slot, const int64_t *offs, int dep
     return (a == target) ? 0 : 1;
 }
 
+static int chain_cmp(const void *pa, const void *pb) {
+    const memread_chain_t *a = (const memread_chain_t *)pa;
+    const memread_chain_t *b = (const memread_chain_t *)pb;
+    if (a->depth != b->depth) return (a->depth < b->depth) ? -1 : 1;
+    int am = (strcmp(a->name, "main") == 0);
+    int bm = (strcmp(b->name, "main") == 0);
+    if (am != bm) return bm - am;                 // main 模块优先
+    long long sa = 0, sb = 0;
+    for (int i = 0; i < a->depth; i++) sa += llabs(a->offs[i]);
+    for (int i = 0; i < b->depth; i++) sb += llabs(b->offs[i]);
+    if (sa != sb) return (sa < sb) ? -1 : 1;      // 偏移合计小优先
+    if (a->static_off != b->static_off) return (a->static_off < b->static_off) ? -1 : 1;
+    return 0;
+}
+
 int memread_chain_scan(pid_t pid, uint64_t target, int max_depth,
                        memread_chain_t *out, int cap, int *found_depth,
                        volatile int *cancel) {
@@ -2283,6 +2305,13 @@ int memread_chain_scan(pid_t pid, uint64_t target, int max_depth,
 
     chainnode_t *lv[MEMREAD_CHAIN_MAX_DEPTH + 1] = {0};
     int ln[MEMREAD_CHAIN_MAX_DEPTH + 1] = {0};
+    unsigned long long tb = 0, tr = 0;
+    memread_writable_bytes(pid, 1, &tb, &tr);
+    g_chain_total = tb;
+    g_chain_bytes = 0;
+    g_chain_nodes = 0;
+    g_chain_results = 0;
+    g_chain_level = 1;
     uint64_t *front = (uint64_t *)malloc(sizeof(uint64_t));
     if (!front) {
         mach_port_deallocate(mach_task_self(), task);
@@ -2295,7 +2324,11 @@ int memread_chain_scan(pid_t pid, uint64_t target, int max_depth,
     for (int lvl = 1; lvl <= max_depth && results == 0; lvl++) {
         lv[lvl] = (chainnode_t *)malloc(sizeof(chainnode_t) * MEMREAD_CHAIN_NODE_CAP);
         if (!lv[lvl]) break;
+        g_chain_level = lvl;
+        g_chain_bytes = 0;
+        g_chain_nodes = 0;
         chain_scan_level(task, front, fn, lv[lvl], MEMREAD_CHAIN_NODE_CAP, &ln[lvl], cancel);
+        g_chain_nodes = ln[lvl];
 
         if (ln[lvl] > 0) {
             for (int j = 0; j < ln[lvl] && results < cap; j++) {
@@ -2331,11 +2364,23 @@ int memread_chain_scan(pid_t pid, uint64_t target, int max_depth,
     }
 
     if (found_depth) *found_depth = stopdepth;
+    g_chain_results = results;
+    if (results > 1) qsort(out, (size_t)results, sizeof(memread_chain_t), chain_cmp);
     free(front);
     for (int i = 0; i <= MEMREAD_CHAIN_MAX_DEPTH; i++) if (lv[i]) free(lv[i]);
     mach_port_deallocate(mach_task_self(), task);
     fprintf(stderr, "指针链扫描: 深度=%d 条数=%d\n", stopdepth, results);
     return results;
+}
+
+// 扫描进度：层数 / 本层已扫字节 / 本层总量 / 本层候选槽 / 已命中链
+void memread_chain_progress(int *level, unsigned long long *done, unsigned long long *total,
+                            int *nodes, int *results) {
+    if (level) *level = g_chain_level;
+    if (done) *done = g_chain_bytes;
+    if (total) *total = g_chain_total;
+    if (nodes) *nodes = g_chain_nodes;
+    if (results) *results = g_chain_results;
 }
 
 // 按保存下来的链（模块 UUID + 静态槽偏移 + 各级偏移）算出本轮目标地址

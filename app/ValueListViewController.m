@@ -8,6 +8,14 @@
 @property (nonatomic, strong) UITableView *table;
 @property (nonatomic, strong) NSArray *rows;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *latest;
+// 指针链扫描进度浮层
+@property (nonatomic, strong) UIView *hud;
+@property (nonatomic, strong) UILabel *hudLabel;
+@property (nonatomic, strong) UIActivityIndicatorView *hudSpinner;
+@property (nonatomic, strong) NSTimer *hudTimer;
+@property (nonatomic, strong) NSDate *hudStart;
+@property (nonatomic, assign) BOOL hudCancel;
+@property (nonatomic, assign) int *chainCancelFlag;
 @end
 
 @implementation ValueListViewController
@@ -40,6 +48,7 @@
 }
 
 - (void)dealloc {
+    [self hideChainHUD];
     [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
@@ -216,18 +225,15 @@
     __weak typeof(self) ws = self;
     [ask addAction:[UIAlertAction actionWithTitle:@"开始" style:UIAlertActionStyleDefault
                                           handler:^(UIAlertAction *x) {
+        ws.hudCancel = NO;
+        ws.chainCancelFlag = cancelFlag;
         [ws runChainScan:pid target:a type:vt cancel:cancelFlag];
     }]];
     [self presentViewController:ask animated:YES completion:nil];
 }
 
 - (void)runChainScan:(pid_t)pid target:(uint64_t)addr type:(int)vt cancel:(int *)cancelFlag {
-    UIAlertController *busy = [UIAlertController alertControllerWithTitle:@"扫描中"
-                                                                  message:@"扫可写内存，点「取消」可中止"
-                                                           preferredStyle:UIAlertControllerStyleAlert];
-    [busy addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel
-                                             handler:^(UIAlertAction *x) { if (cancelFlag) *cancelFlag = 1; }]];
-    [self presentViewController:busy animated:YES completion:nil];
+    [self showChainHUD];
 
     __weak typeof(self) ws = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -251,13 +257,82 @@
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(ws) self2 = ws;
             if (!self2) { free(chains); if (cancelFlag) free(cancelFlag); return; }
-            [self2 dismissViewControllerAnimated:YES completion:^{
-                [self2 showChainResult:copies count:n depth:depth target:addr type:vt];
-                free(chains);
-                if (cancelFlag) free(cancelFlag);
-            }];
+            [self2 hideChainHUD];
+            [self2 showChainResult:copies count:n depth:depth target:addr type:vt];
+            free(chains);
+            if (cancelFlag) free(cancelFlag);
         });
     });
+}
+
+#pragma mark - 扫描进度浮层
+
+- (void)showChainHUD {
+    [self hideChainHUD];
+    CGFloat w = 280, h = 132;
+    UIView *v = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
+    v.center = CGPointMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds));
+    v.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin |
+                         UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
+    v.backgroundColor = [UIColor colorWithWhite:0 alpha:0.85];
+    v.layer.cornerRadius = 14;
+    v.clipsToBounds = YES;
+
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, w - 32, 70)];
+    l.numberOfLines = 3;
+    l.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
+    l.textColor = [UIColor whiteColor];
+    l.text = @"第 1/4 层  已扫 0%\n准备中…";
+    [v addSubview:l];
+
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.frame = CGRectMake(16, 90, w - 32, 32);
+    [b setTitle:@"取消扫描" forState:UIControlStateNormal];
+    [b setTitleColor:[UIColor systemRedColor] forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    [b addTarget:self action:@selector(onCancelChainHUD) forControlEvents:UIControlEventTouchUpInside];
+    [v addSubview:b];
+
+    [self.view addSubview:v];
+    self.hud = v;
+    self.hudLabel = l;
+    self.hudStart = [NSDate date];
+
+    __weak typeof(self) ws = self;
+    self.hudTimer = [NSTimer scheduledTimerWithTimeInterval:0.4 repeats:YES block:^(NSTimer *t) {
+        [ws updateChainHUD];
+    }];
+}
+
+- (void)updateChainHUD {
+    int lvl = 1, nodes = 0, res = 0;
+    unsigned long long done = 0, total = 0;
+    memread_chain_progress(&lvl, &done, &total, &nodes, &res);
+    double pct = (total > 0) ? (100.0 * (double)done / (double)total) : 0.0;
+    if (pct > 100.0) pct = 100.0;
+    double el = self.hudStart ? -[self.hudStart timeIntervalSinceNow] : 0;
+    self.hudLabel.text = [NSString stringWithFormat:
+        @"第 %d/%d 层  已扫 %.0f%%\n%.0f / %.0f MB  候选槽 %d\n已命中 %d 条  用时 %.0fs",
+        lvl, MEMREAD_CHAIN_MAX_DEPTH, pct,
+        (double)done / 1048576.0, (double)total / 1048576.0, nodes, res, el];
+}
+
+- (void)hideChainHUD {
+    [self.hudTimer invalidate];
+    self.hudTimer = nil;
+    [self.hud removeFromSuperview];
+    self.hud = nil;
+    self.hudLabel = nil;
+}
+
+- (void)onCancelChainHUD {
+    self.hudCancel = YES;
+    if (self.chainCancelFlag) *self.chainCancelFlag = 1;
+    [self hideChainHUD];
+}
+
+- (BOOL)chainCancelled {
+    return self.hudCancel;
 }
 
 - (void)showChainResult:(NSArray<NSDictionary *> *)chains count:(int)n depth:(int)depth
@@ -265,7 +340,7 @@
     if (n <= 0 || chains.count == 0) {
         NSString *m = (n == 0)
             ? @"3 层、4 层都没找到静态指针链。常见原因：中间指针只存在临时对象里、或走对象池 + 索引，不是固定字段链。"
-            : [NSString stringWithFormat:@"扫描失败 rc=%d", n];
+            : ([self chainCancelled] ? @"已取消扫描。" : [NSString stringWithFormat:@"扫描失败 rc=%d", n]);
         UIAlertController *e = [UIAlertController alertControllerWithTitle:@"没有链"
                                                                   message:m
                                                            preferredStyle:UIAlertControllerStyleAlert];
@@ -274,25 +349,35 @@
         return;
     }
 
-    NSMutableString *msg = [NSMutableString stringWithFormat:@"命中 %d 条（最短 %d 层）：\n",
-                            (int)chains.count, depth];
+    NSMutableString *msg = [NSMutableString stringWithFormat:
+        @"命中 %d 条（最短 %d 层），已按「层数少 → main 模块 → 偏移小」排序，越靠前越稳。\n"
+        @"先存一条、重启游戏验证；拿不准就「全部保存到分组」，重启后逐个看哪个还对。\n\n", (int)chains.count, depth];
     for (int i = 0; i < chains.count && i < 3; i++) {
         NSDictionary *c = chains[i];
         [msg appendFormat:@"%@\n", [self chainText:c[@"name"] staticOff:[c[@"off"] unsignedLongLongValue]
                                              offs:c[@"offs"] number:i + 1]];
     }
-    if (chains.count > 3) [msg appendFormat:@"…另 %d 条（保存时可选前 8 条）", (int)chains.count - 3];
+    if (chains.count > 3) [msg appendFormat:@"…另 %d 条见下方列表", (int)chains.count - 3];
 
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"找到可跨重启的链"
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"找到 %d 条可跨重启的链", (int)chains.count]
                                                               message:msg
                                                        preferredStyle:UIAlertControllerStyleActionSheet];
     __weak typeof(self) ws = self;
-    for (int i = 0; i < chains.count && i < 8; i++) {
-        [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"保存第 %d 条", i + 1]
+    for (int i = 0; i < chains.count; i++) {
+        NSDictionary *c = chains[i];
+        NSString *title = [NSString stringWithFormat:@"#%d  %@ + 0x%llX  (%lu 层)",
+                           i + 1, c[@"name"], [c[@"off"] unsignedLongLongValue],
+                           (unsigned long)((NSArray *)c[@"offs"]).count];
+        [a addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *x) {
+            [ws promptSaveChain:c type:vt];
+        }]];
+    }
+    if (chains.count > 1) {
+        [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"全部保存 %d 条到分组…", (int)chains.count]
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *x) {
-            NSDictionary *c = chains[i];
-            [ws promptSaveChain:c type:vt];
+            [ws promptSaveAllChains:chains type:vt];
         }]];
     }
     [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
@@ -335,6 +420,61 @@
                                                                    message:(ok ? text : @"链字段缺失")
                                                             preferredStyle:UIAlertControllerStyleAlert];
         [r addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:r animated:YES completion:nil];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)promptSaveAllChains:(NSArray<NSDictionary *> *)chains type:(int)vt {
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:[NSString stringWithFormat:@"保存 %d 条链", (int)chains.count]
+                         message:@"重启游戏后逐条看哪个还能读对，其余删掉即可。全部存同一分组，标签自动编号。"
+                  preferredStyle:UIAlertControllerStyleAlert];
+    NSArray<NSString *> *groups = [[SavedAddressStore shared] groupNames];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = groups.count
+            ? [NSString stringWithFormat:@"分组（已有：%@）", [groups componentsJoinedByString:@"/"]]
+            : @"分组，如 M4 / AK";
+        NSString *last = [[NSUserDefaults standardUserDefaults] stringForKey:@"MemReadLastGroup"];
+        if (last.length) tf.text = last;
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.text = @"链";
+        tf.placeholder = @"标签前缀";
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) {
+        NSString *group = a.textFields[0].text;
+        NSString *prefix = a.textFields[1].text;
+        if (!prefix.length) prefix = @"链";
+        NSUInteger saved = 0;
+        for (NSUInteger i = 0; i < chains.count; i++) {
+            NSDictionary *c = chains[i];
+            if ([[SavedAddressStore shared] addChain:c[@"uuid"]
+                                                 name:c[@"name"]
+                                            staticOff:[c[@"off"] unsignedLongLongValue]
+                                                 offs:c[@"offs"]
+                                                 type:vt
+                                                label:[NSString stringWithFormat:@"%@%lu", prefix, (unsigned long)(i + 1)]
+                                                group:group
+                                                 note:@""]) saved++;
+        }
+        if (group.length) [[NSUserDefaults standardUserDefaults] setObject:group forKey:@"MemReadLastGroup"];
+        UIAlertController *r = [UIAlertController
+            alertControllerWithTitle:@"已保存"
+                             message:[NSString stringWithFormat:@"%lu 条链 → 分组「%@」\n重启游戏后到「已保存地址」页逐条读取验证",
+                                      (unsigned long)saved, group.length ? group : @"未分组"]
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [r addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [r addAction:[UIAlertAction actionWithTitle:@"去查看" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *y) {
+            SavedViewController *vc = [[SavedViewController alloc] init];
+            vc.pid = self.pid;
+            [self.navigationController pushViewController:vc animated:YES];
+        }]];
         [self presentViewController:r animated:YES completion:nil];
     }]];
     [self presentViewController:a animated:YES completion:nil];
