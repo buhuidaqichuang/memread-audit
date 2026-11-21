@@ -17,6 +17,7 @@
                 chunk:(unsigned long long)chunk
                 total:(unsigned long long)total
               skipped:(int)skipped;
+- (void)stringsPid:(pid_t)pid;
 @end
 
 // 读取过程中的实时回调（在后台线程触发，内部切到主线程刷 UI）
@@ -57,6 +58,7 @@ static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
     [self addButton:@"查找 PID" width:W y:&y sel:@selector(onFind)];
     [self addButton:@"启动 App" width:W y:&y sel:@selector(onLaunch)];
     [self addButton:@"读取内存 (rw-only, 无注入)" width:W y:&y sel:@selector(onRead)];
+    [self addButton:@"提取文本 (只导出字符串，体积小)" width:W y:&y sel:@selector(onStrings)];
     [self addButton:@"扫描敏感数据 (不落盘, 出报告)" width:W y:&y sel:@selector(onScan)];
     [self addButton:@"从剪贴板取 PID 读取" width:W y:&y sel:@selector(onManualPid)];
     [self addButton:@"把信息写入 Media" width:W y:&y sel:@selector(onSave)];
@@ -214,7 +216,7 @@ static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
                 rc, size / 1048576.0];
 
             UIAlertController *a = [UIAlertController alertControllerWithTitle:@"读取完成"
-                message:[NSString stringWithFormat:@"rc=%d，写入 %.1f MB\ndump 很大，看完可以在「结果」页删掉", rc, size / 1048576.0]
+                message:[NSString stringWithFormat:@"rc=%d，写入 %.1f MB（4KB 全零页已跳过）\n如需更小的文件，改用「提取文本」", rc, size / 1048576.0]
                 preferredStyle:UIAlertControllerStyleAlert];
             [a addAction:[UIAlertAction actionWithTitle:@"稍后" style:UIAlertActionStyleCancel handler:nil]];
             [a addAction:[UIAlertAction actionWithTitle:@"去查看" style:UIAlertActionStyleDefault
@@ -233,6 +235,44 @@ static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
     pid_t pid = [self findPid];
     if (pid <= 0) { self.resultLabel.text = @"目标未运行，请先启动"; return; }
     [self readPid:pid];
+}
+
+// 文本提取：只导出可打印字符串，体积通常只有 dump 的几十分之一
+- (void)onStrings {
+    pid_t pid = [self findPid];
+    if (pid <= 0) { self.resultLabel.text = @"目标未运行，请先启动"; return; }
+    [self stringsPid:pid];
+}
+
+- (void)stringsPid:(pid_t)pid {
+    if (pid <= 0) { self.resultLabel.text = @"PID 无效"; return; }
+    self.currentPid = pid;
+    self.pidLabel.text = [NSString stringWithFormat:@"PID: %d", pid];
+    [self.spinner startAnimating];
+    self.logView.text = [NSString stringWithFormat:@"开始提取字符串 pid=%d\n", pid];
+    self.resultLabel.text = @"提取中（只导出可打印字符串）...";
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        int rc = memread_strings_ex(pid, "/var/mobile/Media/memread_strings.txt", 1, 5,
+                                    DetailRegionCb, (__bridge void *)self);
+        NSDictionary *attrs = [[NSFileManager defaultManager]
+                               attributesOfItemAtPath:@"/var/mobile/Media/memread_strings.txt" error:nil];
+        unsigned long long size = [attrs[NSFileSize] unsignedLongLongValue];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self.spinner stopAnimating];
+            self.resultLabel.text = [NSString stringWithFormat:
+                @"完成 rc=%d\n%.2f MB\n/var/mobile/Media/memread_strings.txt",
+                rc, size / 1048576.0];
+
+            UIAlertController *a = [UIAlertController alertControllerWithTitle:@"提取完成"
+                message:[NSString stringWithFormat:@"rc=%d，共 %.2f MB\n每行是「地址 + 字符串」，可直接搜关键字", rc, size / 1048576.0]
+                preferredStyle:UIAlertControllerStyleAlert];
+            [a addAction:[UIAlertAction actionWithTitle:@"稍后" style:UIAlertActionStyleCancel handler:nil]];
+            [a addAction:[UIAlertAction actionWithTitle:@"去查看" style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *act) { [self onShowFiles]; }]];
+            [self presentViewController:a animated:YES completion:nil];
+        });
+    });
 }
 
 // 扫描模式：不落盘，只输出分级报告

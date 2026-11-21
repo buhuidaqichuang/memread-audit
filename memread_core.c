@@ -98,8 +98,19 @@ int memread_dump_ex(pid_t pid, const char *out_path, int rw_only,
                         skipped = 1;
                         skipped_total += cur;
                     } else {
-                        fwrite(buf, 1, (size_t)cur, f);
-                        total += cur;
+                        // 块内再按 4KB 页判零：整页全零就不写，dump 体积能砍掉一大半
+                        const size_t PS = 4096;
+                        size_t po = 0;
+                        while (po < (size_t)cur) {
+                            size_t pl = ((size_t)cur - po >= PS) ? PS : ((size_t)cur - po);
+                            if (all_zero(buf + po, pl)) {
+                                skipped_total += pl;
+                            } else {
+                                fwrite(buf + po, 1, pl, f);
+                                total += pl;
+                            }
+                            po += pl;
+                        }
                     }
                 }
                 if (cb) cb((unsigned long long)(addr + off),
@@ -477,4 +488,115 @@ int memread_list_procs(pid_t *pids, int max) {
 
 int memread_proc_path(pid_t pid, char *buf, size_t bufsz) {
     return proc_pidpath(pid, buf, (uint32_t)bufsz);
+}
+
+
+// ================= 文本提取模式 =================
+// 只把可打印 ASCII 串连同虚拟地址写出，体积通常只有原始 dump 的百分之几
+int memread_strings_ex(pid_t pid, const char *out_path, int rw_only, int min_len,
+                       memread_region_cb cb, void *ctx) {
+    if (min_len < 3) min_len = 3;
+
+    task_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "task_for_pid 失败: (%d) %s\n", kr, mach_error_string(kr));
+        return -1;
+    }
+
+    FILE *f = fopen(out_path, "wb");
+    if (!f) { perror("fopen"); return -2; }
+
+    time_t now = time(NULL);
+    struct tm *tmv = localtime(&now);
+    fprintf(f, "# memread strings  pid=%d  %04d-%02d-%02d %02d:%02d:%02d  minlen=%d  mode=%s\n",
+            pid, tmv ? tmv->tm_year + 1900 : 0, tmv ? tmv->tm_mon + 1 : 0, tmv ? tmv->tm_mday : 0,
+            tmv ? tmv->tm_hour : 0, tmv ? tmv->tm_min : 0, tmv ? tmv->tm_sec : 0,
+            min_len, rw_only ? "rw-only" : "all-readable");
+    fprintf(f, "# 每行： 0x<虚拟地址>\t<字符串>\n\n");
+
+    const mach_vm_size_t CHUNK = 4ULL * 1024 * 1024;
+    unsigned char *buf = (unsigned char *)malloc((size_t)CHUNK);
+    if (!buf) { fclose(f); return -4; }
+
+    enum { MAXS = 512 };
+    char partial[MAXS];
+    size_t plen = 0;
+    unsigned long long paddr = 0;
+    unsigned long long hits = 0;
+    unsigned long long bytes = 0;
+    int regions = 0;
+    mach_vm_address_t addr = 0;
+
+    while (1) {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+
+        kr = mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t)&info, &cnt, &obj);
+        if (kr != KERN_SUCCESS || size == 0) break;
+
+        int readable = (info.protection & VM_PROT_READ) != 0;
+        int writable = (info.protection & VM_PROT_WRITE) != 0;
+        int shared = info.shared;
+
+        if (readable && !shared && (!rw_only || writable) &&
+            size <= (mach_vm_size_t)(512ULL * 1024 * 1024)) {
+            regions++;
+            mach_vm_address_t off = 0;
+            while (off < size) {
+                mach_vm_size_t cur = (size - off > CHUNK) ? CHUNK : (size - off);
+                mach_vm_size_t got = 0;
+                kr = mach_vm_read_overwrite(task, addr + off, cur,
+                                            (mach_vm_address_t)buf, &got);
+                if (kr == KERN_SUCCESS && got == cur && !all_zero(buf, (size_t)cur)) {
+                    bytes += cur;
+                    size_t i = 0;
+                    while (i < (size_t)cur) {
+                        unsigned char c = buf[i];
+                        int okch = (c >= 0x20 && c < 0x7f) || c == '\t';
+                        if (okch) {
+                            if (plen == 0) paddr = (unsigned long long)(addr + off + i);
+                            if (plen < (size_t)MAXS - 1) {
+                                partial[plen++] = (char)c;
+                            } else {
+                                partial[plen] = 0;
+                                fprintf(f, "0x%016llX\t%s\n", paddr, partial);
+                                hits++;
+                                plen = 0;
+                                paddr = (unsigned long long)(addr + off + i);
+                                partial[plen++] = (char)c;
+                            }
+                        } else {
+                            if (plen >= (size_t)min_len) {
+                                partial[plen] = 0;
+                                fprintf(f, "0x%016llX\t%s\n", paddr, partial);
+                                hits++;
+                            }
+                            plen = 0;
+                        }
+                        i++;
+                    }
+                }
+                if (cb) cb((unsigned long long)(addr + off),
+                           (unsigned long long)cur, bytes, 0, ctx);
+                off += cur;
+            }
+            if (plen >= (size_t)min_len) {
+                partial[plen] = 0;
+                fprintf(f, "0x%016llX\t%s\n", paddr, partial);
+                hits++;
+            }
+            plen = 0;
+        }
+        addr += size;
+    }
+
+    free(buf);
+    fclose(f);
+    fprintf(stderr, "文本提取完成: 扫描 %llu 字节, 命中 %llu 条, %d 个区域 -> %s\n",
+            bytes, hits, regions, out_path);
+    return hits > 0 ? 0 : -3;
 }

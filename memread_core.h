@@ -33,6 +33,11 @@ int memread_scan_ex(pid_t pid, const char *out_path, const char *label, int rw_o
                     memread_region_cb cb, void *ctx,
                     unsigned long long hits[4]);
 
+// 文本提取：只把可打印 ASCII 串连同虚拟地址写进 out_path，体积远小于原始 dump
+// min_len 为最短字符串长度（建议 5）；返回 0 成功，无命中返回 -3
+int memread_strings_ex(pid_t pid, const char *out_path, int rw_only, int min_len,
+                       memread_region_cb cb, void *ctx);
+
 // 兼容旧签名：只有累计字节的进度回调
 int memread_dump(pid_t pid, const char *out_path, int rw_only,
                  void (*progress)(unsigned long long done, void *ctx), void *ctx);
