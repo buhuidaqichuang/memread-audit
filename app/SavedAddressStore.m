@@ -90,6 +90,47 @@ static uint64_t MemParseAddr(NSString *s) {
     return [self persist];
 }
 
+- (NSUInteger)addBatchWithGroup:(NSString *)group items:(NSArray<NSDictionary *> *)items {
+    NSString *gp = [group stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (!gp) gp = @"";
+
+    NSMutableSet<NSString *> *keys = [NSMutableSet set];
+    for (NSDictionary *d in _items) {
+        NSString *a = d[@"addr"], *g = d[@"group"];
+        NSNumber *t = d[@"type"];
+        if (![a isKindOfClass:[NSString class]] || ![t isKindOfClass:[NSNumber class]]) continue;
+        NSString *gi = [g isKindOfClass:[NSString class]] ? g : @"";
+        [keys addObject:[NSString stringWithFormat:@"%@|%d|%@", a.lowercaseString, t.intValue, gi]];
+    }
+
+    NSString *ts = [NSString stringWithFormat:@"%.0f", [NSDate date].timeIntervalSince1970];
+    NSUInteger added = 0;
+    for (NSDictionary *it in items) {
+        uint64_t addr = [it[@"addr"] unsignedLongLongValue];
+        if (addr == 0) continue;
+        int type = [it[@"type"] intValue];
+        NSString *label = it[@"label"];
+        if (![label isKindOfClass:[NSString class]] || !label.length) continue;
+
+        NSString *hex = [NSString stringWithFormat:@"0x%llX", addr];
+        NSString *key = [NSString stringWithFormat:@"%@|%d|%@", hex.lowercaseString, type, gp];
+        if ([keys containsObject:key]) continue;
+
+        [_items addObject:@{
+            @"addr": hex,
+            @"type": @(type),
+            @"label": label,
+            @"group": gp,
+            @"note": @"",
+            @"ts": ts
+        }];
+        [keys addObject:key];
+        added++;
+    }
+    if (added) [self persist];
+    return added;
+}
+
 - (BOOL)removeAtIndex:(NSUInteger)idx {
     if (idx >= _items.count) return NO;
     [_items removeObjectAtIndex:idx];

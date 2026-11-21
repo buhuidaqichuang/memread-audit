@@ -1,5 +1,6 @@
 #import "ValueListViewController.h"
 #import "SavedAddressStore.h"
+#import "SavedViewController.h"
 #import "memread_core.h"
 
 @interface ValueListViewController () <UITableViewDataSource, UITableViewDelegate>
@@ -22,6 +23,12 @@
     self.table.delegate = self;
     self.table.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [self.view addSubview:self.table];
+
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"存全部"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self
+                                        action:@selector(onSaveAll)];
 
     [self reloadCandidates];
 
@@ -236,6 +243,113 @@
         [ws presentViewController:ok animated:YES completion:nil];
     }]];
     [self presentViewController:a animated:YES completion:nil];
+}
+
+#pragma mark - 批量保存到分组
+
+- (void)onSaveAll {
+    unsigned long long n = memread_valscan_count();
+    if (n == 0) {
+        UIAlertController *e = [UIAlertController alertControllerWithTitle:@"没有候选"
+                                                                   message:@"先做一次首扫或收敛"
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+        [e addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:e animated:YES completion:nil];
+        return;
+    }
+    NSUInteger cap = (n > 200) ? 200 : (NSUInteger)n;
+    NSArray<NSString *> *groups = [[SavedAddressStore shared] groupNames];
+    __weak typeof(self) ws = self;
+
+    if (!groups.count) {
+        [self promptSaveAllToGroup:[[NSUserDefaults standardUserDefaults] stringForKey:@"MemReadLastGroup"]
+                               save:cap total:n];
+        return;
+    }
+
+    NSString *title = [NSString stringWithFormat:@"保存 %lu 条候选到分组（共 %llu 条）",
+                       (unsigned long)cap, n];
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:title
+                                                               message:@"点分组即保存；同地址同类型同分组自动跳过"
+                                                        preferredStyle:UIAlertControllerStyleActionSheet];
+    for (NSString *g in groups) {
+        [a addAction:[UIAlertAction actionWithTitle:g style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *x) {
+            [ws saveAllToGroup:g prefix:@"候选" save:cap total:n];
+        }]];
+    }
+    [a addAction:[UIAlertAction actionWithTitle:@"新建分组…" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) {
+        [ws promptSaveAllToGroup:[[NSUserDefaults standardUserDefaults] stringForKey:@"MemReadLastGroup"]
+                              save:cap total:n];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    a.popoverPresentationController.barButtonItem = self.navigationItem.rightBarButtonItem;
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)promptSaveAllToGroup:(NSString *)prefill save:(NSUInteger)cap total:(unsigned long long)n {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"保存全部候选"
+                                                               message:[NSString stringWithFormat:
+                                        @"将保存前 %lu 条（共 %llu 条），标签自动编号\n分组填枪械名，如 M4 / AK；留空 = 未分组",
+                                        (unsigned long)cap, n]
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        if (prefill.length) tf.text = prefill;
+        tf.placeholder = @"分组名";
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.text = @"候选";
+        tf.placeholder = @"标签前缀";
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) ws = self;
+    [a addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) {
+        NSString *g = a.textFields[0].text;
+        NSString *p = a.textFields[1].text;
+        [ws saveAllToGroup:g prefix:(p.length ? p : @"候选") save:cap total:n];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)saveAllToGroup:(NSString *)group prefix:(NSString *)prefix
+                   save:(NSUInteger)cap total:(unsigned long long)n {
+    NSString *gp = [group stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSMutableArray<NSDictionary *> *items = [NSMutableArray arrayWithCapacity:cap];
+    for (NSUInteger i = 0; i < cap; i++) {
+        uint64_t addr = 0, prev = 0;
+        int vt = self.type;
+        if (memread_valscan_get_ex((unsigned long long)i, &addr, &prev, &vt) != 0) continue;
+        [items addObject:@{
+            @"addr": @(addr),
+            @"type": @(vt),
+            @"label": [NSString stringWithFormat:@"%@%lu", prefix, (unsigned long)(i + 1)]
+        }];
+    }
+    NSUInteger added = [[SavedAddressStore shared] addBatchWithGroup:gp items:items];
+    if (gp.length) [[NSUserDefaults standardUserDefaults] setObject:gp forKey:@"MemReadLastGroup"];
+
+    NSString *gname = gp.length ? gp : @"未分组";
+    NSString *msg = [NSString stringWithFormat:@"新增 %lu 条 → 分组「%@」%@",
+                     (unsigned long)added, gname,
+                     (items.count > added)
+                        ? [NSString stringWithFormat:@"\n跳过重复 %lu 条", (unsigned long)(items.count - added)]
+                        : @""];
+    UIAlertController *ok = [UIAlertController alertControllerWithTitle:@"已保存"
+                                                               message:msg
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    __weak typeof(self) ws = self;
+    [ok addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+    [ok addAction:[UIAlertAction actionWithTitle:@"查看" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) {
+        SavedViewController *vc = [[SavedViewController alloc] init];
+        vc.pid = ws.pid;
+        [ws.navigationController pushViewController:vc animated:YES];
+    }]];
+    [self presentViewController:ok animated:YES completion:nil];
 }
 
 @end
