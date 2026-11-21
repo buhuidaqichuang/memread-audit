@@ -299,6 +299,30 @@ static int is_idcard(const char *s) {
     return (c >= '0' && c <= '9') || c == 'X' || c == 'x';
 }
 
+// 纯数字长串：12 位以上、又不是手机号/卡号/身份证的那种（编号、密钥、随机数字）
+static int is_digits_only(const char *s, size_t n) {
+    if (n < 12 || n > 512) return 0;
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] < '0' || s[i] > '9') return 0;
+    }
+    return 1;
+}
+
+// 混合随机串：12 字符以上、无空格、同时含字母和数字（自写密钥最常见的形态）
+static int is_mixed_token(const char *s, size_t n) {
+    if (n < 12 || n > 200) return 0;
+    int hasLower = 0, hasUpper = 0, hasDigit = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (c == ' ' || c == '\t') return 0;
+        if (c >= 'a' && c <= 'z') hasLower = 1;
+        else if (c >= 'A' && c <= 'Z') hasUpper = 1;
+        else if (c >= '0' && c <= '9') hasDigit = 1;
+    }
+    if (!hasDigit) return 0;
+    return (hasLower || hasUpper) ? 1 : 0;
+}
+
 // 返回值：档位 0=A 1=B 2=C 3=D；conf: 0=high 1=medium 2=low
 static int classify(const char *s, size_t n, const char *ctx, size_t ctxn,
                     int *conf, const char **type) {
@@ -317,6 +341,9 @@ static int classify(const char *s, size_t n, const char *ctx, size_t ctxn,
     if (is_cn_phone(s)) { *conf = 0; *type = "phone"; return 1; }
     if (is_card_number(s)) { *conf = 0; *type = "card"; return 1; }
     if (is_idcard(s)) { *conf = 0; *type = "idcard"; return 1; }
+    // 自写密钥最常落在这一档：纯数字长串 / 字母数字混合长串
+    if (is_digits_only(s, n)) { *conf = 2; *type = "digits"; return 2; }
+    if (is_mixed_token(s, n)) { *conf = 2; *type = "mixed-token"; return 2; }
     if (is_url(s)) { *conf = 1; *type = "url"; return 2; }
     if (strncmp(s, "sk-", 3) == 0 && n >= 20) { *conf = 0; *type = "openai-key"; return 0; }
     if ((is_hexish(s, n) || is_b64ish(s, n)) && n >= 24) {
@@ -358,7 +385,9 @@ int memread_scan_ex(pid_t pid, const char *out_path, const char *label, int rw_o
             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
             tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
     fprintf(f, "# app=%s\n", label ? label : "(unknown)");
-    fprintf(f, "# mode=%s\n\n", rw_only ? "rw-only" : "all-readable");
+    fprintf(f, "# mode=%s\n", rw_only ? "rw-only" : "all-readable");
+    fprintf(f, "# 分级：A=凭证/密钥类  B=身份类(邮箱/手机号/卡号/身份证)  "
+               "C=疑似值(URL/hex-base64 blob/纯数字长串/字母数字混合串)  D=普通字符串(只计数不列明细)\n\n");
 
     const mach_vm_size_t CHUNK = 4ULL * 1024 * 1024;
     unsigned char *buf = (unsigned char *)malloc((size_t)CHUNK);
