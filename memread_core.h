@@ -174,6 +174,22 @@ int memread_coord_diff(const memread_coord_hit_t *a, int na,
 // 用一批地址覆盖候选表（供列表页直接点『链』）
 int memread_valscan_set(const uint64_t *addrs, int n, int type);
 
+// 取链上第 hop 跳读出的对象指针（hop 从 0 起，0 = 静态槽里的值）
+int memread_chain_hop_object(pid_t pid, const char *uuid, uint64_t static_off,
+                             const int64_t *offs, int depth, int hop, uint64_t *out_obj);
+
+// 同类对象枚举：self_obj 是自己的角色对象，vtable 相同的都是同类单位
+// root_off = RootComponent 在角色对象内的偏移；loc_off = 坐标在 RootComponent 内的偏移
+typedef struct {
+    uint64_t obj;
+    float v[3];
+    float dist;     // 与自己的距离（游戏单位），自己为 0
+} memread_peer_t;
+
+int memread_peers_scan(pid_t pid, uint64_t self_obj, int64_t root_off, int64_t loc_off,
+                       memread_peer_t *out, int cap, int *found, uint64_t *out_vtable,
+                       volatile int *cancel);
+
 void memread_snapshot_free(void);
 
 // 预统计可写区域总量（进度百分比用，不读内存，只枚举 region）；返回 0 成功

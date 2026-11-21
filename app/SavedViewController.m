@@ -819,12 +819,81 @@ static void MemSavedSigCacheInit(void) {
             [self2 locateSignatureFor:s flat:flat sender:nil];
         }]];
     }
+    if (s.hasChain && s.chainOffsets.count >= 2) {
+        [a addAction:[UIAlertAction actionWithTitle:@"同类单位坐标" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *x) { [ws showPeersFor:s]; }]];
+    }
     [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:a animated:YES completion:nil];
 }
 
 - (void)tableView:(UITableView *)tv didDeselectRowAtIndexPath:(NSIndexPath *)ip {
     if (self.table.isEditing) [self updateDeleteItem];
+}
+
+#pragma mark - 同类单位（单机 NPC）
+
+// 用已保存的坐标链当模板：链的倒数第二跳是角色对象，最后一跳是坐标在 RootComponent 里的偏移。
+// 同一个类的对象 vtable 相同，扫全内存找 vtable 相等的对象头，就是所有同类单位。
+- (void)showPeersFor:(SavedAddress *)s {
+    if (self.pid <= 0 || !s.hasChain) return;
+    int d = (int)MIN(s.chainOffsets.count, (NSUInteger)MEMREAD_CHAIN_MAX_DEPTH);
+    if (d < 2) return;
+    int64_t *offs = (int64_t *)malloc(sizeof(int64_t) * (size_t)d);
+    if (!offs) return;
+    for (int k = 0; k < d; k++) offs[k] = [s.chainOffsets[(NSUInteger)k] longLongValue];
+    int64_t rootOff = offs[d - 2];
+    int64_t locOff = offs[d - 1];
+    pid_t pid = self.pid;
+    NSString *uuid = s.moduleUUID;
+    uint64_t staticOff = s.chainStaticOff;
+    self.navigationItem.prompt = @"扫描同类对象…";
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        uint64_t pawn = 0;
+        int rc = memread_chain_hop_object(pid, uuid.UTF8String, staticOff, offs, d, d - 2, &pawn);
+        free(offs);
+        int n = 0;
+        uint64_t vt = 0;
+        memread_peer_t *peers = (memread_peer_t *)malloc(sizeof(memread_peer_t) * 256);
+        if (!peers) {
+            rc = -4;
+        } else if (rc == 0) {
+            rc = memread_peers_scan(pid, pawn, rootOff, locOff, peers, 256, &n, &vt, NULL);
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) self2 = ws;
+            if (!self2) { free(peers); return; }
+            self2.navigationItem.prompt = nil;
+            NSString *msg;
+            if (rc != 0) {
+                msg = [NSString stringWithFormat:@"失败 rc=%d（链没解析到角色对象，或对象头不是 vtable）", rc];
+            } else if (n == 0) {
+                msg = [NSString stringWithFormat:@"vtable 0x%llX 没找到同类对象。\n可能这条链的倒数第二跳不是角色对象本身。",
+                       (unsigned long long)vt];
+            } else {
+                NSMutableString *m = [NSMutableString stringWithFormat:
+                    @"共 %d 个同类对象（vtable 0x%llX）。距离单位与游戏一致，UE 一般是厘米。\n\n",
+                    n, (unsigned long long)vt];
+                int show = MIN(n, 12);
+                for (int i = 0; i < show; i++) {
+                    [m appendFormat:@"#%d  %.1f  (%.1f, %.1f, %.1f)%@\n", i + 1,
+                     peers[i].dist, peers[i].v[0], peers[i].v[1], peers[i].v[2],
+                     (peers[i].dist >= 0 && peers[i].dist < 0.01f) ? @"  ← 自己" : @""];
+                }
+                if (n > show) [m appendFormat:@"…另 %d 个", n - show];
+                msg = m;
+            }
+            free(peers);
+            UIAlertController *a = [UIAlertController alertControllerWithTitle:@"同类单位坐标"
+                                                                       message:msg
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+            [a addAction:[UIAlertAction actionWithTitle:@"刷新" style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *x) { [self2 showPeersFor:s]; }]];
+            [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+            [self2 presentViewController:a animated:YES completion:nil];
+        });
+    });
 }
 
 #pragma mark - 编辑

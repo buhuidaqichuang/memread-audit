@@ -3028,3 +3028,138 @@ int memread_chain_resolve_ex(pid_t pid, const char *uuid, uint64_t static_off,
     if (rc == 0 && out_addr) *out_addr = a;
     return rc;
 }
+
+#pragma mark - 同类对象枚举（单机：NPC 与玩家角色同类）
+
+// 取链上第 hop 跳的对象指针：hop=0 是静态槽里的值，hop=1 是再解一次引用后的对象
+int memread_chain_hop_object(pid_t pid, const char *uuid, uint64_t static_off,
+                             const int64_t *offs, int depth, int hop, uint64_t *out_obj) {
+    if (out_obj) *out_obj = 0;
+    if (!offs || hop < 0 || hop >= depth) return -2;
+    uint64_t base = 0;
+    char nm[64] = {0};
+    int br = memread_module_base(pid, uuid, &base, nm, sizeof(nm));
+    if (br == 1 || base == 0) return 2;
+    if (br != 0) return -1;
+    task_t task = MACH_PORT_NULL;
+    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
+    uint64_t a = base + static_off;
+    int rc = -3;
+    for (int i = 0; i <= hop; i++) {
+        uint64_t v = 0;
+        if (chain_read_u64(task, a, &v) != 0 || v < 0x100000000ULL) {
+            rc = -3;
+            break;
+        }
+        if (i == hop) {
+            if (out_obj) *out_obj = v;
+            rc = 0;
+            break;
+        }
+        a = (uint64_t)((int64_t)v + offs[i]);
+    }
+    mach_port_deallocate(mach_task_self(), task);
+    return rc;
+}
+
+// 读某个同类对象的 RootComponent + 坐标偏移，得到它的位置
+static int peer_read_coord(task_t task, uint64_t obj, int64_t root_off, int64_t loc_off, float v[3]) {
+    uint64_t root = 0;
+    if (chain_read_u64(task, (uint64_t)((int64_t)obj + root_off), &root) != 0) return 0;
+    if (root < 0x100000000ULL) return 0;
+    unsigned char buf[12];
+    mach_vm_size_t got = 0;
+    uint64_t la = (uint64_t)((int64_t)root + loc_off);
+    if (mach_vm_read_overwrite(task, la, 12, (mach_vm_address_t)buf, &got) != KERN_SUCCESS || got != 12) return 0;
+    memcpy(v, buf, 12);
+    return coord_vec_ok(v);
+}
+
+static int peer_cmp(const void *pa, const void *pb) {
+    const memread_peer_t *a = (const memread_peer_t *)pa;
+    const memread_peer_t *b = (const memread_peer_t *)pb;
+    if (a->dist == b->dist) return 0;
+    return (a->dist < b->dist) ? -1 : 1;
+}
+
+// 同一个 C++ 类 ⇒ 同一个 vtable。玩家角色和同类 NPC 的 vtable 相同，
+// 所以扫「对象头 8 字节 == 自己的 vtable」就能把同类单位全找出来，不用遍历场景树。
+int memread_peers_scan(pid_t pid, uint64_t self_obj, int64_t root_off, int64_t loc_off,
+                       memread_peer_t *out, int cap, int *found, uint64_t *out_vtable,
+                       volatile int *cancel) {
+    if (found) *found = 0;
+    if (out_vtable) *out_vtable = 0;
+    if (!out || cap <= 0 || self_obj == 0) return -2;
+    task_t task = MACH_PORT_NULL;
+    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
+
+    uint64_t vt = 0;
+    if (chain_read_u64(task, self_obj, &vt) != 0 || vt < 0x100000000ULL) {
+        mach_port_deallocate(mach_task_self(), task);
+        return -3;                      // 自己这个地址不是对象头
+    }
+    if (out_vtable) *out_vtable = vt;
+
+    float selfv[3] = {0, 0, 0};
+    int self_ok = peer_read_coord(task, self_obj, root_off, loc_off, selfv);
+
+    const mach_vm_size_t CHUNK = 4ULL * 1024 * 1024;
+    unsigned char *buf = (unsigned char *)malloc((size_t)CHUNK);
+    if (!buf) {
+        mach_port_deallocate(mach_task_self(), task);
+        return -4;
+    }
+    int n = 0;
+    int stop = 0;
+    mach_vm_address_t addr = 0;
+    for (;;) {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t objp = MACH_PORT_NULL;
+        kern_return_t kr = mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
+                                         (vm_region_info_t)&info, &cnt, &objp);
+        if (kr != KERN_SUCCESS || size == 0) break;
+        if (snap_region_ok(&info, size)) {
+            uint64_t off = 0;
+            while (off + 8 <= (uint64_t)size) {
+                if (cancel && *cancel) { stop = 1; break; }
+                mach_vm_size_t cur = (mach_vm_size_t)((size - off > CHUNK) ? CHUNK : (size - off));
+                cur -= (cur % 8);
+                if (cur == 0) break;
+                mach_vm_size_t got = 0;
+                kr = mach_vm_read_overwrite(task, addr + off, cur,
+                                           (mach_vm_address_t)buf, &got);
+                if (kr == KERN_SUCCESS && got == cur) {
+                    for (mach_vm_size_t o = 0; o + 8 <= cur; o += 8) {
+                        uint64_t val;
+                        memcpy(&val, buf + o, 8);
+                        if (val != vt) continue;        // 不是同类对象头，跳过
+                        uint64_t obj = (uint64_t)addr + off + o;
+                        float v[3];
+                        if (!peer_read_coord(task, obj, root_off, loc_off, v)) continue;
+                        if (n >= cap) { stop = 1; break; }
+                        out[n].obj = obj;
+                        out[n].v[0] = v[0]; out[n].v[1] = v[1]; out[n].v[2] = v[2];
+                        out[n].dist = self_ok
+                            ? sqrtf((v[0] - selfv[0]) * (v[0] - selfv[0]) +
+                                    (v[1] - selfv[1]) * (v[1] - selfv[1]) +
+                                    (v[2] - selfv[2]) * (v[2] - selfv[2]))
+                            : -1.0f;
+                        n++;
+                    }
+                    if (stop) break;
+                }
+                off += cur;
+            }
+        }
+        if (stop) break;
+        addr += size;
+    }
+    free(buf);
+    mach_port_deallocate(mach_task_self(), task);
+    qsort(out, (size_t)n, sizeof(memread_peer_t), peer_cmp);
+    if (found) *found = n;
+    fprintf(stderr, "同类对象: %d 个（vtable 0x%llX）\n", n, (unsigned long long)vt);
+    return 0;
+}
