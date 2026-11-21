@@ -64,7 +64,7 @@ jobs:
             -miphoneos-version-min=15.0 \
             -I . \
             -framework UIKit -framework Foundation -framework Metal -framework OpenGLES \
-            -framework AVKit -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework QuartzCore -framework AudioToolbox \
+            -framework AVKit -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework QuartzCore -framework CoreGraphics -framework AudioToolbox \
             -o build/Payload/memread.app/memread \
             app/main.m app/AppDelegate.m app/ViewController.m app/DetailViewController.m app/FilesViewController.m app/DumpViewController.m app/FileTextViewController.m app/MemFileSearch.m app/SearchResultsViewController.m app/ValueScanViewController.m app/ValueListViewController.m app/SavedAddressStore.m app/SavedViewController.m app/FloatPanelController.m memread_core.c
           file build/Payload/memread.app/memread
