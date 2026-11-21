@@ -212,8 +212,16 @@
 
 - (void)promptSaveAddr:(uint64_t)addr type:(int)vt {
     NSString *typeName = [SavedAddressStore typeName:vt];
+    char muuid[40] = {0}, mname[64] = {0};
+    uint64_t mbase = 0, moff = 0;
+    int mrc = memread_addr_module_info(self.pid, addr, muuid, sizeof(muuid), mname, sizeof(mname), &mbase, &moff);
+    BOOL inModule = (mrc == 0 && muuid[0]);
+
+    NSString *where = inModule
+        ? [NSString stringWithFormat:@"模块 %s + 0x%llX（重启后能复原）", mname, moff]
+        : @"堆地址（仅本次运行有效，重启后失效）";
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"保存为标签"
-                                                               message:[NSString stringWithFormat:@"0x%llX · %@\n分组填枪械名，同一地址在不同枪下可各存一条", addr, typeName]
+                                                               message:[NSString stringWithFormat:@"0x%llX · %@\n%@\n分组填枪械名，同一地址在不同枪下可各存一条", addr, typeName, where]
                                                         preferredStyle:UIAlertControllerStyleAlert];
     [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
         tf.placeholder = @"标签名，如 当前弹匣 / 玩家HP";
@@ -232,12 +240,15 @@
                                         handler:^(UIAlertAction *x) {
         NSString *label = a.textFields[0].text;
         NSString *group = a.textFields[1].text;
-        [[SavedAddressStore shared] addAddr:addr type:vt label:label group:group note:@""];
+        [[SavedAddressStore shared] addAddr:addr type:vt label:label group:group note:@""
+                                  moduleUUID:(inModule ? [NSString stringWithUTF8String:muuid] : @"")
+                                  moduleName:(inModule ? [NSString stringWithUTF8String:mname] : @"")
+                                   moduleOff:moff];
         UIAlertController *ok = [UIAlertController alertControllerWithTitle:@"已保存"
-                                                                   message:[NSString stringWithFormat:@"%@%@ → %@",
+                                                                   message:[NSString stringWithFormat:@"%@%@ → %@\n%@",
                                                                             group.length ? [NSString stringWithFormat:@"[%@] ", group] : @"",
                                                                             label.length ? label : @"未命名",
-                                                                            [SavedAddressStore typeName:vt]]
+                                                                            [SavedAddressStore typeName:vt], where]
                                                             preferredStyle:UIAlertControllerStyleAlert];
         [ok addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
         [ws presentViewController:ok animated:YES completion:nil];
@@ -319,15 +330,26 @@
                    save:(NSUInteger)cap total:(unsigned long long)n {
     NSString *gp = [group stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     NSMutableArray<NSDictionary *> *items = [NSMutableArray arrayWithCapacity:cap];
+    NSUInteger modCount = 0;
     for (NSUInteger i = 0; i < cap; i++) {
         uint64_t addr = 0, prev = 0;
         int vt = self.type;
         if (memread_valscan_get_ex((unsigned long long)i, &addr, &prev, &vt) != 0) continue;
-        [items addObject:@{
+        NSMutableDictionary *it = [@{
             @"addr": @(addr),
             @"type": @(vt),
             @"label": [NSString stringWithFormat:@"%@%lu", prefix, (unsigned long)(i + 1)]
-        }];
+        } mutableCopy];
+        char muuid[40] = {0}, mname[64] = {0};
+        uint64_t mbase = 0, moff = 0;
+        if (memread_addr_module_info(self.pid, addr, muuid, sizeof(muuid), mname, sizeof(mname), &mbase, &moff) == 0
+            && muuid[0]) {
+            it[@"uuid"] = [NSString stringWithUTF8String:muuid];
+            it[@"name"] = [NSString stringWithUTF8String:mname];
+            it[@"off"] = @(moff);
+            modCount++;
+        }
+        [items addObject:it];
     }
     NSUInteger added = [[SavedAddressStore shared] addBatchWithGroup:gp items:items];
     if (gp.length) [[NSUserDefaults standardUserDefaults] setObject:gp forKey:@"MemReadLastGroup"];
@@ -338,6 +360,9 @@
                      (items.count > added)
                         ? [NSString stringWithFormat:@"\n跳过重复 %lu 条", (unsigned long)(items.count - added)]
                         : @""];
+    if (modCount) {
+        msg = [msg stringByAppendingFormat:@"\n其中 %lu 条在模块内，可跨重启复原；其余为堆地址，仅本次运行有效", (unsigned long)modCount];
+    }
     UIAlertController *ok = [UIAlertController alertControllerWithTitle:@"已保存"
                                                                message:msg
                                                         preferredStyle:UIAlertControllerStyleAlert];

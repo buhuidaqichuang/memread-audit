@@ -15,6 +15,7 @@ static uint64_t SaveParseAddr(NSString *s) {
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *values;
 @property (nonatomic, strong) NSArray<NSArray<NSNumber *> *> *sections; // 每组：扁平的 item 下标
 @property (nonatomic, strong) NSArray<NSString *> *sectionNames;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *resolved; // 扁平下标 → 本轮实际地址
 @property (nonatomic, assign) NSUInteger generation;
 @end
 
@@ -65,6 +66,7 @@ static uint64_t SaveParseAddr(NSString *s) {
     [[SavedAddressStore shared] reload];
     self.items = [[SavedAddressStore shared] allItems];
     [self buildSections];
+    [self resolveAddresses];
     if (!self.items.count) {
         UILabel *empty = [[UILabel alloc] init];
         empty.text = @"还没有保存的地址\n\n在「候选列表」点一行 → 保存为标签\n也可以点右上角 + 手动添加";
@@ -88,6 +90,7 @@ static uint64_t SaveParseAddr(NSString *s) {
     NSUInteger gen = ++self.generation;
     pid_t pid = self.pid;
     NSArray<SavedAddress *> *items = self.items;
+    NSDictionary<NSNumber *, NSNumber *> *resolved = [self.resolved copy];
     if (pid <= 0 || items.count == 0) return;
 
     __weak typeof(self) ws = self;
@@ -95,8 +98,10 @@ static uint64_t SaveParseAddr(NSString *s) {
         NSMutableDictionary *res = [NSMutableDictionary dictionaryWithCapacity:items.count];
         for (NSUInteger i = 0; i < items.count; i++) {
             SavedAddress *s = items[i];
+            NSNumber *ra = resolved[@(i)];
+            if (!ra) { res[@(i)] = @"模块未加载"; continue; }
             double v = 0;
-            int rc = memread_read_scalar(pid, s.addr, s.type, &v);
+            int rc = memread_read_scalar(pid, ra.unsignedLongLongValue, s.type, &v);
             res[@(i)] = (rc == 0)
                 ? [SavedAddressStore formatValue:v type:s.type]
                 : [NSString stringWithFormat:@"不可读 rc=%d", rc];
@@ -109,6 +114,24 @@ static uint64_t SaveParseAddr(NSString *s) {
             [self2.table reloadData];
         });
     });
+}
+
+- (void)resolveAddresses {
+    self.resolved = [NSMutableDictionary dictionaryWithCapacity:self.items.count];
+    if (self.pid <= 0) return;
+    for (NSUInteger i = 0; i < self.items.count; i++) {
+        SavedAddress *s = self.items[i];
+        if (!s.inModule) {
+            self.resolved[@(i)] = @(s.addr);
+            continue;
+        }
+        uint64_t base = 0;
+        char nm[64] = {0};
+        if (memread_module_base(self.pid, s.moduleUUID.UTF8String, &base, nm, sizeof(nm)) == 0 && base) {
+            self.resolved[@(i)] = @(base + s.moduleOff);
+        }
+        // 解析不到就留空：这条会显示「模块未加载」
+    }
 }
 
 #pragma mark - 分组
@@ -183,8 +206,14 @@ static uint64_t SaveParseAddr(NSString *s) {
 
     NSString *val = self.values[@(flat)];
     if (!val) val = (self.pid > 0) ? @"读取中" : @"未绑定进程";
-    c.detailTextLabel.text = [NSString stringWithFormat:@"0x%llX  %@\n= %@",
-                              s.addr, [SavedAddressStore typeName:s.type], val];
+
+    NSNumber *ra = self.resolved[@(flat)];
+    NSString *addrText = ra ? [NSString stringWithFormat:@"0x%llX", ra.unsignedLongLongValue] : @"模块未加载";
+    NSString *modText = s.inModule
+        ? [NSString stringWithFormat:@"  %@+0x%llX", (s.moduleName.length ? s.moduleName : @"mod"), s.moduleOff]
+        : @"";
+    c.detailTextLabel.text = [NSString stringWithFormat:@"%@  %@%@\n= %@",
+                              addrText, [SavedAddressStore typeName:s.type], modText, val];
     c.detailTextLabel.numberOfLines = 2;
     c.detailTextLabel.lineBreakMode = NSLineBreakByWordWrapping;
     c.detailTextLabel.font = [UIFont systemFontOfSize:12];
@@ -205,12 +234,20 @@ static uint64_t SaveParseAddr(NSString *s) {
     NSUInteger flat = (NSUInteger)sender.tag;
     if (flat >= self.items.count) return;
     SavedAddress *s = self.items[flat];
+    NSNumber *ra = self.resolved[@(flat)];
+    if (!ra) {
+        self.values[@(flat)] = @"模块未加载";
+        NSIndexPath *ip = [self indexPathForFlat:flat];
+        if (ip) [self.table reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
+        return;
+    }
+    uint64_t addr = ra.unsignedLongLongValue;
     pid_t pid = self.pid;
     sender.enabled = NO;
     __weak typeof(self) ws = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         double v = 0;
-        int rc = memread_read_scalar(pid, s.addr, s.type, &v);
+        int rc = memread_read_scalar(pid, addr, s.type, &v);
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(ws) self2 = ws;
             if (!self2) return;
@@ -231,9 +268,13 @@ static uint64_t SaveParseAddr(NSString *s) {
     SavedAddress *s = self.items[flat];
 
     NSString *val = self.values[@(flat)] ?: @"—";
-    NSString *msg = [NSString stringWithFormat:@"0x%llX · %@\n分组: %@\n当前值: %@",
-                     s.addr, [SavedAddressStore typeName:s.type],
-                     s.group.length ? s.group : @"未分组", val];
+    NSNumber *ra = self.resolved[@(flat)];
+    NSString *addrText = ra ? [NSString stringWithFormat:@"0x%llX", ra.unsignedLongLongValue] : @"模块未加载";
+    NSString *msg = [NSString stringWithFormat:@"%@ · %@\n分组: %@%@\n当前值: %@",
+                     addrText, [SavedAddressStore typeName:s.type],
+                     s.group.length ? s.group : @"未分组",
+                     s.inModule ? [NSString stringWithFormat:@"\n模块: %@ + 0x%llX", (s.moduleName.length ? s.moduleName : @"mod"), s.moduleOff] : @"\n类型: 堆地址（仅本次运行）",
+                     val];
     UIAlertController *a = [UIAlertController alertControllerWithTitle:s.label
                                                                message:msg
                                                         preferredStyle:UIAlertControllerStyleAlert];
@@ -372,7 +413,14 @@ static uint64_t SaveParseAddr(NSString *s) {
             [ws presentViewController:e animated:YES completion:nil];
             return;
         }
-        [[SavedAddressStore shared] addAddr:addr type:type label:label group:group note:@""];
+        char muuid[40] = {0}, mname[64] = {0};
+        uint64_t mbase = 0, moff = 0;
+        BOOL inModule = (memread_addr_module_info(ws.pid, addr, muuid, sizeof(muuid),
+                                                  mname, sizeof(mname), &mbase, &moff) == 0 && muuid[0]);
+        [[SavedAddressStore shared] addAddr:addr type:type label:label group:group note:@""
+                                  moduleUUID:(inModule ? [NSString stringWithUTF8String:muuid] : @"")
+                                  moduleName:(inModule ? [NSString stringWithUTF8String:mname] : @"")
+                                   moduleOff:moff];
         [ws reloadAll];
     }]];
     [self presentViewController:a animated:YES completion:nil];

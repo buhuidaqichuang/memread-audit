@@ -742,8 +742,11 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
             [self2.spinner stopAnimating];
             memread_snapshot_free();   // 通用未知值一轮够用，快照可以放掉
             if (rc != 0) {
-                self2.statusLabel.text = [NSString stringWithFormat:@"比对失败 rc=%d", rc];
-                [self2 appendProgressLine:[NSString stringWithFormat:@"未知值比对失败 rc=%d", rc]];
+                NSString *why = (rc == MEMREAD_PROC_RESTARTED)
+                    ? @"游戏进程已重启，快照作废，请重新拍"
+                    : [NSString stringWithFormat:@"比对失败 rc=%d", rc];
+                self2.statusLabel.text = why;
+                [self2 appendProgressLine:why];
                 return;
             }
             self2.statusLabel.text = [NSString stringWithFormat:@"未知值扫描完成：候选 %llu", hits];
@@ -808,8 +811,11 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
             [self2.spinner stopAnimating];
             if (rc != 0) {
                 memread_snapshot_free();
-                self2.statusLabel.text = [NSString stringWithFormat:@"走动扫描失败 rc=%d", rc];
-                [self2 appendProgressLine:[NSString stringWithFormat:@"走动扫描失败 rc=%d", rc]];
+                NSString *why = (rc == MEMREAD_PROC_RESTARTED)
+                    ? @"游戏进程已重启，快照作废，请从第①步重来"
+                    : [NSString stringWithFormat:@"走动扫描失败 rc=%d", rc];
+                self2.statusLabel.text = why;
+                [self2 appendProgressLine:why];
                 return;
             }
             if (hits == 0) {
@@ -905,8 +911,11 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
             [self2.spinner stopAnimating];
             memread_snapshot_free();
             if (rc != 0) {
-                self2.statusLabel.text = [NSString stringWithFormat:@"坐标锁定失败 rc=%d", rc];
-                [self2 appendProgressLine:[NSString stringWithFormat:@"坐标锁定失败 rc=%d", rc]];
+                NSString *why = (rc == MEMREAD_PROC_RESTARTED)
+                    ? @"游戏进程已重启，快照作废，请从第①步重来"
+                    : [NSString stringWithFormat:@"坐标锁定失败 rc=%d", rc];
+                self2.statusLabel.text = why;
+                [self2 appendProgressLine:why];
                 return;
             }
             if (triplets == 0) {

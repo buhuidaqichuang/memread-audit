@@ -91,6 +91,8 @@ int memread_valscan_first(pid_t pid, int rw_only, int type, double value, double
 // 返回 0 成功；phits 回填剩余候选数
 // 若本次会把候选筛成 0，则拒绝执行、原样保留候选，返回 MEMREAD_VALSCAN_ZERO
 #define MEMREAD_VALSCAN_ZERO -3
+// 快照/候选所属进程已经重启（pid 变了或主模块基址变了），旧快照与旧候选全部作废
+#define MEMREAD_PROC_RESTARTED -9
 int memread_valscan_refine(pid_t pid, int type, int cond, double target,
                            memread_region_cb cb, void *ctx,
                            unsigned long long *phits, volatile int *cancel);
@@ -113,6 +115,19 @@ int memread_valscan_get_ex(unsigned long long index, uint64_t *out_addr,
 
 // 读任意地址的当前值（已保存地址刷新用）；返回 0 成功，-1 task_for_pid 失败，-3 地址不可读
 int memread_read_scalar(pid_t pid, uint64_t addr, int type, double *out_value);
+
+// ============ 模块基址 + 偏移（跨进程重启定位模块内地址） ============
+// 判断 addr 落在哪个 Mach-O 模块里；命中回填模块 UUID / 名字 / 基址 / 偏移
+// 返回 0 命中，1 不在任何模块（堆地址），-1 取进程失败
+int memread_addr_module_info(pid_t pid, uint64_t addr,
+                             char *out_uuid, size_t uuid_cap,
+                             char *out_name, size_t name_cap,
+                             uint64_t *out_base, uint64_t *out_off);
+// 按模块 UUID 找回本次进程里的模块基址；返回 0 找到，1 没加载，-1 取进程失败
+int memread_module_base(pid_t pid, const char *uuid,
+                        uint64_t *out_base, char *out_name, size_t name_cap);
+// 进程身份：主可执行模块的 UUID + 基址（重启后必然变），用于快照/候选的进程校验
+int memread_proc_token(pid_t pid, char *out_uuid, size_t uuid_cap, uint64_t *out_base);
 
 // ============ 未知值扫描 / 坐标扫描 ============
 // 快照：把进程可写内存整块写到 /var/mobile/Media/memread_snap.bin 再只读 mmap 回来

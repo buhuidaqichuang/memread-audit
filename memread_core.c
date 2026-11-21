@@ -1440,6 +1440,265 @@ int memread_valscan_get_ex(unsigned long long index, uint64_t *out_addr,
     return 0;
 }
 
+#pragma mark - 模块基址 + 偏移（Mach-O 解析，跨重启定位模块内地址）
+
+#define MEMREAD_MOD_SEG_MAX 96
+#define MEMREAD_MOD_CMD_MAX (16u * 1024 * 1024)
+
+typedef struct {
+    uint64_t base;          // 模块 Mach-O header 地址（本轮运行的基址）
+    uint64_t seg_start;
+    uint64_t seg_end;
+    char uuid[40];
+    char name[64];
+} memread_modseg_t;
+
+static memread_modseg_t *g_modsegs = NULL;
+static int g_modsegn = 0;
+static pid_t g_modpid = 0;
+static time_t g_modtime = 0;
+static char g_main_uuid[40] = {0};
+static uint64_t g_main_base = 0;
+
+static void module_cache_reset(void) {
+    if (g_modsegs) free(g_modsegs);
+    g_modsegs = NULL;
+    g_modsegn = 0;
+    g_modpid = 0;
+    g_modtime = 0;
+    g_main_uuid[0] = 0;
+    g_main_base = 0;
+}
+
+static void uuid_to_str(const unsigned char *u, char *out, size_t cap) {
+    if (!out || cap < 33) { if (out && cap) out[0] = 0; return; }
+    for (int i = 0; i < 16; i++) snprintf(out + 2 * i, cap - 2 * i, "%02X", u[i]);
+    out[32] = 0;
+}
+
+static void path_basename(const char *in, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    const char *s = strrchr(in, '/');
+    s = s ? s + 1 : in;
+    size_t n = strlen(s);
+    if (n >= cap) n = cap - 1;
+    memcpy(out, s, n);
+    out[n] = 0;
+}
+
+// 解析一个 Mach-O 头，把各段的运行区间写进 out；返回段数，0 表示不是 Mach-O
+static int macho_scan(task_t task, uint64_t hdr, memread_modseg_t *out, int cap, int *out_is_main) {
+    unsigned char b[32];
+    mach_vm_size_t got = 0;
+    kern_return_t kr = mach_vm_read_overwrite(task, (mach_vm_address_t)hdr, 32,
+                                             (mach_vm_address_t)b, &got);
+    if (kr != KERN_SUCCESS || got != 32) return 0;
+    uint32_t magic;
+    memcpy(&magic, b, 4);
+    if (magic != 0xFEEDFACF) return 0;
+
+    uint32_t filetype;
+    memcpy(&filetype, b + 12, 4);
+    uint32_t ncmds, sizeofcmds;
+    memcpy(&ncmds, b + 16, 4);
+    memcpy(&sizeofcmds, b + 20, 4);
+    if (ncmds == 0 || ncmds > 4096 || sizeofcmds == 0 || sizeofcmds > MEMREAD_MOD_CMD_MAX) return 0;
+
+    unsigned char *cmds = (unsigned char *)malloc(sizeofcmds);
+    if (!cmds) return 0;
+    kr = mach_vm_read_overwrite(task, (mach_vm_address_t)(hdr + 32), sizeofcmds,
+                                (mach_vm_address_t)cmds, &got);
+    if (kr != KERN_SUCCESS || got != sizeofcmds) { free(cmds); return 0; }
+
+    uint64_t seg_vm[32], seg_sz[32];
+    int nseg = 0;
+    uint64_t text_vm = 0;
+    int has_text = 0, has_uuid = 0;
+    unsigned char uuid[16] = {0};
+    char name[64] = "";
+
+    uint64_t p = 0;
+    for (uint32_t c = 0; c < ncmds && p + 8 <= sizeofcmds; c++) {
+        uint32_t cmd, cmdsize;
+        memcpy(&cmd, cmds + p, 4);
+        memcpy(&cmdsize, cmds + p + 4, 4);
+        if (cmdsize < 8 || p + cmdsize > sizeofcmds) break;
+
+        if (cmd == 0x19 && cmdsize >= 72) {               // LC_SEGMENT_64
+            char sg[17];
+            memcpy(sg, cmds + p + 8, 16);
+            sg[16] = 0;
+            uint64_t vmaddr, vmsize, fileoff;
+            memcpy(&vmaddr, cmds + p + 24, 8);
+            memcpy(&vmsize, cmds + p + 32, 8);
+            memcpy(&fileoff, cmds + p + 40, 8);
+            if (nseg < 32 && vmsize) {
+                seg_vm[nseg] = vmaddr;
+                seg_sz[nseg] = vmsize;
+                nseg++;
+            }
+            if (strcmp(sg, "__TEXT") == 0 && fileoff == 0) {
+                text_vm = vmaddr;
+                has_text = 1;
+            }
+        } else if (cmd == 0x1b && cmdsize >= 24) {        // LC_UUID
+            memcpy(uuid, cmds + p + 8, 16);
+            has_uuid = 1;
+        } else if (cmd == 0xd && cmdsize >= 24) {         // LC_ID_DYLIB
+            uint32_t noff;
+            memcpy(&noff, cmds + p + 8, 4);
+            if (noff + 1 < cmdsize) path_basename((const char *)(cmds + p + noff), name, sizeof(name));
+        }
+        p += cmdsize;
+    }
+    free(cmds);
+
+    if (!has_text || nseg == 0) return 0;
+    if (filetype == 2) snprintf(name, sizeof(name), "main");
+
+    char uuidstr[40] = "";
+    if (has_uuid) uuid_to_str(uuid, uuidstr, sizeof(uuidstr));
+
+    int64_t slide = (int64_t)hdr - (int64_t)text_vm;
+    int n = 0;
+    for (int i = 0; i < nseg && n < cap; i++) {
+        uint64_t start = (uint64_t)((int64_t)seg_vm[i] + slide);
+        if (seg_sz[i] == 0) continue;
+        out[n].base = hdr;
+        out[n].seg_start = start;
+        out[n].seg_end = start + seg_sz[i];
+        memcpy(out[n].uuid, uuidstr, sizeof(out[n].uuid));
+        memcpy(out[n].name, name, sizeof(out[n].name));
+        n++;
+    }
+    if (out_is_main) *out_is_main = (filetype == 2);
+    return n;
+}
+
+static int module_cache_build(pid_t pid) {
+    module_cache_reset();
+
+    task_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS) return -1;
+
+    int cap = 0, cnt = 0;
+    mach_vm_address_t addr = 0;
+    memread_modseg_t rows[MEMREAD_MOD_SEG_MAX];
+
+    for (;;) {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t icnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        kr = mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t)&info, &icnt, &obj);
+        if (kr != KERN_SUCCESS || size == 0) break;
+
+        if (size >= 32) {
+            int is_main = 0;
+            int n = macho_scan(task, (uint64_t)addr, rows, MEMREAD_MOD_SEG_MAX, &is_main);
+            if (n > 0) {
+                if (cnt + n > cap) {
+                    int nc = (cnt + n + 63) / 64 * 64;
+                    memread_modseg_t *nr = (memread_modseg_t *)realloc(g_modsegs, (size_t)nc * sizeof(memread_modseg_t));
+                    if (!nr) break;
+                    g_modsegs = nr;
+                    cap = nc;
+                }
+                memcpy(g_modsegs + cnt, rows, (size_t)n * sizeof(memread_modseg_t));
+                cnt += n;
+                if (is_main && !g_main_uuid[0] && n > 0) {
+                    memcpy(g_main_uuid, rows[0].uuid, sizeof(g_main_uuid));
+                    g_main_base = rows[0].base;
+                }
+            }
+        }
+        addr += size;
+    }
+
+    mach_port_deallocate(mach_task_self(), task);
+    g_modsegn = cnt;
+    g_modpid = pid;
+    g_modtime = time(NULL);
+    fprintf(stderr, "模块解析: %d 个段, 主模块 base=0x%llX\n", cnt, g_main_base);
+    return 0;
+}
+
+static int module_cache_ensure(pid_t pid) {
+    if (!g_modsegs || g_modpid != pid || time(NULL) - g_modtime > 3) {
+        return module_cache_build(pid);
+    }
+    return 0;
+}
+
+int memread_addr_module_info(pid_t pid, uint64_t addr,
+                             char *out_uuid, size_t uuid_cap,
+                             char *out_name, size_t name_cap,
+                             uint64_t *out_base, uint64_t *out_off) {
+    if (out_uuid && uuid_cap) out_uuid[0] = 0;
+    if (out_name && name_cap) out_name[0] = 0;
+    if (module_cache_ensure(pid) != 0) return -1;
+
+    for (int i = 0; i < g_modsegn; i++) {
+        if (addr >= g_modsegs[i].seg_start && addr < g_modsegs[i].seg_end) {
+            if (out_uuid && uuid_cap) {
+                size_t n = strlen(g_modsegs[i].uuid);
+                if (n >= uuid_cap) n = uuid_cap - 1;
+                memcpy(out_uuid, g_modsegs[i].uuid, n);
+                out_uuid[n] = 0;
+            }
+            if (out_name && name_cap) {
+                size_t n = strlen(g_modsegs[i].name);
+                if (n >= name_cap) n = name_cap - 1;
+                memcpy(out_name, g_modsegs[i].name, n);
+                out_name[n] = 0;
+            }
+            if (out_base) *out_base = g_modsegs[i].base;
+            if (out_off) *out_off = addr - g_modsegs[i].base;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int memread_module_base(pid_t pid, const char *uuid,
+                        uint64_t *out_base, char *out_name, size_t name_cap) {
+    if (out_base) *out_base = 0;
+    if (out_name && name_cap) out_name[0] = 0;
+    if (!uuid || !uuid[0]) return 1;
+    if (module_cache_ensure(pid) != 0) return -1;
+
+    for (int i = 0; i < g_modsegn; i++) {
+        if (strcmp(g_modsegs[i].uuid, uuid) == 0) {
+            if (out_base) *out_base = g_modsegs[i].base;
+            if (out_name && name_cap) {
+                size_t n = strlen(g_modsegs[i].name);
+                if (n >= name_cap) n = name_cap - 1;
+                memcpy(out_name, g_modsegs[i].name, n);
+                out_name[n] = 0;
+            }
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int memread_proc_token(pid_t pid, char *out_uuid, size_t uuid_cap, uint64_t *out_base) {
+    if (out_uuid && uuid_cap) out_uuid[0] = 0;
+    if (out_base) *out_base = 0;
+    if (module_cache_ensure(pid) != 0) return -1;
+    if (!g_main_uuid[0]) return 1;
+    if (out_uuid && uuid_cap) {
+        size_t n = strlen(g_main_uuid);
+        if (n >= uuid_cap) n = uuid_cap - 1;
+        memcpy(out_uuid, g_main_uuid, n);
+        out_uuid[n] = 0;
+    }
+    if (out_base) *out_base = g_main_base;
+    return 0;
+}
+
 #pragma mark - 未知值扫描 / 坐标扫描（磁盘快照 + 变化比对）
 
 // 快照放磁盘再 mmap 回来：整块可写内存往往 700MB~1.5GB，纯内存拷贝会被系统直接杀掉
@@ -1461,6 +1720,18 @@ static unsigned long long g_sbytes = 0;
 static int g_sfd = -1;
 static void *g_smap = NULL;
 static size_t g_smaplen = 0;
+static pid_t g_snap_pid = 0;
+static char g_snap_uuid[40] = {0};
+static uint64_t g_snap_base = 0;
+
+static int snap_proc_same(pid_t pid) {
+    if (g_snap_pid && pid != g_snap_pid) return 0;
+    if (!g_snap_uuid[0]) return 1;   // 没有 token 就不校验
+    char u[40] = {0};
+    uint64_t base = 0;
+    if (memread_proc_token(pid, u, sizeof(u), &base) != 0) return 0;
+    return (strcmp(u, g_snap_uuid) == 0 && base == g_snap_base);
+}
 
 void memread_snapshot_free(void) {
     if (g_smap) munmap(g_smap, g_smaplen);
@@ -1473,6 +1744,9 @@ void memread_snapshot_free(void) {
     g_sregs = NULL;
     g_sregn = 0;
     g_sbytes = 0;
+    g_snap_pid = 0;
+    g_snap_uuid[0] = 0;
+    g_snap_base = 0;
 }
 
 // 可写、非共享、单个区域不超过 512MB：与首扫一致
@@ -1650,6 +1924,12 @@ int memread_unknown_snapshot(pid_t pid, unsigned long long *pbytes, unsigned lon
     g_smap = map;
     g_smaplen = (size_t)fileoff;
 
+    g_snap_pid = pid;
+    if (memread_proc_token(pid, g_snap_uuid, sizeof(g_snap_uuid), &g_snap_base) != 0) {
+        g_snap_uuid[0] = 0;
+        g_snap_base = 0;
+    }
+
     fprintf(stderr, "内存快照(磁盘): %d 个区域 %llu MB\n", idx, fileoff / 1048576ULL);
     if (pbytes) *pbytes = fileoff;
     if (pregions) *pregions = (unsigned long long)idx;
@@ -1680,6 +1960,7 @@ int memread_unknown_diff(pid_t pid, int cond, int float_only,
                          unsigned long long *phits, volatile int *cancel) {
     if (phits) *phits = 0;
     if (!g_sregs || g_sregn == 0) return -6;
+    if (!snap_proc_same(pid)) return MEMREAD_PROC_RESTARTED;
 
     task_t task = MACH_PORT_NULL;
     kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
@@ -1764,6 +2045,7 @@ int memread_coord_lock(pid_t pid, int *ptriplets, unsigned long long *pcands,
     if (pcands) *pcands = 0;
     if (!g_sregs || g_sregn == 0) return -6;
     if (!g_valents || g_valcount == 0) return 0;
+    if (!snap_proc_same(pid)) return MEMREAD_PROC_RESTARTED;
 
     task_t task = MACH_PORT_NULL;
     kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);

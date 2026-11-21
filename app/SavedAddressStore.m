@@ -11,6 +11,9 @@ static uint64_t MemParseAddr(NSString *s) {
 }
 
 @implementation SavedAddress
+- (BOOL)inModule {
+    return self.moduleUUID.length > 0;
+}
 @end
 
 @implementation SavedAddressStore {
@@ -67,6 +70,12 @@ static uint64_t MemParseAddr(NSString *s) {
         s.note = [nt isKindOfClass:[NSString class]] ? nt : @"";
         NSString *gp = d[@"group"];
         s.group = [gp isKindOfClass:[NSString class]] ? gp : @"";
+        NSString *mu = d[@"muuid"];
+        s.moduleUUID = [mu isKindOfClass:[NSString class]] ? mu : @"";
+        NSString *mn = d[@"mname"];
+        s.moduleName = [mn isKindOfClass:[NSString class]] ? mn : @"";
+        NSNumber *mo = d[@"moff"];
+        s.moduleOff = [mo isKindOfClass:[NSNumber class]] ? mo.unsignedLongLongValue : 0;
         [out addObject:s];
     }
     return out;
@@ -74,16 +83,27 @@ static uint64_t MemParseAddr(NSString *s) {
 
 - (BOOL)addAddr:(uint64_t)addr type:(int)type label:(NSString *)label
            group:(NSString *)group note:(NSString *)note {
+    return [self addAddr:addr type:type label:label group:group note:note
+               moduleUUID:@"" moduleName:@"" moduleOff:0];
+}
+
+- (BOOL)addAddr:(uint64_t)addr type:(int)type label:(NSString *)label
+           group:(NSString *)group note:(NSString *)note
+        moduleUUID:(NSString *)uuid moduleName:(NSString *)name moduleOff:(uint64_t)off {
     if (addr == 0) return NO;
     NSString *lb = [label stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (!lb.length) lb = @"未命名";
     NSString *gp = [group stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *mu = uuid.length ? uuid : @"";
     NSDictionary *d = @{
         @"addr": [NSString stringWithFormat:@"0x%llX", addr],
         @"type": @(type),
         @"label": lb,
         @"group": gp.length ? gp : @"",
         @"note": note.length ? note : @"",
+        @"muuid": mu,
+        @"mname": (name.length ? name : @""),
+        @"moff": @(off),
         @"ts": [NSString stringWithFormat:@"%.0f", [NSDate date].timeIntervalSince1970]
     };
     [_items addObject:d];
@@ -122,6 +142,9 @@ static uint64_t MemParseAddr(NSString *s) {
             @"label": label,
             @"group": gp,
             @"note": @"",
+            @"muuid": it[@"uuid"] ?: @"",
+            @"mname": it[@"name"] ?: @"",
+            @"moff": it[@"off"] ?: @(0),
             @"ts": ts
         }];
         [keys addObject:key];

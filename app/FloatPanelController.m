@@ -489,9 +489,24 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
     NSArray<SavedAddress *> *items = [[SavedAddressStore shared] allItems];
     NSMutableArray *rows = [NSMutableArray array];
     for (SavedAddress *it in items) {
-        double v = 0;
-        int rc = memread_read_scalar(pid, it.addr, it.type, &v);
-        NSString *val = (rc == 0) ? [SavedAddressStore formatValue:v type:it.type] : @"?";
+        NSString *val = nil;
+        uint64_t addr = it.addr;
+        BOOL ok = YES;
+        if (it.inModule) {
+            uint64_t base = 0;
+            char nm[64] = {0};
+            if (memread_module_base(pid, it.moduleUUID.UTF8String, &base, nm, sizeof(nm)) == 0 && base) {
+                addr = base + it.moduleOff;
+            } else {
+                val = @"模块未加载";
+                ok = NO;
+            }
+        }
+        if (ok) {
+            double v = 0;
+            int rc = memread_read_scalar(pid, addr, it.type, &v);
+            val = (rc == 0) ? [SavedAddressStore formatValue:v type:it.type] : @"?";
+        }
         NSString *name = (it.label.length ? it.label : @"(未命名)");
         if (it.group.length) name = [NSString stringWithFormat:@"%@·%@", it.group, name];
         [rows addObject:@{@"label": name, @"v": val}];
