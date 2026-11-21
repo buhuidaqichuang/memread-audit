@@ -114,6 +114,23 @@ int memread_valscan_get_ex(unsigned long long index, uint64_t *out_addr,
 // 读任意地址的当前值（已保存地址刷新用）；返回 0 成功，-1 task_for_pid 失败，-3 地址不可读
 int memread_read_scalar(pid_t pid, uint64_t addr, int type, double *out_value);
 
+// ============ 未知值扫描 / 坐标扫描 ============
+// 快照：把进程可写内存整块拷一份（上限 640MB），用于「不知道数值」时按变化收敛。
+int memread_unknown_snapshot(pid_t pid, unsigned long long *pbytes, unsigned long long *pregions);
+
+// 与快照比对，重建候选表；cond 支持 CHANGED / UNCHANGED / INCREASED / DECREASED
+// float_only=1 时只保留「当前位能解析成有限 float 且 |v| <= 1e6」的地址（坐标用）
+int memread_unknown_diff(pid_t pid, int cond, int float_only,
+                         memread_region_cb cb, void *ctx,
+                         unsigned long long *phits, volatile int *cancel);
+
+// 坐标锁定：在「走动变化」候选里找三连 float，其中恰好一个分量在最近一次快照后变了，
+// 且变化的不是候选自己（走 XZ 不变、跳 Y 变）。命中则把候选表改写成三连 float 地址。
+int memread_coord_lock(pid_t pid, int *ptriplets, unsigned long long *pcands,
+                       memread_region_cb cb, void *ctx);
+
+void memread_snapshot_free(void);
+
 // 预统计可写区域总量（进度百分比用，不读内存，只枚举 region）；返回 0 成功
 int memread_writable_bytes(pid_t pid, int rw_only,
                            unsigned long long *out_bytes, unsigned long long *out_regions);

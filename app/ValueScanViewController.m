@@ -118,6 +118,9 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
 
     [self addButton:@"首扫：按当前值找地址（值 / 容差）" width:W y:&y sel:@selector(onFirst)];
     [self addButton:@"收敛：按变化筛选候选" width:W y:&y sel:@selector(onRefine)];
+    [self addButton:@"未知值扫描（不知道数值）" width:W y:&y sel:@selector(onUnknown)];
+    [self addButton:@"坐标扫描（走动→站定→跳）" width:W y:&y sel:@selector(onCoord)];
+    [self addButton:@"释放内存快照（省内存）" width:W y:&y sel:@selector(onFreeSnap)];
     [self addButton:@"查看候选列表（点一行读当前值）" width:W y:&y sel:@selector(onList)];
     [self addButton:@"已保存地址（自定义标签）" width:W y:&y sel:@selector(onSaved)];
     [self addButton:@"画中画悬浮窗（后台监控）" width:W y:&y sel:@selector(onFloat)];
@@ -648,6 +651,283 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
         self.statusLabel.text = @"悬浮窗启动失败：设备不支持画中画或预览层未就绪";
         [self appendProgressLine:@"画中画启动失败"];
     }
+}
+
+#pragma mark - 未知值扫描 / 坐标扫描
+
+- (void)onFreeSnap {
+    memread_snapshot_free();
+    self.statusLabel.text = @"已释放内存快照";
+    [self appendProgressLine:@"已释放内存快照"];
+}
+
+- (void)takeSnapshotThen:(void (^)(BOOL ok, unsigned long long bytes, unsigned long long regs))done {
+    pid_t pid = [self ensurePid];
+    if (pid <= 0) return;
+    [self.spinner startAnimating];
+    self.statusLabel.text = @"拍内存快照…";
+    [self appendProgressLine:@"开始拍内存快照（整块可写内存，可能几百 MB）"];
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        unsigned long long bytes = 0, regs = 0;
+        int rc = memread_unknown_snapshot(pid, &bytes, &regs);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) self2 = ws;
+            if (!self2) return;
+            [self2.spinner stopAnimating];
+            if (rc != 0) {
+                self2.statusLabel.text = [NSString stringWithFormat:@"快照失败 rc=%d", rc];
+                [self2 appendProgressLine:[NSString stringWithFormat:
+                    @"快照失败 rc=%d（-4 内存不足 / -5 超过 640MB 上限 / -1 取进程失败）", rc]];
+                if (done) done(NO, 0, 0);
+                return;
+            }
+            self2.statusLabel.text = [NSString stringWithFormat:@"快照完成：%llu MB / %llu 个区域",
+                                      bytes / 1048576ULL, regs];
+            [self2 appendProgressLine:[NSString stringWithFormat:@"快照完成：%llu MB / %llu 区",
+                                      bytes / 1048576ULL, regs]];
+            if (done) done(YES, bytes, regs);
+        });
+    });
+}
+
+#pragma mark 未知值
+
+- (void)onUnknown {
+    __weak typeof(self) ws = self;
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"未知值扫描"
+                                                               message:@"① 保持当前状态别动，点『拍快照』。\n② 去游戏里做一次动作（开一枪 / 换弹 / 捡东西）。\n③ 回来选『变了 / 变大了 / 变小了』，就能筛出所有跟着变的地址。\n\n拍完可继续用普通『收敛』反复筛。"
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"拍快照" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) { [ws startUnknownSnapshot]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)startUnknownSnapshot {
+    __weak typeof(self) ws = self;
+    [self takeSnapshotThen:^(BOOL ok, unsigned long long bytes, unsigned long long regs) {
+        if (ok) [ws askUnknownCond];
+    }];
+}
+
+- (void)askUnknownCond {
+    __weak typeof(self) ws = self;
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"② 去游戏操作，然后回来选条件"
+                                                               message:@"刚拍完快照。现在切到游戏开一枪或换弹，再回来点下面任一条件。"
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"变了" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) { [ws unknownDiff:MEMREAD_VALCOND_CHANGED]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"变大了" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) { [ws unknownDiff:MEMREAD_VALCOND_INCREASED]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"变小了" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) { [ws unknownDiff:MEMREAD_VALCOND_DECREASED]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消（释放快照）" style:UIAlertActionStyleCancel
+                                        handler:^(UIAlertAction *x) { memread_snapshot_free(); }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)unknownDiff:(int)cond {
+    pid_t pid = [self ensurePid];
+    if (pid <= 0) return;
+    [self.spinner startAnimating];
+    self.statusLabel.text = @"与快照比对中…";
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        unsigned long long hits = 0;
+        int rc = memread_unknown_diff(pid, cond, 0, NULL, NULL, &hits, NULL);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) self2 = ws;
+            if (!self2) return;
+            [self2.spinner stopAnimating];
+            memread_snapshot_free();   // 通用未知值一轮够用，快照可以放掉
+            if (rc != 0) {
+                self2.statusLabel.text = [NSString stringWithFormat:@"比对失败 rc=%d", rc];
+                [self2 appendProgressLine:[NSString stringWithFormat:@"未知值比对失败 rc=%d", rc]];
+                return;
+            }
+            self2.statusLabel.text = [NSString stringWithFormat:@"未知值扫描完成：候选 %llu", hits];
+            [self2 appendProgressLine:[NSString stringWithFormat:
+                @"未知值扫描完成 条件=%d 候选=%llu（快照已释放）", cond, hits]];
+            [self2 refreshCount];
+            UIAlertController *ok = [UIAlertController alertControllerWithTitle:@"扫描完成"
+                                                                       message:[NSString stringWithFormat:@"候选 %llu 条。\n之后点『收敛』可以继续按变化筛。", hits]
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+            [ok addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+            [ok addAction:[UIAlertAction actionWithTitle:@"查看候选" style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *x) { [self2 onList]; }]];
+            [self2 presentViewController:ok animated:YES completion:nil];
+        });
+    });
+}
+
+#pragma mark 坐标
+
+- (void)onCoord {
+    __weak typeof(self) ws = self;
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"坐标扫描（4 步）"
+                                                               message:@"① 站空地别动 → 拍快照\n② 走动几步（别跳、别开枪）→ 扫描走动\n③ 站住不动 → 静止过滤\n④ 原地跳一下 → 锁定坐标\n\n靠「走时 X/Z 变、跳时只有 Y 变」把三连 float 挑出来。快照占几百 MB 内存。"
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"① 拍快照" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) { [ws startCoordSnapshot]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)startCoordSnapshot {
+    __weak typeof(self) ws = self;
+    [self takeSnapshotThen:^(BOOL ok, unsigned long long bytes, unsigned long long regs) {
+        if (ok) [ws askCoordWalk];
+    }];
+}
+
+- (void)askCoordWalk {
+    __weak typeof(self) ws = self;
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"② 去走动几步"
+                                                               message:@"切到游戏，向前/左右走 3~5 秒（不要跳、不要开枪、不要开镜），然后回来点『扫描走动』。"
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"扫描走动" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) { [ws coordWalk]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消（释放快照）" style:UIAlertActionStyleCancel
+                                        handler:^(UIAlertAction *x) { memread_snapshot_free(); }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)coordWalk {
+    pid_t pid = [self ensurePid];
+    if (pid <= 0) return;
+    [self.spinner startAnimating];
+    self.statusLabel.text = @"扫描走动产生的变化…";
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        unsigned long long hits = 0;
+        int rc = memread_unknown_diff(pid, MEMREAD_VALCOND_CHANGED, 1, NULL, NULL, &hits, NULL);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) self2 = ws;
+            if (!self2) return;
+            [self2.spinner stopAnimating];
+            if (rc != 0) {
+                memread_snapshot_free();
+                self2.statusLabel.text = [NSString stringWithFormat:@"走动扫描失败 rc=%d", rc];
+                [self2 appendProgressLine:[NSString stringWithFormat:@"走动扫描失败 rc=%d", rc]];
+                return;
+            }
+            if (hits == 0) {
+                memread_snapshot_free();
+                self2.statusLabel.text = @"没有检测到变化：走动太短或拍快照时也在动";
+                [self2 appendProgressLine:@"走动扫描命中 0：重来一次（快照时站稳）"];
+                return;
+            }
+            self2.statusLabel.text = [NSString stringWithFormat:@"走动变化候选 %llu", hits];
+            [self2 appendProgressLine:[NSString stringWithFormat:@"走动变化候选 %llu（已只留 float 形状的地址）", hits]];
+            [self2 refreshCount];
+            [self2 askCoordStand];
+        });
+    });
+}
+
+- (void)askCoordStand {
+    __weak typeof(self) ws = self;
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"③ 站住别动"
+                                                               message:@"人物站稳、视角别转，然后点『静止过滤』：把站着还在变的地址（计时器、粒子、UI）筛掉，并重新拍一次站立基线。"
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"静止过滤" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) { [ws coordStand]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消（释放快照）" style:UIAlertActionStyleCancel
+                                        handler:^(UIAlertAction *x) { memread_snapshot_free(); }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)coordStand {
+    pid_t pid = [self ensurePid];
+    if (pid <= 0) return;
+    [self.spinner startAnimating];
+    self.statusLabel.text = @"静止过滤 + 重拍基线…";
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        unsigned long long left = 0;
+        int rc = memread_valscan_refine(pid, MEMREAD_VALTYPE_AUTO, MEMREAD_VALCOND_UNCHANGED,
+                                        0, NULL, NULL, &left, NULL);
+        unsigned long long bytes = 0, regs = 0;
+        int src = 0;
+        if (rc == 0) src = memread_unknown_snapshot(pid, &bytes, &regs);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) self2 = ws;
+            if (!self2) return;
+            [self2.spinner stopAnimating];
+            if (rc == MEMREAD_VALSCAN_ZERO) {
+                memread_snapshot_free();
+                self2.statusLabel.text = @"静止过滤把候选筛成 0，已保留原候选";
+                [self2 appendProgressLine:@"静止过滤结果会是 0（可能走动时没真的位移），重来一次"];
+                [self2 refreshCount];
+                return;
+            }
+            if (rc != 0 || src != 0) {
+                memread_snapshot_free();
+                self2.statusLabel.text = [NSString stringWithFormat:@"静止过滤失败 rc=%d src=%d", rc, src];
+                [self2 appendProgressLine:[NSString stringWithFormat:@"静止过滤失败 rc=%d 重拍基线=%d", rc, src]];
+                return;
+            }
+            self2.statusLabel.text = [NSString stringWithFormat:@"静止过滤后候选 %llu（基线已更新）", left];
+            [self2 appendProgressLine:[NSString stringWithFormat:
+                @"静止过滤后候选 %llu，重拍基线 %llu MB", left, bytes / 1048576ULL]];
+            [self2 refreshCount];
+            [self2 askCoordJump];
+        });
+    });
+}
+
+- (void)askCoordJump {
+    __weak typeof(self) ws = self;
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"④ 原地跳一下"
+                                                               message:@"只按跳跃键，不要按方向键。落地后回来点『锁定坐标』。\n判定：三连 float 里恰好一个变了，且变的是竖直轴，不是走动时变的那两个。"
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"锁定坐标" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) { [ws coordJump]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消（释放快照）" style:UIAlertActionStyleCancel
+                                        handler:^(UIAlertAction *x) { memread_snapshot_free(); }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)coordJump {
+    pid_t pid = [self ensurePid];
+    if (pid <= 0) return;
+    [self.spinner startAnimating];
+    self.statusLabel.text = @"锁定坐标三连…";
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        int triplets = 0;
+        unsigned long long cands = 0;
+        int rc = memread_coord_lock(pid, &triplets, &cands, NULL, NULL);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) self2 = ws;
+            if (!self2) return;
+            [self2.spinner stopAnimating];
+            memread_snapshot_free();
+            if (rc != 0) {
+                self2.statusLabel.text = [NSString stringWithFormat:@"坐标锁定失败 rc=%d", rc];
+                [self2 appendProgressLine:[NSString stringWithFormat:@"坐标锁定失败 rc=%d", rc]];
+                return;
+            }
+            if (triplets == 0) {
+                self2.statusLabel.text = @"没锁定到坐标三连";
+                [self2 appendProgressLine:@"没锁定到坐标三连：跳跃时是否也在移动？重来一次，跳的时候别按方向键"];
+                return;
+            }
+            self2.statusLabel.text = [NSString stringWithFormat:@"锁定 %d 组坐标（%llu 条候选）", triplets, cands];
+            [self2 appendProgressLine:[NSString stringWithFormat:
+                @"锁定 %d 组坐标，共 %llu 条 float 候选（每 3 条一组 X/Y/Z 连续）", triplets, cands]];
+            [self2 refreshCount];
+
+            UIAlertController *ok = [UIAlertController alertControllerWithTitle:@"已锁定坐标"
+                                                                       message:[NSString stringWithFormat:@"%d 组三连 float，共 %llu 条候选。\n列表里每 3 条一组（0x…0 / +4 / +8），点『读』边走边看它们是否平滑变化。", triplets, cands]
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+            [ok addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+            [ok addAction:[UIAlertAction actionWithTitle:@"查看候选" style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *x) { [self2 onList]; }]];
+            [self2 presentViewController:ok animated:YES completion:nil];
+        });
+    });
 }
 
 - (void)onReset {

@@ -1434,3 +1434,338 @@ int memread_valscan_get_ex(unsigned long long index, uint64_t *out_addr,
     if (out_type) *out_type = g_valents[index].type;
     return 0;
 }
+
+#pragma mark - 未知值扫描 / 坐标扫描（整块内存快照 + 变化比对）
+#define MEMREAD_SNAP_MAX_BYTES (640ULL * 1024 * 1024)
+#define MEMREAD_COORD_MAX_TRIPLETS 4000
+#define MEMREAD_SNAP_REGION_MAX (512ULL * 1024 * 1024)
+
+typedef struct {
+    uint64_t addr;
+    uint64_t size;
+    unsigned char *buf;
+} memread_snapreg_t;
+
+static memread_snapreg_t *g_sregs = NULL;
+static int g_sregn = 0;
+static unsigned long long g_sbytes = 0;
+
+void memread_snapshot_free(void) {
+    if (g_sregs) {
+        for (int i = 0; i < g_sregn; i++) free(g_sregs[i].buf);
+        free(g_sregs);
+    }
+    g_sregs = NULL;
+    g_sregn = 0;
+    g_sbytes = 0;
+}
+
+// 可写、非共享、单个区域不超过 512MB：与首扫一致
+static int snap_region_ok(vm_region_basic_info_data_64_t *info, mach_vm_size_t size) {
+    if (!((info->protection & VM_PROT_READ) != 0)) return 0;
+    if (!((info->protection & VM_PROT_WRITE) != 0)) return 0;
+    if (info->shared) return 0;
+    if (size > (mach_vm_size_t)MEMREAD_SNAP_REGION_MAX) return 0;
+    return 1;
+}
+
+int memread_unknown_snapshot(pid_t pid, unsigned long long *pbytes, unsigned long long *pregions) {
+    if (pbytes) *pbytes = 0;
+    if (pregions) *pregions = 0;
+    memread_snapshot_free();
+
+    task_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "快照 task_for_pid 失败: %s\n", mach_error_string(kr));
+        return -1;
+    }
+
+    // 第一遍：只枚举，算总量，避免中途 OOM
+    mach_vm_address_t addr = 0;
+    unsigned long long total = 0;
+    int cap = 0;
+    for (;;) {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        kr = mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t)&info, &cnt, &obj);
+        if (kr != KERN_SUCCESS || size == 0) break;
+        if (snap_region_ok(&info, size)) {
+            total += (unsigned long long)size;
+            cap++;
+        }
+        addr += size;
+    }
+
+    if (cap == 0 || total == 0) {
+        mach_port_deallocate(mach_task_self(), task);
+        return -6;
+    }
+    if (total > MEMREAD_SNAP_MAX_BYTES) {
+        fprintf(stderr, "快照需要 %llu MB，超过上限 %llu MB\n",
+                total / 1048576ULL, MEMREAD_SNAP_MAX_BYTES / 1048576ULL);
+        mach_port_deallocate(mach_task_self(), task);
+        return -5;
+    }
+
+    memread_snapreg_t *regs = (memread_snapreg_t *)calloc((size_t)cap, sizeof(memread_snapreg_t));
+    if (!regs) {
+        mach_port_deallocate(mach_task_self(), task);
+        return -4;
+    }
+
+    const mach_vm_size_t CHUNK = 4ULL * 1024 * 1024;
+    addr = 0;
+    int idx = 0;
+    unsigned long long bytes = 0;
+    for (;;) {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        kr = mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t)&info, &cnt, &obj);
+        if (kr != KERN_SUCCESS || size == 0) break;
+
+        if (idx < cap && snap_region_ok(&info, size)) {
+            unsigned char *rb = (unsigned char *)malloc((size_t)size);
+            if (!rb) {
+                for (int k = 0; k < idx; k++) free(regs[k].buf);
+                free(regs);
+                mach_port_deallocate(mach_task_self(), task);
+                return -4;
+            }
+            mach_vm_size_t off = 0;
+            int ok = 1;
+            while (off < size) {
+                mach_vm_size_t cur = (size - off > CHUNK) ? CHUNK : (size - off);
+                mach_vm_size_t got = 0;
+                kr = mach_vm_read_overwrite(task, addr + off, cur,
+                                            (mach_vm_address_t)(rb + off), &got);
+                if (kr != KERN_SUCCESS || got != cur) { ok = 0; break; }
+                off += cur;
+            }
+            if (ok) {
+                regs[idx].addr = (uint64_t)addr;
+                regs[idx].size = (uint64_t)size;
+                regs[idx].buf = rb;
+                idx++;
+                bytes += (unsigned long long)size;
+            } else {
+                free(rb);
+            }
+        }
+        addr += size;
+    }
+
+    g_sregs = regs;
+    g_sregn = idx;
+    g_sbytes = bytes;
+    mach_port_deallocate(mach_task_self(), task);
+
+    fprintf(stderr, "内存快照: %d 个区域 %llu MB\n", idx, bytes / 1048576ULL);
+    if (pbytes) *pbytes = bytes;
+    if (pregions) *pregions = (unsigned long long)idx;
+    return 0;
+}
+
+// 找到覆盖 [addr, addr+len) 的快照区域下标；-1 表示没覆盖
+static int snap_find(uint64_t addr, uint64_t len) {
+    for (int i = 0; i < g_sregn; i++) {
+        uint64_t a = g_sregs[i].addr;
+        uint64_t e = a + g_sregs[i].size;
+        if (addr >= a && addr + len <= e) return i;
+    }
+    return -1;
+}
+
+static int float_plausible(uint32_t raw) {
+    float f;
+    memcpy(&f, &raw, 4);
+    if (!isfinite(f)) return 0;
+    double d = (double)f;
+    if (d < 0) d = -d;
+    return d <= 1e6;
+}
+
+int memread_unknown_diff(pid_t pid, int cond, int float_only,
+                         memread_region_cb cb, void *ctx,
+                         unsigned long long *phits, volatile int *cancel) {
+    if (phits) *phits = 0;
+    if (!g_sregs || g_sregn == 0) return -6;
+
+    task_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS) return -1;
+
+    if (!g_valents) {
+        g_valents = (memread_valent_t *)calloc(MEMREAD_VALSCAN_MAX, sizeof(memread_valent_t));
+        if (!g_valents) {
+            mach_port_deallocate(mach_task_self(), task);
+            return -4;
+        }
+    }
+    g_valcount = 0;
+
+    const mach_vm_size_t CHUNK = 4ULL * 1024 * 1024;
+    unsigned char *buf = (unsigned char *)malloc((size_t)CHUNK);
+    if (!buf) {
+        mach_port_deallocate(mach_task_self(), task);
+        return -4;
+    }
+
+    unsigned long long count = 0;
+    unsigned long long total = 0;
+    int stopped = 0;
+
+    for (int r = 0; r < g_sregn && !stopped; r++) {
+        uint64_t base = g_sregs[r].addr;
+        uint64_t size = g_sregs[r].size;
+        unsigned char *snap = g_sregs[r].buf;
+        uint64_t off = 0;
+        while (off < size) {
+            if (cancel && *cancel) { stopped = 1; break; }
+            mach_vm_size_t cur = (size - off > CHUNK) ? CHUNK : (size - off);
+            mach_vm_size_t got = 0;
+            kr = mach_vm_read_overwrite(task, base + off, cur,
+                                        (mach_vm_address_t)buf, &got);
+            if (kr != KERN_SUCCESS || got != cur) {
+                off += cur;         // 读失败：保留旧快照，跳过本块
+                continue;
+            }
+            total += cur;
+            for (size_t i = 0; i + 4 <= (size_t)cur; i += 4) {
+                uint32_t oldv, newv;
+                memcpy(&oldv, snap + off + i, 4);
+                memcpy(&newv, buf + i, 4);
+
+                int match = 0;
+                switch (cond) {
+                    case MEMREAD_VALCOND_CHANGED:    match = (oldv != newv); break;
+                    case MEMREAD_VALCOND_UNCHANGED:  match = (oldv == newv); break;
+                    case MEMREAD_VALCOND_INCREASED:  match = ((int32_t)newv > (int32_t)oldv); break;
+                    case MEMREAD_VALCOND_DECREASED:  match = ((int32_t)newv < (int32_t)oldv); break;
+                    default:                         match = (oldv != newv); break;
+                }
+                if (!match) continue;
+                if (float_only && !float_plausible(newv)) continue;
+                if (count >= MEMREAD_VALSCAN_MAX) continue;
+
+                g_valents[count].addr = base + off + i;
+                g_valents[count].prev = (uint64_t)newv;
+                g_valents[count].type = float_only ? MEMREAD_VALTYPE_FLOAT : MEMREAD_VALTYPE_INT32;
+                count++;
+            }
+            memcpy(snap + off, buf, (size_t)cur);   // 快照推进到「现在」
+            off += cur;
+            if (cb) cb((unsigned long long)(base + off), cur, total, 0, ctx);
+        }
+    }
+
+    free(buf);
+    g_valcount = count;
+    mach_port_deallocate(mach_task_self(), task);
+    fprintf(stderr, "未知值比对完成: 扫描 %llu MB, 候选 %llu\n",
+            total / 1048576ULL, count);
+    if (phits) *phits = count;
+    return 0;
+}
+
+int memread_coord_lock(pid_t pid, int *ptriplets, unsigned long long *pcands,
+                       memread_region_cb cb, void *ctx) {
+    if (ptriplets) *ptriplets = 0;
+    if (pcands) *pcands = 0;
+    if (!g_sregs || g_sregn == 0) return -6;
+    if (!g_valents || g_valcount == 0) return 0;
+
+    task_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS) return -1;
+
+    unsigned long long n = g_valcount;
+    typedef struct { uint64_t base; uint32_t raw[3]; } triple_t;
+    triple_t *out = (triple_t *)calloc(MEMREAD_COORD_MAX_TRIPLETS, sizeof(triple_t));
+    if (!out) {
+        mach_port_deallocate(mach_task_self(), task);
+        return -4;
+    }
+    int found = 0;
+
+    for (unsigned long long i = 0; i < n; i++) {
+        if (found >= MEMREAD_COORD_MAX_TRIPLETS) break;
+        uint64_t a = g_valents[i].addr;
+        uint64_t bases[2] = { a, (a >= 8) ? a - 8 : a };
+        int nb = (bases[1] == bases[0]) ? 1 : 2;
+        for (int bi = 0; bi < nb; bi++) {
+            uint64_t base = bases[bi];
+            if (base < 0x1000) continue;
+            int ri = snap_find(base, 12);
+            if (ri < 0) continue;
+            const unsigned char *sbuf = g_sregs[ri].buf + (size_t)(base - g_sregs[ri].addr);
+
+            unsigned char now[12] = {0};
+            mach_vm_size_t got = 0;
+            kr = mach_vm_read_overwrite(task, (mach_vm_address_t)base, 12,
+                                        (mach_vm_address_t)now, &got);
+            if (kr != KERN_SUCCESS || got != 12) continue;
+
+            int changed_idx = -1, changed_n = 0;
+            uint32_t olds[3], news[3];
+            for (int k = 0; k < 3; k++) {
+                memcpy(&olds[k], sbuf + 4 * k, 4);
+                memcpy(&news[k], now + 4 * k, 4);
+                if (olds[k] != news[k]) { changed_n++; changed_idx = k; }
+            }
+            if (changed_n != 1) continue;
+
+            uint64_t changed_addr = base + (uint64_t)(4 * changed_idx);
+            if (changed_addr == a) continue;      // 变化的就是候选自己：走动时就该变，跳时不该是它
+
+            int ok = 1;
+            for (int k = 0; k < 3; k++) if (!float_plausible(news[k])) { ok = 0; break; }
+            if (!ok) continue;
+
+            int dup = 0;
+            for (int k = 0; k < found; k++) if (out[k].base == base) { dup = 1; break; }
+            if (dup) continue;
+
+            out[found].base = base;
+            for (int k = 0; k < 3; k++) out[found].raw[k] = news[k];
+            found++;
+        }
+        if (found >= MEMREAD_COORD_MAX_TRIPLETS) break;
+        if (cb && ((i & 0xFFFF) == 0)) cb(i, n, i, 0, ctx);
+    }
+
+    // 候选表改写成三连 float
+    if (found > 0) {
+        memread_valscan_reset();
+        g_valents = (memread_valent_t *)calloc(MEMREAD_VALSCAN_MAX, sizeof(memread_valent_t));
+        if (!g_valents) {
+            free(out);
+            mach_port_deallocate(mach_task_self(), task);
+            return -4;
+        }
+        unsigned long long count = 0;
+        for (int k = 0; k < found; k++) {
+            for (int j = 0; j < 3; j++) {
+                if (count >= MEMREAD_VALSCAN_MAX) break;
+                g_valents[count].addr = out[k].base + (uint64_t)(4 * j);
+                g_valents[count].prev = (uint64_t)out[k].raw[j];
+                g_valents[count].type = MEMREAD_VALTYPE_FLOAT;
+                count++;
+            }
+        }
+        g_valcount = count;
+        if (pcands) *pcands = count;
+    }
+
+    free(out);
+    mach_port_deallocate(mach_task_self(), task);
+    fprintf(stderr, "坐标锁定: %d 组\n", found);
+    if (ptriplets) *ptriplets = found;
+    return 0;
+}
