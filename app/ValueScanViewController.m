@@ -3,6 +3,7 @@
 #import "SavedViewController.h"
 #import "SavedAddressStore.h"
 #import "memread_core.h"
+#import "FloatPanelController.h"
 #include <string.h>
 #include <QuartzCore/QuartzCore.h>
 
@@ -78,7 +79,7 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
 
     CGFloat W = [UIScreen mainScreen].bounds.size.width;
     CGFloat H = self.view.bounds.size.height;
-    CGFloat panelH = 180.0;
+    CGFloat panelH = 210.0;
 
     self.scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 0, W, H - panelH)];
     self.scroll.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -112,6 +113,7 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
     [self addButton:@"收敛：按变化筛选候选" width:W y:&y sel:@selector(onRefine)];
     [self addButton:@"查看候选列表（点一行读当前值）" width:W y:&y sel:@selector(onList)];
     [self addButton:@"已保存地址（自定义标签）" width:W y:&y sel:@selector(onSaved)];
+    [self addButton:@"画中画悬浮窗（后台自动收敛）" width:W y:&y sel:@selector(onFloat)];
     [self addButton:@"重置候选" width:W y:&y sel:@selector(onReset)];
 
     self.scroll.contentSize = CGSizeMake(W, y + 20);
@@ -127,13 +129,22 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
     sep.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     [panel addSubview:sep];
 
-    UILabel *pt = [[UILabel alloc] initWithFrame:CGRectMake(14, 8, W - 28, 18)];
+    UILabel *pt = [[UILabel alloc] initWithFrame:CGRectMake(14, 8, W - 190, 18)];
     pt.text = @"进度";
     pt.font = [UIFont boldSystemFontOfSize:12];
     pt.textColor = [UIColor secondaryLabelColor];
     [panel addSubview:pt];
 
-    self.progressView = [[UITextView alloc] initWithFrame:CGRectMake(10, 28, W - 20, panelH - 36)];
+    // 画中画预览（PiP 启动前必须挂在一个可见视图上）
+    UIView *previewBox = [[UIView alloc] initWithFrame:CGRectMake(W - 166, 8, 152, 86)];
+    previewBox.backgroundColor = [UIColor blackColor];
+    previewBox.clipsToBounds = YES;
+    previewBox.layer.cornerRadius = 6;
+    previewBox.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+    [panel addSubview:previewBox];
+    [[FloatPanelController shared] attachPreviewTo:previewBox];
+
+    self.progressView = [[UITextView alloc] initWithFrame:CGRectMake(10, 100, W - 20, panelH - 106)];
     self.progressView.editable = NO;
     self.progressView.selectable = NO;
     self.progressView.backgroundColor = [UIColor clearColor];
@@ -432,6 +443,70 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
     SavedViewController *vc = [[SavedViewController alloc] init];
     vc.pid = [self ensurePid];
     [self.navigationController pushViewController:vc animated:YES];
+}
+
+#pragma mark - 画中画悬浮窗
+
+- (void)onFloat {
+    FloatPanelController *fp = [FloatPanelController shared];
+    if (fp.isRunning) {
+        [fp stop];
+        self.statusLabel.text = @"悬浮窗已停止";
+        [self appendProgressLine:@"悬浮窗已停止"];
+        return;
+    }
+    if (memread_valscan_count() == 0) {
+        self.statusLabel.text = @"先做一次首扫，悬浮窗才有候选可收敛";
+        return;
+    }
+    pid_t pid = [self ensurePid];
+    if (pid <= 0) return;
+
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"自动收敛条件"
+        message:@"每轮先探测是否变化，没变化就不动候选"
+        preferredStyle:UIAlertControllerStyleAlert];
+    __weak typeof(self) ws = self;
+    void (^addCond)(NSString *, int) = ^(NSString *title, int cond) {
+        [a addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *x) {
+            [ws askFloatInterval:cond];
+        }]];
+    };
+    addCond(@"变小了", MEMREAD_VALCOND_DECREASED);
+    addCond(@"变大了", MEMREAD_VALCOND_INCREASED);
+    addCond(@"变了", MEMREAD_VALCOND_CHANGED);
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)askFloatInterval:(int)cond {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"收敛间隔"
+                                                               message:nil
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    __weak typeof(self) ws = self;
+    NSArray<NSString *> *names = @[@"1 秒", @"1.5 秒", @"2 秒", @"3 秒"];
+    NSArray<NSNumber *> *vals = @[@1.0, @1.5, @2.0, @3.0];
+    for (NSUInteger i = 0; i < names.count; i++) {
+        [a addAction:[UIAlertAction actionWithTitle:names[i] style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *x) {
+            [ws startFloatCond:cond interval:[vals[i] doubleValue]];
+        }]];
+    }
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)startFloatCond:(int)cond interval:(double)iv {
+    pid_t pid = [self ensurePid];
+    if (pid <= 0) return;
+    BOOL ok = [[FloatPanelController shared] startWithPid:pid type:[self type] cond:cond interval:iv];
+    if (ok) {
+        self.statusLabel.text = @"悬浮窗已开启，直接切到游戏";
+        [self appendProgressLine:[NSString stringWithFormat:@"画中画悬浮窗已开启  每 %.1f 秒自动收敛一次", iv]];
+    } else {
+        self.statusLabel.text = @"悬浮窗启动失败：设备不支持画中画或预览层未就绪";
+        [self appendProgressLine:@"画中画启动失败"];
+    }
 }
 
 - (void)onReset {

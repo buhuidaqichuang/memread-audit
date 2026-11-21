@@ -92,6 +92,11 @@ int memread_valscan_refine(pid_t pid, int type, int cond, double target,
                            memread_region_cb cb, void *ctx,
                            unsigned long long *phits, volatile int *cancel);
 
+// 自动收敛：先探测是否有候选变化，无变化则原样保留（后台定时收敛用，避免空跑把候选清空）
+// pchanged 回填本次是否检测到变化；pleft 回填剩余候选数
+int memread_valscan_autorefine(pid_t pid, int type, int cond, double target,
+                               unsigned long long *pleft, int *pchanged);
+
 // 读某个候选的当前值（结果列表点按查看）；返回 0 成功
 int memread_valscan_peek(pid_t pid, int type, unsigned long long index,
                          uint64_t *out_addr, double *out_value);

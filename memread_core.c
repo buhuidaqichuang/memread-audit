@@ -1114,11 +1114,14 @@ int memread_valscan_first(pid_t pid, int rw_only, int type, double value, double
     }
 
     g_valents = (memread_valent_t *)calloc(MEMREAD_VALSCAN_MAX, sizeof(memread_valent_t));
-    if (!g_valents) return -4;
+    if (!g_valents) {
+        mach_port_deallocate(mach_task_self(), task);
+        return -4;
+    }
 
     const mach_vm_size_t CHUNK = 4ULL * 1024 * 1024;
     unsigned char *buf = (unsigned char *)malloc((size_t)CHUNK + 8);
-    if (!buf) { memread_valscan_reset(); return -4; }
+    if (!buf) { memread_valscan_reset(); mach_port_deallocate(mach_task_self(), task); return -4; }
 
     unsigned long long count = 0;
     unsigned long long bytes = 0;
@@ -1197,6 +1200,7 @@ int memread_valscan_first(pid_t pid, int rw_only, int type, double value, double
 
     g_valcount = count;
     free(buf);
+    mach_port_deallocate(mach_task_self(), task);
     fprintf(stderr, "数值首扫完成: 扫描 %llu 字节, 候选 %llu, %d 个区域\n",
             bytes, count, regions);
     if (phits) *phits = count;
@@ -1260,8 +1264,42 @@ int memread_valscan_refine(pid_t pid, int type, int cond, double target,
 
     g_valcount = kept;
     fprintf(stderr, "数值收敛完成: %llu -> %llu\n", n, kept);
+    mach_port_deallocate(mach_task_self(), task);
     if (phits) *phits = kept;
     return 0;
+}
+
+// 自动收敛：定时器每轮先看有没有候选真的变了；没变就原样返回，避免空跑把候选全筛掉
+int memread_valscan_autorefine(pid_t pid, int type, int cond, double target,
+                               unsigned long long *pleft, int *pchanged) {
+    if (pleft) *pleft = g_valcount;
+    if (pchanged) *pchanged = 0;
+    if (type < MEMREAD_VALTYPE_INT32 || type > MEMREAD_VALTYPE_DOUBLE) return -2;
+    if (!g_valents || g_valcount == 0) return 0;
+
+    task_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS) return -1;
+
+    int changed = 0;
+    unsigned long long n = g_valcount;
+    // 候选特别多时抽样探测（每轮只读约 4096 条），避免每秒扫几百万地址
+    unsigned long long step = (n > 4096) ? (n / 4096) : 1;
+    for (unsigned long long i = 0; i < n; i += step) {
+        uint64_t raw = 0;
+        if (val_read_raw(task, g_valents[i].addr, type, &raw) != 0) continue;
+        double cur = memread_valscan_raw2double(raw, type);
+        double prev = memread_valscan_raw2double(g_valents[i].prev, type);
+        if (!val_eq(cur, prev, type)) { changed = 1; break; }
+    }
+    mach_port_deallocate(mach_task_self(), task);
+
+    if (pchanged) *pchanged = changed;
+    if (!changed) {
+        if (pleft) *pleft = n;
+        return 0;
+    }
+    return memread_valscan_refine(pid, type, cond, target, NULL, NULL, pleft, NULL);
 }
 
 int memread_valscan_peek(pid_t pid, int type, unsigned long long index,
@@ -1271,7 +1309,9 @@ int memread_valscan_peek(pid_t pid, int type, unsigned long long index,
     kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
     if (kr != KERN_SUCCESS) return -2;
     uint64_t raw = 0;
-    if (val_read_raw(task, g_valents[index].addr, type, &raw) != 0) return -3;
+    int rc = val_read_raw(task, g_valents[index].addr, type, &raw);
+    mach_port_deallocate(mach_task_self(), task);
+    if (rc != 0) return -3;
     if (out_addr) *out_addr = g_valents[index].addr;
     if (out_value) *out_value = memread_valscan_raw2double(raw, type);
     return 0;
