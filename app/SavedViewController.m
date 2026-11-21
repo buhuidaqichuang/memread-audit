@@ -19,6 +19,9 @@ static uint64_t SaveParseAddr(NSString *s) {
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *resolved; // 扁平下标 → 本轮实际地址
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *resolveNotes; // 解析失败原因
 @property (nonatomic, assign) NSUInteger generation;
+@property (nonatomic, strong) UIBarButtonItem *selectItem;
+@property (nonatomic, strong) UIBarButtonItem *deleteItem;
+@property (nonatomic, strong) UIToolbar *editBar;
 @end
 
 @implementation SavedViewController
@@ -45,7 +48,12 @@ static uint64_t SaveParseAddr(NSString *s) {
                                                                style:UIBarButtonItemStylePlain
                                                               target:self
                                                               action:@selector(refreshValues)];
-    self.navigationItem.rightBarButtonItems = @[add, refresh];
+    self.selectItem = [[UIBarButtonItem alloc] initWithTitle:@"选择"
+                                                       style:UIBarButtonItemStylePlain
+                                                      target:self
+                                                      action:@selector(toggleEditing)];
+    self.navigationItem.rightBarButtonItems = @[add, refresh, self.selectItem];
+    self.table.allowsMultipleSelectionDuringEditing = YES;
 
     UILabel *footer = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 46)];
     footer.text = @"存于 /var/mobile/Media/memread_saved.json";
@@ -57,6 +65,88 @@ static uint64_t SaveParseAddr(NSString *s) {
     self.table.tableFooterView = footer;
 
     [self reloadAll];
+}
+
+#pragma mark - 批量删除
+
+- (void)toggleEditing {
+    BOOL on = !self.table.isEditing;
+    [self.table setEditing:on animated:YES];
+    self.selectItem.title = on ? @"完成" : @"选择";
+    if (on) {
+        if (!self.editBar) {
+            UIToolbar *bar = [[UIToolbar alloc] initWithFrame:CGRectMake(0, self.view.bounds.size.height - 44,
+                                                                        self.view.bounds.size.width, 44)];
+            bar.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
+            UIBarButtonItem *all = [[UIBarButtonItem alloc] initWithTitle:@"全选"
+                                                                    style:UIBarButtonItemStylePlain
+                                                                   target:self
+                                                                   action:@selector(selectAllRows)];
+            UIBarButtonItem *flex = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace
+                                                                                  target:nil action:nil];
+            self.deleteItem = [[UIBarButtonItem alloc] initWithTitle:@"删除选中"
+                                                               style:UIBarButtonItemStylePlain
+                                                              target:self
+                                                              action:@selector(deleteSelected)];
+            self.deleteItem.tintColor = [UIColor systemRedColor];
+            bar.items = @[all, flex, self.deleteItem];
+            self.editBar = bar;
+        }
+        self.editBar.frame = CGRectMake(0, self.view.bounds.size.height - 44, self.view.bounds.size.width, 44);
+        [self.view addSubview:self.editBar];
+        self.table.contentInset = UIEdgeInsetsMake(0, 0, 44, 0);
+    } else {
+        [self.editBar removeFromSuperview];
+        self.table.contentInset = UIEdgeInsetsZero;
+        for (NSIndexPath *ip in self.table.indexPathsForSelectedRows) {
+            [self.table deselectRowAtIndexPath:ip animated:NO];
+        }
+    }
+    [self.table reloadData];
+    [self updateDeleteItem];
+}
+
+- (void)selectAllRows {
+    for (NSInteger s = 0; s < (NSInteger)self.sections.count; s++) {
+        NSArray<NSNumber *> *rows = self.sections[(NSUInteger)s];
+        for (NSInteger r = 0; r < (NSInteger)rows.count; r++) {
+            [self.table selectRowAtIndexPath:[NSIndexPath indexPathForRow:r inSection:s]
+                                     animated:NO scrollPosition:UITableViewScrollPositionNone];
+        }
+    }
+    [self updateDeleteItem];
+}
+
+- (void)updateDeleteItem {
+    NSUInteger n = self.table.indexPathsForSelectedRows.count;
+    self.deleteItem.enabled = (n > 0);
+    self.deleteItem.title = n ? [NSString stringWithFormat:@"删除 %lu 条", (unsigned long)n] : @"删除选中";
+}
+
+- (void)deleteSelected {
+    NSArray<NSIndexPath *> *ips = self.table.indexPathsForSelectedRows;
+    if (!ips.count) return;
+    NSMutableIndexSet *set = [NSMutableIndexSet indexSet];
+    for (NSIndexPath *ip in ips) {
+        NSUInteger flat = [self flatAtIndexPath:ip];
+        if (flat != NSNotFound) [set addIndex:flat];
+    }
+    if (!set.count) return;
+
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:[NSString stringWithFormat:@"删除 %lu 条？", (unsigned long)set.count]
+                         message:@"分组里其它条目不受影响，删掉后不可恢复"
+                  preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) ws = self;
+    [a addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive
+                                        handler:^(UIAlertAction *x) {
+        [[SavedAddressStore shared] removeIndexes:set];
+        [ws reloadAll];
+        [ws toggleEditing];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    a.popoverPresentationController.barButtonItem = self.selectItem;
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
@@ -296,6 +386,7 @@ static pid_t SavedFindPidForPath(NSString *path) {
     b.frame = CGRectMake(0, 0, 44, 32);
     b.tag = (NSInteger)flat;
     [b addTarget:self action:@selector(readRowTapped:) forControlEvents:UIControlEventTouchUpInside];
+    b.hidden = self.table.isEditing;
     c.accessoryView = b;
     return c;
 }
@@ -333,6 +424,7 @@ static pid_t SavedFindPidForPath(NSString *path) {
 }
 
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    if (self.table.isEditing) { [self updateDeleteItem]; return; }
     [tv deselectRowAtIndexPath:ip animated:YES];
     NSUInteger flat = [self flatAtIndexPath:ip];
     if (flat == NSNotFound || flat >= self.items.count) return;
@@ -372,6 +464,10 @@ static pid_t SavedFindPidForPath(NSString *path) {
                                         handler:^(UIAlertAction *x) { [ws confirmDeleteAt:flat]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)tableView:(UITableView *)tv didDeselectRowAtIndexPath:(NSIndexPath *)ip {
+    if (self.table.isEditing) [self updateDeleteItem];
 }
 
 #pragma mark - 编辑

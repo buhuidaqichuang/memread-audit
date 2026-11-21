@@ -215,6 +215,17 @@ static uint64_t MemParseAddr(NSString *s) {
     return [self persist];
 }
 
+- (BOOL)removeIndexes:(NSIndexSet *)indexes {
+    if (!indexes.count || !_items.count) return NO;
+    NSMutableIndexSet *valid = [NSMutableIndexSet indexSet];
+    [indexes enumerateIndexesUsingBlock:^(NSUInteger i, BOOL *stop) {
+        if (i < _items.count) [valid addIndex:i];
+    }];
+    if (!valid.count) return NO;
+    [_items removeObjectsAtIndexes:valid];
+    return [self persist];
+}
+
 - (BOOL)renameAtIndex:(NSUInteger)idx label:(NSString *)label {
     if (idx >= _items.count) return NO;
     NSString *lb = [label stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];

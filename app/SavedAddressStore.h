@@ -49,6 +49,7 @@
             offs:(NSArray<NSNumber *> *)offs type:(int)type label:(NSString *)label
            group:(NSString *)group note:(NSString *)note procPath:(NSString *)procPath;
 - (BOOL)removeAtIndex:(NSUInteger)idx;
+- (BOOL)removeIndexes:(NSIndexSet *)indexes;   // 批量删除，一次落盘
 - (BOOL)renameAtIndex:(NSUInteger)idx label:(NSString *)label;
 - (BOOL)setGroupAtIndex:(NSUInteger)idx group:(NSString *)group;
 - (NSArray<NSString *> *)groupNames;
