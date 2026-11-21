@@ -69,8 +69,10 @@ jobs:
           file build/Payload/memread.app/memread
           cp app/Info.plist build/Payload/memread.app/Info.plist
           cp ent.plist build/ent.plist
-          # 生成各尺寸图标（源图 1024），作为 CFBundleIconFiles 的兜底
-          for spec in "AppIcon60x60@2x.png 120" "AppIcon60x60@3x.png 180" "AppIcon76x76@2x~ipad.png 152" "AppIcon83.5x83.5@2x~ipad.png 167" "AppIcon1024.png 1024"; do
+          # 生成各尺寸图标（源图 1024），同时给一套越狱 App 认的传统 Icon*.png
+          for spec in "AppIcon60x60@2x.png 120" "AppIcon60x60@3x.png 180" "AppIcon76x76@2x~ipad.png 152" "AppIcon83.5x83.5@2x~ipad.png 167" "AppIcon1024.png 1024" \
+                      "Icon.png 57" "Icon@2x.png 114" "Icon-72.png 72" "Icon-72@2x.png 144" \
+                      "Icon-76.png 76" "Icon-76@2x.png 152" "Icon-60@2x.png 120" "Icon-60@3x.png 180" "Icon-83.5@2x.png 167"; do
             set -- $spec
             sips -z "$2" "$2" app/AppIcon1024.png --out "build/Payload/memread.app/$1" >/dev/null
           done

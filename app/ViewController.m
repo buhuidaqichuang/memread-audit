@@ -155,16 +155,25 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
         self.navigationItem.hidesSearchBarWhenScrolling = NO;
         self.definesPresentationContext = YES;
     } else {
+        // 放进 tableHeaderView：天然位于导航栏下方，不会被遮挡
+        UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 60)];
+        header.backgroundColor = [UIColor clearColor];
+
         self.searchButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        self.searchButton.frame = CGRectMake(12, 8, header.bounds.size.width - 24, 44);
+        self.searchButton.autoresizingMask = UIViewAutoresizingFlexibleWidth;
         self.searchButton.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
-        self.searchButton.contentEdgeInsets = UIEdgeInsetsMake(0, 12, 0, 12);
-        self.searchButton.backgroundColor = [UIColor secondarySystemBackgroundColor];
+        self.searchButton.contentEdgeInsets = UIEdgeInsetsMake(0, 14, 0, 14);
+        self.searchButton.backgroundColor = [UIColor systemBackgroundColor];
         self.searchButton.layer.cornerRadius = 10;
-        self.searchButton.titleLabel.font = [UIFont systemFontOfSize:15];
-        [self.searchButton setTitleColor:[UIColor secondaryLabelColor] forState:UIControlStateNormal];
+        self.searchButton.layer.borderWidth = 1;
+        self.searchButton.layer.borderColor = [UIColor systemGray3Color].CGColor;
+        self.searchButton.titleLabel.font = [UIFont systemFontOfSize:16];
+        [self.searchButton setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];
         [self.searchButton setTitle:@"🔍 搜索名字或 Bundle ID" forState:UIControlStateNormal];
         [self.searchButton addTarget:self action:@selector(onSearchTapped) forControlEvents:UIControlEventTouchUpInside];
-        [self.view addSubview:self.searchButton];
+        [header addSubview:self.searchButton];
+        self.table.tableHeaderView = header;
 
         self.keyboard = [[MemKeyboardView alloc] initWithFrame:CGRectMake(0, 0, 0, 0)];
         __weak typeof(self) weakSelf = self;
@@ -188,8 +197,13 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
     CGFloat top = self.view.safeAreaInsets.top;
 
     if (self.searchButton) {
-        self.searchButton.frame = CGRectMake(12, top + 8, W - 24, 38);
-        self.table.frame = CGRectMake(0, top + 54, W, H - top - 54);
+        UIView *h = self.searchButton.superview;
+        if (h) {
+            h.frame = CGRectMake(0, 0, W, 60);
+            self.searchButton.frame = CGRectMake(12, 8, W - 24, 44);
+            self.table.tableHeaderView = h;   // 重新赋值让表头按新宽度排版
+        }
+        self.table.frame = CGRectMake(0, top, W, H - top);
         CGFloat kbH = 6 * 44 + 8;
         CGRect f = self.keyboard.frame;
         f.size = CGSizeMake(W, kbH);

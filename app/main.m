@@ -92,6 +92,12 @@ static void MemReadEnvSelfCheck(void) {
         MemReadEnvLine(@"file %@=%d", f, e ? 1 : 0);
     }
     MemReadEnvLine(@"CFBundleIconName=%@", [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleIconName"] ?: @"(none)");
+    MemReadEnvLine(@"CFBundleIconFile=%@", [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleIconFile"] ?: @"(none)");
+
+    NSString *exe = [[NSBundle mainBundle] executablePath];
+    NSDictionary *ea = [[NSFileManager defaultManager] attributesOfItemAtPath:exe error:nil];
+    MemReadEnvLine(@"exe_size=%llu exe_mtime=%@",
+                   [ea[NSFileSize] unsignedLongLongValue], ea[NSFileModificationDate]);
 
     MemReadEnvLine(@"========== end");
 }
