@@ -1052,7 +1052,9 @@ int memread_read_scalar(pid_t pid, uint64_t addr, int type, double *out_value) {
     kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
     if (kr != KERN_SUCCESS) return -1;
     uint64_t raw = 0;
-    if (val_read_raw(task, addr, type, &raw) != 0) return -3;
+    int rc = val_read_raw(task, addr, type, &raw);
+    mach_port_deallocate(mach_task_self(), task);   // 逐条刷新会调用很多次，必须还端口
+    if (rc != 0) return -3;
     if (out_value) *out_value = memread_valscan_raw2double(raw, type);
     return 0;
 }
