@@ -2148,6 +2148,8 @@ int memread_coord_lock(pid_t pid, int *ptriplets, unsigned long long *pcands,
 
 #pragma mark - 指针链扫描（模块静态槽 + 多级偏移，跨重启复原堆地址）
 
+#define MEMREAD_CHAIN_NODE_CAP 120000    // 每层最多保留的候选槽
+
 typedef struct {
     uint64_t addr;       // 槽地址
     int32_t off;         // 本跳偏移：槽内容 + off = 上一层要解释的地址
