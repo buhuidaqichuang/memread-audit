@@ -89,6 +89,8 @@ int memread_valscan_first(pid_t pid, int rw_only, int type, double value, double
 
 // 收敛：对现有候选逐个重读当前值，按 cond 过滤（DELTA 用 target 作差值）
 // 返回 0 成功；phits 回填剩余候选数
+// 若本次会把候选筛成 0，则拒绝执行、原样保留候选，返回 MEMREAD_VALSCAN_ZERO
+#define MEMREAD_VALSCAN_ZERO -3
 int memread_valscan_refine(pid_t pid, int type, int cond, double target,
                            memread_region_cb cb, void *ctx,
                            unsigned long long *phits, volatile int *cancel);

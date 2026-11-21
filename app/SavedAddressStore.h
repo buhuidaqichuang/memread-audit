@@ -6,6 +6,7 @@
 @property (nonatomic, assign) uint64_t addr;
 @property (nonatomic, assign) int type;      // MEMREAD_VALTYPE_INT32 / INT64 / FLOAT / DOUBLE
 @property (nonatomic, copy) NSString *label; // 自定义标签
+@property (nonatomic, copy) NSString *group; // 分组（如枪械名），空 = 未分组
 @property (nonatomic, copy) NSString *note;
 @end
 
@@ -18,9 +19,12 @@
 
 - (NSUInteger)count;
 - (NSArray<SavedAddress *> *)allItems;
-- (BOOL)addAddr:(uint64_t)addr type:(int)type label:(NSString *)label note:(NSString *)note;
+- (BOOL)addAddr:(uint64_t)addr type:(int)type label:(NSString *)label
+           group:(NSString *)group note:(NSString *)note;
 - (BOOL)removeAtIndex:(NSUInteger)idx;
 - (BOOL)renameAtIndex:(NSUInteger)idx label:(NSString *)label;
+- (BOOL)setGroupAtIndex:(NSUInteger)idx group:(NSString *)group;
+- (NSArray<NSString *> *)groupNames;
 - (void)reload;
 
 + (NSString *)typeName:(int)type;

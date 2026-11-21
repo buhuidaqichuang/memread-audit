@@ -65,19 +65,24 @@ static uint64_t MemParseAddr(NSString *s) {
         s.label = [lb isKindOfClass:[NSString class]] && lb.length ? lb : @"未命名";
         NSString *nt = d[@"note"];
         s.note = [nt isKindOfClass:[NSString class]] ? nt : @"";
+        NSString *gp = d[@"group"];
+        s.group = [gp isKindOfClass:[NSString class]] ? gp : @"";
         [out addObject:s];
     }
     return out;
 }
 
-- (BOOL)addAddr:(uint64_t)addr type:(int)type label:(NSString *)label note:(NSString *)note {
+- (BOOL)addAddr:(uint64_t)addr type:(int)type label:(NSString *)label
+           group:(NSString *)group note:(NSString *)note {
     if (addr == 0) return NO;
     NSString *lb = [label stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (!lb.length) lb = @"未命名";
+    NSString *gp = [group stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     NSDictionary *d = @{
         @"addr": [NSString stringWithFormat:@"0x%llX", addr],
         @"type": @(type),
         @"label": lb,
+        @"group": gp.length ? gp : @"",
         @"note": note.length ? note : @"",
         @"ts": [NSString stringWithFormat:@"%.0f", [NSDate date].timeIntervalSince1970]
     };
@@ -99,6 +104,23 @@ static uint64_t MemParseAddr(NSString *s) {
     m[@"label"] = lb;
     _items[idx] = m;
     return [self persist];
+}
+
+- (BOOL)setGroupAtIndex:(NSUInteger)idx group:(NSString *)group {
+    if (idx >= _items.count) return NO;
+    NSString *gp = [group stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSMutableDictionary *m = [_items[idx] mutableCopy];
+    m[@"group"] = gp.length ? gp : @"";
+    _items[idx] = m;
+    return [self persist];
+}
+
+- (NSArray<NSString *> *)groupNames {
+    NSMutableArray<NSString *> *a = [NSMutableArray array];
+    for (SavedAddress *s in [self allItems]) {
+        if (s.group.length && ![a containsObject:s.group]) [a addObject:s.group];
+    }
+    return a;
 }
 
 + (NSString *)typeName:(int)type {

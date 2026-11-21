@@ -245,9 +245,17 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
 - (void)onPiPSync:(NSNotification *)n {
     unsigned long long before = [n.userInfo[@"before"] unsignedLongLongValue];
     unsigned long long after = [n.userInfo[@"after"] unsignedLongLongValue];
-    self.statusLabel.text = [NSString stringWithFormat:@"悬浮窗自动收敛：%llu → %llu", before, after];
+    BOOL zero = [n.userInfo[@"zero"] boolValue];
+    if (zero) {
+        self.statusLabel.text = [NSString stringWithFormat:
+            @"悬浮窗收敛会变成 0，已拒绝并停止，保留 %llu 条", after];
+        [self appendProgressLine:[NSString stringWithFormat:
+            @"悬浮窗收敛被拒 会变成 0，保留 %llu 条", after]];
+    } else {
+        self.statusLabel.text = [NSString stringWithFormat:@"悬浮窗收敛：%llu → %llu", before, after];
+        [self appendProgressLine:[NSString stringWithFormat:@"悬浮窗收敛  %llu → %llu", before, after]];
+    }
     [self refreshCount];
-    [self appendProgressLine:[NSString stringWithFormat:@"悬浮窗收敛  %llu → %llu", before, after]];
 }
 
 - (void)refreshCount {
@@ -461,9 +469,16 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
 
         dispatch_async(dispatch_get_main_queue(), ^{
             [self2.spinner stopAnimating];
-            self2.statusLabel.text = [NSString stringWithFormat:@"收敛完成 rc=%d 剩余=%llu", rc, left];
-            [self2 appendProgressLine:[NSString stringWithFormat:
-                @"收敛结束  rc=%d  %llu → %llu  用时 %.1f s", rc, before, left, cost]];
+            if (rc == MEMREAD_VALSCAN_ZERO) {
+                self2.statusLabel.text = [NSString stringWithFormat:
+                    @"本轮会变成 0，已拒绝，保留 %llu 条", left];
+                [self2 appendProgressLine:[NSString stringWithFormat:
+                    @"收敛被拒 结果会是 0，候选原样保留 %llu 条  用时 %.1f s", left, cost]];
+            } else {
+                self2.statusLabel.text = [NSString stringWithFormat:@"收敛完成 rc=%d 剩余=%llu", rc, left];
+                [self2 appendProgressLine:[NSString stringWithFormat:
+                    @"收敛结束  rc=%d  %llu → %llu  用时 %.1f s", rc, before, left, cost]];
+            }
             [self2 refreshCount];
         });
     });

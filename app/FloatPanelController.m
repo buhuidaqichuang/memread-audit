@@ -137,6 +137,7 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
 @property (nonatomic, assign) BOOL watchSaved;   // YES：监控已保存地址；NO：收敛候选
 @property (nonatomic, assign) BOOL autoRefine;   // NO：只显示，不自动收敛
 @property (nonatomic, assign) BOOL refineOnPause; // YES：点 PiP 暂停键时收敛一次
+@property (nonatomic, assign) BOOL zeroStop;     // YES：上次收敛会变 0，已停止继续收敛
 @property (nonatomic, assign) BOOL retried;
 @property (nonatomic, assign) int frames;
 @property (nonatomic, assign) BOOL kvoAdded;
@@ -313,6 +314,7 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
     self.retried = NO;
     self.frames = 0;
     self.ticks = 0;
+    self.zeroStop = NO;
 
     [self startAudio];
 
@@ -440,12 +442,23 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
 // 点 PiP 暂停键 = 按当前条件收敛一次（不用切 App，也不会按秒乱筛）
 - (void)refineOnce {
     if (self.watchSaved) return;
+    if (self.zeroStop) {
+        [self logMsg:@"收敛已停止（上次会变成 0），本次跳过"];
+        return;
+    }
     pid_t pid = self.pid;
     int type = self.vtype, cond = self.cond;
     unsigned long long before = memread_valscan_count();
     unsigned long long left = before;
     int rc = memread_valscan_refine(pid, type, cond, 0, NULL, NULL, &left, NULL);
     [self logMsg:@"暂停键收敛  %llu → %llu rc=%d", before, left, rc];
+
+    if (rc == MEMREAD_VALSCAN_ZERO) {
+        // 下次收敛会变成 0：禁止执行，并停止后续收敛，候选原样保留
+        self.zeroStop = YES;
+        self.refineOnPause = NO;
+        [self logMsg:@"收敛结果会是 0，已拒绝并停止收敛，保留 %llu 条", left];
+    }
 
     NSMutableArray *rows = [NSMutableArray array];
     unsigned long long n = memread_valscan_count();
@@ -461,12 +474,14 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
         [rows addObject:@{@"addr": @(addr), @"v": v}];
     }
     unsigned long long after = left;
+    BOOL applied = (rc != MEMREAD_VALSCAN_ZERO);
     dispatch_async(dispatch_get_main_queue(), ^{
-        [self renderLeft:after changed:1 rows:rows];
+        [self renderLeft:after changed:(applied ? 1 : 0) rows:rows];
         [[NSNotificationCenter defaultCenter] postNotificationName:@"MemReadPiPSync"
                                                             object:nil
                                                           userInfo:@{@"before": @(before),
-                                                                     @"after": @(after)}];
+                                                                     @"after": @(after),
+                                                                     @"zero": @(self.zeroStop)}];
     });
 }
 
@@ -477,7 +492,9 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
         double v = 0;
         int rc = memread_read_scalar(pid, it.addr, it.type, &v);
         NSString *val = (rc == 0) ? [SavedAddressStore formatValue:v type:it.type] : @"?";
-        [rows addObject:@{@"label": (it.label.length ? it.label : @"(未命名)"), @"v": val}];
+        NSString *name = (it.label.length ? it.label : @"(未命名)");
+        if (it.group.length) name = [NSString stringWithFormat:@"%@·%@", it.group, name];
+        [rows addObject:@{@"label": name, @"v": val}];
     }
     return rows;
 }
@@ -577,7 +594,9 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
         }
 
         NSString *foot;
-        if (self.refineOnPause) {
+        if (self.zeroStop) {
+            foot = [NSString stringWithFormat:@"上次收敛会变成 0，已停止收敛，保留 %llu 条", left];
+        } else if (self.refineOnPause) {
             foot = @"开火后点 PiP 暂停键 = 收敛一次";
         } else if (!self.autoRefine) {
             foot = @"不自动收敛，回 App 手动点收敛";
@@ -682,7 +701,7 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
 
 - (void)pictureInPictureController:(AVPictureInPictureController *)c setPlaying:(BOOL)playing {
     self.paused = !playing;
-    if (!playing && self.refineOnPause && !self.watchSaved) {
+    if (!playing && self.refineOnPause && !self.watchSaved && !self.zeroStop) {
         dispatch_async(_q, ^{ [self refineOnce]; });
     }
 }

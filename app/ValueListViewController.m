@@ -5,6 +5,7 @@
 @interface ValueListViewController () <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, strong) UITableView *table;
 @property (nonatomic, strong) NSArray *rows;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *latest;
 @end
 
 @implementation ValueListViewController
@@ -47,6 +48,8 @@
         [a addObject:@(i)];
     }
     self.rows = a;
+    if (!self.latest) self.latest = [NSMutableDictionary dictionary];
+    [self.latest removeAllObjects];
     [self.table reloadData];
 
     // 用可换行表头，避免 navigationItem.prompt 被系统截断成省略号
@@ -96,14 +99,69 @@
         c.textLabel.text = [NSString stringWithFormat:@"0x%llX  %@", addr, [SavedAddressStore typeName:vt]];
         c.textLabel.font = [UIFont fontWithName:@"Menlo" size:13]
             ?: [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
-        c.detailTextLabel.text = [NSString stringWithFormat:@"上一轮值: %@", [self fmtRaw:prev type:vt]];
+        NSString *now = self.latest[@(idx)];
+        if (now.length) {
+            c.detailTextLabel.text = [NSString stringWithFormat:@"最新: %@   上一轮: %@", now, [self fmtRaw:prev type:vt]];
+        } else {
+            c.detailTextLabel.text = [NSString stringWithFormat:@"上一轮值: %@", [self fmtRaw:prev type:vt]];
+        }
         c.detailTextLabel.font = [UIFont systemFontOfSize:12];
         c.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+        [b setTitle:@"读" forState:UIControlStateNormal];
+        b.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+        b.frame = CGRectMake(0, 0, 44, 32);
+        b.tag = (NSInteger)idx;
+        [b addTarget:self action:@selector(readRowTapped:) forControlEvents:UIControlEventTouchUpInside];
+        c.accessoryView = b;
+        c.accessoryView.tag = (NSInteger)ip.row;
     } else {
         c.textLabel.text = @"—";
         c.detailTextLabel.text = @"—";
+        c.accessoryView = nil;
     }
     return c;
+}
+
+// 「读」按钮：立刻读这条地址的最新值，直接更新到该行
+- (void)readRowTapped:(UIButton *)sender {
+    unsigned long long idx = (unsigned long long)sender.tag;
+    if (idx >= memread_valscan_count()) return;
+    pid_t pid = self.pid;
+    int vt = self.type;
+    uint64_t a0 = 0, p0 = 0;
+    if (memread_valscan_get_ex(idx, &a0, &p0, &vt) != 0) return;
+
+    sender.enabled = NO;
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        uint64_t addr = 0;
+        double cur = 0;
+        int rc = memread_valscan_peek(pid, vt, idx, &addr, &cur);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) self2 = ws;
+            if (!self2) return;
+            sender.enabled = YES;
+            if (rc == 0) {
+                self2.latest[@(idx)] = [NSString stringWithFormat:@"%@ (%@)",
+                                        [self2 fmtDouble:cur type:vt], [SavedAddressStore typeName:vt]];
+                // 找到该候选当前所在的行再刷新
+                NSUInteger row = [self2.rows indexOfObject:@(idx)];
+                if (row != NSNotFound) {
+                    [self2.table reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:(NSInteger)row inSection:0]]
+                                        withRowAnimation:UITableViewRowAnimationNone];
+                }
+            } else {
+                self2.latest[@(idx)] = [NSString stringWithFormat:@"读取失败 rc=%d", rc];
+                NSUInteger row = [self2.rows indexOfObject:@(idx)];
+                if (row != NSNotFound) {
+                    [self2.table reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:(NSInteger)row inSection:0]]
+                                        withRowAnimation:UITableViewRowAnimationNone];
+                }
+            }
+        });
+    });
 }
 
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
@@ -148,20 +206,31 @@
 - (void)promptSaveAddr:(uint64_t)addr type:(int)vt {
     NSString *typeName = [SavedAddressStore typeName:vt];
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"保存为标签"
-                                                               message:[NSString stringWithFormat:@"0x%llX · %@", addr, typeName]
+                                                               message:[NSString stringWithFormat:@"0x%llX · %@\n分组填枪械名，同一地址在不同枪下可各存一条", addr, typeName]
                                                         preferredStyle:UIAlertControllerStyleAlert];
     [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
         tf.placeholder = @"标签名，如 当前弹匣 / 玩家HP";
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    NSArray<NSString *> *groups = [[SavedAddressStore shared] groupNames];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = groups.count
+            ? [NSString stringWithFormat:@"分组（已有：%@）", [groups componentsJoinedByString:@"/"]]
+            : @"分组，如 M4 / AK（可留空）";
         tf.clearButtonMode = UITextFieldViewModeWhileEditing;
     }];
     [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     __weak typeof(self) ws = self;
     [a addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
                                         handler:^(UIAlertAction *x) {
-        NSString *label = a.textFields.firstObject.text;
-        [[SavedAddressStore shared] addAddr:addr type:vt label:label note:@""];
+        NSString *label = a.textFields[0].text;
+        NSString *group = a.textFields[1].text;
+        [[SavedAddressStore shared] addAddr:addr type:vt label:label group:group note:@""];
         UIAlertController *ok = [UIAlertController alertControllerWithTitle:@"已保存"
-                                                                   message:[NSString stringWithFormat:@"%@ → %@", label.length ? label : @"未命名", [SavedAddressStore typeName:vt]]
+                                                                   message:[NSString stringWithFormat:@"%@%@ → %@",
+                                                                            group.length ? [NSString stringWithFormat:@"[%@] ", group] : @"",
+                                                                            label.length ? label : @"未命名",
+                                                                            [SavedAddressStore typeName:vt]]
                                                             preferredStyle:UIAlertControllerStyleAlert];
         [ok addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
         [ws presentViewController:ok animated:YES completion:nil];

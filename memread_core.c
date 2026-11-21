@@ -1327,6 +1327,15 @@ int memread_valscan_refine(pid_t pid, int type, int cond, double target,
         }
     }
 
+    // 一条都没留下：拒绝清零（kept==0 时数组没被写过，直接恢复计数即可）
+    if (kept == 0 && n > 0) {
+        g_valcount = n;
+        fprintf(stderr, "收敛结果会是 0，已拒绝并保留 %llu 条\n", n);
+        mach_port_deallocate(mach_task_self(), task);
+        if (phits) *phits = n;
+        return MEMREAD_VALSCAN_ZERO;
+    }
+
     g_valcount = kept;
     fprintf(stderr, "数值收敛完成: %llu -> %llu\n", n, kept);
     mach_port_deallocate(mach_task_self(), task);
@@ -1381,23 +1390,16 @@ int memread_valscan_autorefine(pid_t pid, int type, int cond, double target,
         return 0;
     }
 
-    // 候选不多时先备份：万一这轮谁都不符合方向，保留原候选，不要清零
-    memread_valent_t *backup = NULL;
-    if (n <= 50000) {
-        backup = (memread_valent_t *)malloc(n * sizeof(memread_valent_t));
-        if (backup) memcpy(backup, g_valents, n * sizeof(memread_valent_t));
-    }
-
+    // refine 内部已保证「不把候选清零」，这里不需要再备份
     unsigned long long left = 0;
     int rc = memread_valscan_refine(pid, type, cond, target, NULL, NULL, &left, NULL);
-    if (rc == 0 && backup && left == 0) {
-        memcpy(g_valents, backup, n * sizeof(memread_valent_t));
-        g_valcount = n;
+    if (rc == MEMREAD_VALSCAN_ZERO) {
         left = n;
         if (pchanged) *pchanged = 0;
-        fprintf(stderr, "自动收敛无符合项，保留原候选 %llu\n", n);
+        fprintf(stderr, "自动收敛结果会是 0，已拒绝并保留 %llu 条\n", n);
+        if (pleft) *pleft = left;
+        return 0;
     }
-    if (backup) free(backup);
     if (pleft) *pleft = left;
     return rc;
 }

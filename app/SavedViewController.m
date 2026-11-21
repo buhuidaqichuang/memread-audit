@@ -13,6 +13,8 @@ static uint64_t SaveParseAddr(NSString *s) {
 @property (nonatomic, strong) UITableView *table;
 @property (nonatomic, strong) NSArray<SavedAddress *> *items;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *values;
+@property (nonatomic, strong) NSArray<NSArray<NSNumber *> *> *sections; // 每组：扁平的 item 下标
+@property (nonatomic, strong) NSArray<NSString *> *sectionNames;
 @property (nonatomic, assign) NSUInteger generation;
 @end
 
@@ -62,6 +64,7 @@ static uint64_t SaveParseAddr(NSString *s) {
 - (void)reloadAll {
     [[SavedAddressStore shared] reload];
     self.items = [[SavedAddressStore shared] allItems];
+    [self buildSections];
     if (!self.items.count) {
         UILabel *empty = [[UILabel alloc] init];
         empty.text = @"还没有保存的地址\n\n在「候选列表」点一行 → 保存为标签\n也可以点右上角 + 手动添加";
@@ -108,20 +111,77 @@ static uint64_t SaveParseAddr(NSString *s) {
     });
 }
 
+#pragma mark - 分组
+
+// 按分组切 section；没有分组的归到「未分组」并排在最后
+- (void)buildSections {
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    for (SavedAddress *s in self.items) {
+        if (s.group.length && ![names containsObject:s.group]) [names addObject:s.group];
+    }
+    BOOL hasUngrouped = NO;
+    for (SavedAddress *s in self.items) {
+        if (!s.group.length) { hasUngrouped = YES; break; }
+    }
+    if (hasUngrouped) [names addObject:@"未分组"];
+
+    NSMutableArray<NSArray<NSNumber *> *> *secs = [NSMutableArray array];
+    for (NSString *g in names) {
+        NSMutableArray<NSNumber *> *rows = [NSMutableArray array];
+        for (NSUInteger i = 0; i < self.items.count; i++) {
+            SavedAddress *s = self.items[i];
+            NSString *gi = s.group.length ? s.group : @"未分组";
+            if ([gi isEqualToString:g]) [rows addObject:@(i)];
+        }
+        [secs addObject:rows];
+    }
+    self.sectionNames = names;
+    self.sections = secs;
+}
+
+- (NSUInteger)flatAtIndexPath:(NSIndexPath *)ip {
+    if (ip.section >= (NSInteger)self.sections.count) return NSNotFound;
+    NSArray<NSNumber *> *rows = self.sections[ip.section];
+    if (ip.row >= (NSInteger)rows.count) return NSNotFound;
+    return [rows[ip.row] unsignedIntegerValue];
+}
+
+- (NSIndexPath *)indexPathForFlat:(NSUInteger)flat {
+    for (NSUInteger s = 0; s < self.sections.count; s++) {
+        NSUInteger r = [self.sections[s] indexOfObject:@(flat)];
+        if (r != NSNotFound) return [NSIndexPath indexPathForRow:(NSInteger)r inSection:(NSInteger)s];
+    }
+    return nil;
+}
+
 #pragma mark - UITableView
 
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv {
+    return (NSInteger)self.sections.count;
+}
+
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
+    if (!self.sectionNames.count) return nil;
+    NSArray<NSNumber *> *rows = self.sections[s];
+    NSString *name = self.sectionNames[s];
+    return [NSString stringWithFormat:@"%@  ·  %lu 条", name, (unsigned long)rows.count];
+}
+
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-    return (NSInteger)self.items.count;
+    if (s >= (NSInteger)self.sections.count) return 0;
+    return (NSInteger)self.sections[s].count;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
     UITableViewCell *c = [tv dequeueReusableCellWithIdentifier:@"saved"];
     if (!c) c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"saved"];
-    SavedAddress *s = self.items[ip.row];
+    NSUInteger flat = [self flatAtIndexPath:ip];
+    if (flat == NSNotFound || flat >= self.items.count) return c;
+    SavedAddress *s = self.items[flat];
     c.textLabel.text = s.label;
     c.textLabel.font = [UIFont boldSystemFontOfSize:15];
 
-    NSString *val = self.values[@(ip.row)];
+    NSString *val = self.values[@(flat)];
     if (!val) val = (self.pid > 0) ? @"读取中" : @"未绑定进程";
     c.detailTextLabel.text = [NSString stringWithFormat:@"0x%llX  %@\n= %@",
                               s.addr, [SavedAddressStore typeName:s.type], val];
@@ -129,29 +189,66 @@ static uint64_t SaveParseAddr(NSString *s) {
     c.detailTextLabel.lineBreakMode = NSLineBreakByWordWrapping;
     c.detailTextLabel.font = [UIFont systemFontOfSize:12];
     c.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    [b setTitle:@"读" forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    b.frame = CGRectMake(0, 0, 44, 32);
+    b.tag = (NSInteger)flat;
+    [b addTarget:self action:@selector(readRowTapped:) forControlEvents:UIControlEventTouchUpInside];
+    c.accessoryView = b;
     return c;
+}
+
+// 「读」按钮：立刻读这条地址的最新值并刷新本行
+- (void)readRowTapped:(UIButton *)sender {
+    NSUInteger flat = (NSUInteger)sender.tag;
+    if (flat >= self.items.count) return;
+    SavedAddress *s = self.items[flat];
+    pid_t pid = self.pid;
+    sender.enabled = NO;
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        double v = 0;
+        int rc = memread_read_scalar(pid, s.addr, s.type, &v);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) self2 = ws;
+            if (!self2) return;
+            sender.enabled = YES;
+            self2.values[@(flat)] = (rc == 0)
+                ? [SavedAddressStore formatValue:v type:s.type]
+                : [NSString stringWithFormat:@"不可读 rc=%d", rc];
+            NSIndexPath *ip = [self2 indexPathForFlat:flat];
+            if (ip) [self2.table reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
+        });
+    });
 }
 
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [tv deselectRowAtIndexPath:ip animated:YES];
-    SavedAddress *s = self.items[ip.row];
+    NSUInteger flat = [self flatAtIndexPath:ip];
+    if (flat == NSNotFound || flat >= self.items.count) return;
+    SavedAddress *s = self.items[flat];
 
-    NSString *val = self.values[@(ip.row)] ?: @"—";
-    NSString *msg = [NSString stringWithFormat:@"0x%llX · %@\n当前值: %@",
-                     s.addr, [SavedAddressStore typeName:s.type], val];
+    NSString *val = self.values[@(flat)] ?: @"—";
+    NSString *msg = [NSString stringWithFormat:@"0x%llX · %@\n分组: %@\n当前值: %@",
+                     s.addr, [SavedAddressStore typeName:s.type],
+                     s.group.length ? s.group : @"未分组", val];
     UIAlertController *a = [UIAlertController alertControllerWithTitle:s.label
                                                                message:msg
                                                         preferredStyle:UIAlertControllerStyleAlert];
 
     __weak typeof(self) ws = self;
     [a addAction:[UIAlertAction actionWithTitle:@"改名" style:UIAlertActionStyleDefault
-                                        handler:^(UIAlertAction *x) { [ws promptRenameAt:ip.row]; }]];
+                                        handler:^(UIAlertAction *x) { [ws promptRenameAt:flat]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"移动到分组" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) { [ws promptGroupAt:flat]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"复制地址" style:UIAlertActionStyleDefault
                                         handler:^(UIAlertAction *x) {
         [UIPasteboard generalPasteboard].string = [NSString stringWithFormat:@"0x%llX", s.addr];
     }]];
     [a addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive
-                                        handler:^(UIAlertAction *x) { [ws confirmDeleteAt:ip.row]; }]];
+                                        handler:^(UIAlertAction *x) { [ws confirmDeleteAt:flat]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:a animated:YES completion:nil];
 }
@@ -175,6 +272,32 @@ static uint64_t SaveParseAddr(NSString *s) {
                                         handler:^(UIAlertAction *x) {
         NSString *t = a.textFields.firstObject.text;
         [[SavedAddressStore shared] renameAtIndex:idx label:t];
+        [ws reloadAll];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)promptGroupAt:(NSUInteger)idx {
+    if (idx >= self.items.count) return;
+    SavedAddress *s = self.items[idx];
+    NSArray<NSString *> *groups = [[SavedAddressStore shared] groupNames];
+    NSString *hint = groups.count
+        ? [NSString stringWithFormat:@"已有分组：%@\n留空 = 未分组", [groups componentsJoinedByString:@" / "]]
+        : @"按枪械建组，如 M4 / AK / 手枪\n留空 = 未分组";
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"移动到分组"
+                                                               message:hint
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.text = s.group;
+        tf.placeholder = @"分组名";
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) ws = self;
+    [a addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) {
+        NSString *g = a.textFields.firstObject.text;
+        [[SavedAddressStore shared] setGroupAtIndex:idx group:g];
         [ws reloadAll];
     }]];
     [self presentViewController:a animated:YES completion:nil];
@@ -227,12 +350,20 @@ static uint64_t SaveParseAddr(NSString *s) {
         tf.placeholder = @"标签名，如 玩家HP";
         tf.clearButtonMode = UITextFieldViewModeWhileEditing;
     }];
+    NSArray<NSString *> *groups = [[SavedAddressStore shared] groupNames];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = groups.count
+            ? [NSString stringWithFormat:@"分组（已有：%@）", [groups componentsJoinedByString:@"/"]]
+            : @"分组，如 M4 / AK（可留空）";
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
     [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     __weak typeof(self) ws = self;
     [a addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
                                         handler:^(UIAlertAction *x) {
         uint64_t addr = SaveParseAddr(a.textFields[0].text);
         NSString *label = a.textFields[1].text;
+        NSString *group = a.textFields[2].text;
         if (addr == 0) {
             UIAlertController *e = [UIAlertController alertControllerWithTitle:@"地址无效"
                                                                        message:@"按十六进制填，例如 0x0000000123456789"
@@ -241,7 +372,7 @@ static uint64_t SaveParseAddr(NSString *s) {
             [ws presentViewController:e animated:YES completion:nil];
             return;
         }
-        [[SavedAddressStore shared] addAddr:addr type:type label:label note:@""];
+        [[SavedAddressStore shared] addAddr:addr type:type label:label group:group note:@""];
         [ws reloadAll];
     }]];
     [self presentViewController:a animated:YES completion:nil];
