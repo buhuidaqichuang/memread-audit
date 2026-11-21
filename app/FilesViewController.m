@@ -3,9 +3,12 @@
 
 static NSString *const kMediaDir = @"/var/mobile/Media";
 
-@interface FilesViewController () <UITableViewDataSource, UITableViewDelegate>
+@interface FilesViewController () <UITableViewDataSource, UITableViewDelegate,
+                                   UISearchResultsUpdating, UISearchControllerDelegate>
 @property (nonatomic, strong) UITableView *table;
 @property (nonatomic, strong) NSMutableArray *items;
+@property (nonatomic, strong) NSMutableArray *shown;
+@property (nonatomic, strong) UISearchController *searchController;
 @end
 
 @implementation FilesViewController
@@ -15,12 +18,24 @@ static NSString *const kMediaDir = @"/var/mobile/Media";
     self.title = @"读取结果";
     self.view.backgroundColor = [UIColor systemBackgroundColor];
     self.items = [NSMutableArray array];
+    self.shown = [NSMutableArray array];
 
     self.table = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStylePlain];
     self.table.dataSource = self;
     self.table.delegate = self;
     self.table.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [self.view addSubview:self.table];
+
+    // 结果页搜索：GPU 已可用，直接用系统搜索框（中文输入法可切）
+    self.searchController = [[UISearchController alloc] initWithSearchResultsController:nil];
+    self.searchController.searchResultsUpdater = self;
+    self.searchController.delegate = self;
+    self.searchController.obscuresBackgroundDuringPresentation = NO;
+    self.searchController.searchBar.placeholder = @"搜索文件名";
+    self.searchController.searchBar.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    self.navigationItem.searchController = self.searchController;
+    self.navigationItem.hidesSearchBarWhenScrolling = NO;
+    self.definesPresentationContext = YES;
 
     // 左上角必须留给系统返回按钮，否则进了结果页就退不回去
     UIBarButtonItem *refresh =
@@ -53,7 +68,30 @@ static NSString *const kMediaDir = @"/var/mobile/Media";
     [self.items sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
         return [b[@"date"] compare:a[@"date"]];
     }];
+    [self applyFilter];
+}
+
+- (void)applyFilter {
+    NSString *q = @"";
+    if (self.searchController.isActive) {
+        q = (self.searchController.searchBar.text ?: @"").lowercaseString;
+    }
+    [self.shown removeAllObjects];
+    for (NSDictionary *d in self.items) {
+        NSString *name = d[@"name"] ?: @"";
+        if (q.length == 0 || [[name lowercaseString] containsString:q]) {
+            [self.shown addObject:d];
+        }
+    }
     [self.table reloadData];
+}
+
+- (void)updateSearchResultsForSearchController:(UISearchController *)searchController {
+    [self applyFilter];
+}
+
+- (void)willDismissSearchController:(UISearchController *)searchController {
+    [self applyFilter];
 }
 
 - (NSString *)sizeText:(NSNumber *)size {
@@ -62,13 +100,13 @@ static NSString *const kMediaDir = @"/var/mobile/Media";
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return (NSInteger)self.items.count;
+    return (NSInteger)self.shown.count;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *c = [tableView dequeueReusableCellWithIdentifier:@"f"];
     if (!c) c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"f"];
-    NSDictionary *d = self.items[indexPath.row];
+    NSDictionary *d = self.shown[indexPath.row];
     c.textLabel.text = d[@"name"];
     NSDateFormatter *df = [[NSDateFormatter alloc] init];
     df.dateFormat = @"MM-dd HH:mm";
@@ -80,7 +118,7 @@ static NSString *const kMediaDir = @"/var/mobile/Media";
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    NSDictionary *d = self.items[indexPath.row];
+    NSDictionary *d = self.shown[indexPath.row];
     NSString *path = d[@"path"];
     NSString *name = d[@"name"];
 
@@ -111,7 +149,7 @@ static NSString *const kMediaDir = @"/var/mobile/Media";
 }
 
 - (void)deleteRow:(NSIndexPath *)indexPath {
-    NSDictionary *d = self.items[indexPath.row];
+    NSDictionary *d = self.shown[indexPath.row];
     [[NSFileManager defaultManager] removeItemAtPath:d[@"path"] error:nil];
     [self reload];
 }
