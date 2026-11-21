@@ -1,4 +1,5 @@
 #import "SavedAddressStore.h"
+#import "memread_core.h"
 #include <stdlib.h>
 
 // 地址统一按十六进制字符串存盘，避免 JSON 数字精度问题
@@ -13,6 +14,9 @@ static uint64_t MemParseAddr(NSString *s) {
 @implementation SavedAddress
 - (BOOL)inModule {
     return self.moduleUUID.length > 0;
+}
+- (BOOL)hasChain {
+    return self.moduleUUID.length > 0 && self.chainOffsets.count > 0;
 }
 @end
 
@@ -76,6 +80,20 @@ static uint64_t MemParseAddr(NSString *s) {
         s.moduleName = [mn isKindOfClass:[NSString class]] ? mn : @"";
         NSNumber *mo = d[@"moff"];
         s.moduleOff = [mo isKindOfClass:[NSNumber class]] ? mo.unsignedLongLongValue : 0;
+        NSString *cn = d[@"cname"];
+        s.chainName = [cn isKindOfClass:[NSString class]] ? cn : @"";
+        NSNumber *cso = d[@"coff"];
+        s.chainStaticOff = [cso isKindOfClass:[NSNumber class]] ? cso.unsignedLongLongValue : 0;
+        id co = d[@"cchain"];
+        if ([co isKindOfClass:[NSArray class]]) {
+            NSMutableArray<NSNumber *> *offs = [NSMutableArray array];
+            for (id v in (NSArray *)co) {
+                if ([v isKindOfClass:[NSNumber class]]) [offs addObject:v];
+            }
+            s.chainOffsets = offs;
+        } else {
+            s.chainOffsets = @[];
+        }
         [out addObject:s];
     }
     return out;
@@ -104,6 +122,33 @@ static uint64_t MemParseAddr(NSString *s) {
         @"muuid": mu,
         @"mname": (name.length ? name : @""),
         @"moff": @(off),
+        @"ts": [NSString stringWithFormat:@"%.0f", [NSDate date].timeIntervalSince1970]
+    };
+    [_items addObject:d];
+    return [self persist];
+}
+
+- (BOOL)addChain:(NSString *)uuid name:(NSString *)name staticOff:(uint64_t)staticOff
+            offs:(NSArray<NSNumber *> *)offs type:(int)type label:(NSString *)label
+           group:(NSString *)group note:(NSString *)note {
+    if (!uuid.length || !offs.count || offs.count > MEMREAD_CHAIN_MAX_DEPTH) return NO;
+    NSString *lb = [label stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (!lb.length) lb = @"未命名";
+    NSString *gp = [group stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSMutableArray<NSNumber *> *co = [NSMutableArray array];
+    for (NSNumber *n in offs) [co addObject:@([n longLongValue])];
+    NSDictionary *d = @{
+        @"addr": @"0x0",           // 链存的是静态槽，不是绝对地址
+        @"type": @(type),
+        @"label": lb,
+        @"group": gp.length ? gp : @"",
+        @"note": note.length ? note : @"",
+        @"muuid": uuid,
+        @"mname": (name.length ? name : @""),
+        @"moff": @(0),
+        @"cname": (name.length ? name : @""),
+        @"coff": @(staticOff),
+        @"cchain": co,
         @"ts": [NSString stringWithFormat:@"%.0f", [NSDate date].timeIntervalSince1970]
     };
     [_items addObject:d];

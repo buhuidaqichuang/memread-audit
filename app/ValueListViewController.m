@@ -2,6 +2,7 @@
 #import "SavedAddressStore.h"
 #import "SavedViewController.h"
 #import "memread_core.h"
+#include <stdlib.h>
 
 @interface ValueListViewController () <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, strong) UITableView *table;
@@ -115,14 +116,24 @@
         c.detailTextLabel.font = [UIFont systemFontOfSize:12];
         c.detailTextLabel.textColor = [UIColor secondaryLabelColor];
 
+        UIView *acc = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 92, 32)];
         UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
         [b setTitle:@"读" forState:UIControlStateNormal];
         b.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
         b.frame = CGRectMake(0, 0, 44, 32);
         b.tag = (NSInteger)idx;
         [b addTarget:self action:@selector(readRowTapped:) forControlEvents:UIControlEventTouchUpInside];
-        c.accessoryView = b;
-        c.accessoryView.tag = (NSInteger)ip.row;
+        [acc addSubview:b];
+
+        UIButton *cb = [UIButton buttonWithType:UIButtonTypeSystem];
+        [cb setTitle:@"链" forState:UIControlStateNormal];
+        cb.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+        cb.frame = CGRectMake(48, 0, 44, 32);
+        cb.tag = (NSInteger)idx;
+        [cb addTarget:self action:@selector(chainRowTapped:) forControlEvents:UIControlEventTouchUpInside];
+        [acc addSubview:cb];
+
+        c.accessoryView = acc;
     } else {
         c.textLabel.text = @"—";
         c.detailTextLabel.text = @"—";
@@ -169,6 +180,164 @@
             }
         });
     });
+}
+
+#pragma mark - 指针链（跨重启复原堆地址）
+
+- (NSString *)chainText:(NSString *)name staticOff:(uint64_t)off
+                    offs:(NSArray<NSNumber *> *)offs number:(int)num {
+    NSMutableString *s = [NSMutableString stringWithFormat:@"#%d  %@ + 0x%llX",
+                          num, name.length ? name : @"mod", off];
+    for (NSNumber *n in offs) {
+        long long o = n.longLongValue;
+        [s appendFormat:@"  →  %@0x%llX", (o < 0 ? @"-" : @"+"), (unsigned long long)llabs(o)];
+    }
+    [s appendString:@"  →  数值"];
+    return s;
+}
+
+- (void)chainRowTapped:(UIButton *)sender {
+    unsigned long long idx = (unsigned long long)sender.tag;
+    if (idx >= memread_valscan_count()) return;
+    uint64_t a = 0, prev = 0;
+    int vt = self.type;
+    if (memread_valscan_get_ex(idx, &a, &prev, &vt) != 0) return;
+    pid_t pid = self.pid;
+    int *cancelFlag = (int *)calloc(1, sizeof(int));
+
+    UIAlertController *ask = [UIAlertController
+        alertControllerWithTitle:@"指针链扫描"
+                         message:[NSString stringWithFormat:
+                                  @"目标 0x%llX（%@）\n先反推 3 层，找不到自动试 4 层；每层都要扫一遍可写内存，可能要几十秒。",
+                                  a, [SavedAddressStore typeName:vt]]
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [ask addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel
+                                          handler:^(UIAlertAction *x) { if (cancelFlag) free(cancelFlag); }]];
+    __weak typeof(self) ws = self;
+    [ask addAction:[UIAlertAction actionWithTitle:@"开始" style:UIAlertActionStyleDefault
+                                          handler:^(UIAlertAction *x) {
+        [ws runChainScan:pid target:a type:vt cancel:cancelFlag];
+    }]];
+    [self presentViewController:ask animated:YES completion:nil];
+}
+
+- (void)runChainScan:(pid_t)pid target:(uint64_t)addr type:(int)vt cancel:(int *)cancelFlag {
+    UIAlertController *busy = [UIAlertController alertControllerWithTitle:@"扫描中"
+                                                                  message:@"扫可写内存，点「取消」可中止"
+                                                           preferredStyle:UIAlertControllerStyleAlert];
+    [busy addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel
+                                             handler:^(UIAlertAction *x) { if (cancelFlag) *cancelFlag = 1; }]];
+    [self presentViewController:busy animated:YES completion:nil];
+
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        const int CAP = 24;
+        memread_chain_t *chains = (memread_chain_t *)calloc((size_t)CAP, sizeof(memread_chain_t));
+        int depth = 0, n = -4;
+        if (chains) n = memread_chain_scan(pid, addr, MEMREAD_CHAIN_MAX_DEPTH, chains, CAP, &depth, cancelFlag);
+
+        NSMutableArray<NSDictionary *> *copies = [NSMutableArray array];
+        for (int i = 0; i < n && i < CAP; i++) {
+            NSMutableArray<NSNumber *> *offs = [NSMutableArray array];
+            for (int k = 0; k < chains[i].depth; k++) [offs addObject:@(chains[i].offs[k])];
+            [copies addObject:@{
+                @"uuid": [NSString stringWithUTF8String:chains[i].uuid],
+                @"name": [NSString stringWithUTF8String:chains[i].name],
+                @"off": @(chains[i].static_off),
+                @"offs": offs
+            }];
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) self2 = ws;
+            if (!self2) { free(chains); if (cancelFlag) free(cancelFlag); return; }
+            [self2 dismissViewControllerAnimated:YES completion:^{
+                [self2 showChainResult:copies count:n depth:depth target:addr type:vt];
+                free(chains);
+                if (cancelFlag) free(cancelFlag);
+            }];
+        });
+    });
+}
+
+- (void)showChainResult:(NSArray<NSDictionary *> *)chains count:(int)n depth:(int)depth
+                 target:(uint64_t)t type:(int)vt {
+    if (n <= 0 || chains.count == 0) {
+        NSString *m = (n == 0)
+            ? @"3 层、4 层都没找到静态指针链。常见原因：中间指针只存在临时对象里、或走对象池 + 索引，不是固定字段链。"
+            : [NSString stringWithFormat:@"扫描失败 rc=%d", n];
+        UIAlertController *e = [UIAlertController alertControllerWithTitle:@"没有链"
+                                                                  message:m
+                                                           preferredStyle:UIAlertControllerStyleAlert];
+        [e addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:e animated:YES completion:nil];
+        return;
+    }
+
+    NSMutableString *msg = [NSMutableString stringWithFormat:@"命中 %d 条（最短 %d 层）：\n",
+                            (int)chains.count, depth];
+    for (int i = 0; i < chains.count && i < 3; i++) {
+        NSDictionary *c = chains[i];
+        [msg appendFormat:@"%@\n", [self chainText:c[@"name"] staticOff:[c[@"off"] unsignedLongLongValue]
+                                             offs:c[@"offs"] number:i + 1]];
+    }
+    if (chains.count > 3) [msg appendFormat:@"…另 %d 条（保存时可选前 8 条）", (int)chains.count - 3];
+
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"找到可跨重启的链"
+                                                              message:msg
+                                                       preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) ws = self;
+    for (int i = 0; i < chains.count && i < 8; i++) {
+        [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"保存第 %d 条", i + 1]
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *x) {
+            NSDictionary *c = chains[i];
+            [ws promptSaveChain:c type:vt];
+        }]];
+    }
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    a.popoverPresentationController.barButtonItem = self.navigationItem.rightBarButtonItem;
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)promptSaveChain:(NSDictionary *)c type:(int)vt {
+    NSString *text = [self chainText:c[@"name"] staticOff:[c[@"off"] unsignedLongLongValue]
+                                offs:c[@"offs"] number:1];
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"保存指针链"
+                         message:[NSString stringWithFormat:@"%@\n\n重启游戏后按模块基址重算，链断会显示「链断了」", text]
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"标签名，如 M4 弹匣 / 人物坐标";
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    NSArray<NSString *> *groups = [[SavedAddressStore shared] groupNames];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = groups.count
+            ? [NSString stringWithFormat:@"分组（已有：%@）", [groups componentsJoinedByString:@"/"]]
+            : @"分组，如 M4 / AK（可留空）";
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) {
+        NSString *label = a.textFields[0].text;
+        NSString *group = a.textFields[1].text;
+        BOOL ok = [[SavedAddressStore shared] addChain:c[@"uuid"]
+                                                   name:c[@"name"]
+                                              staticOff:[c[@"off"] unsignedLongLongValue]
+                                                   offs:c[@"offs"]
+                                                   type:vt
+                                                  label:label
+                                                  group:group
+                                                   note:@""];
+        UIAlertController *r = [UIAlertController alertControllerWithTitle:(ok ? @"已保存" : @"保存失败")
+                                                                   message:(ok ? text : @"链字段缺失")
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+        [r addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:r animated:YES completion:nil];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {

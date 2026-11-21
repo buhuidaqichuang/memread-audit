@@ -492,7 +492,20 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
         NSString *val = nil;
         uint64_t addr = it.addr;
         BOOL ok = YES;
-        if (it.inModule) {
+        if (it.hasChain) {
+            int64_t offs[MEMREAD_CHAIN_MAX_DEPTH] = {0};
+            int d = (int)MIN(it.chainOffsets.count, (NSUInteger)MEMREAD_CHAIN_MAX_DEPTH);
+            for (int k = 0; k < d; k++) offs[k] = [it.chainOffsets[(NSUInteger)k] longLongValue];
+            uint64_t t = 0;
+            int rc = memread_chain_resolve(pid, it.moduleUUID.UTF8String, it.chainStaticOff,
+                                           offs, d, &t);
+            if (rc == 0 && t) {
+                addr = t;
+            } else {
+                val = (rc == 2) ? @"模块未加载" : @"链断了";
+                ok = NO;
+            }
+        } else if (it.inModule) {
             uint64_t base = 0;
             char nm[64] = {0};
             if (memread_module_base(pid, it.moduleUUID.UTF8String, &base, nm, sizeof(nm)) == 0 && base) {

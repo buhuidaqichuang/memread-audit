@@ -1449,6 +1449,8 @@ typedef struct {
     uint64_t base;          // 模块 Mach-O header 地址（本轮运行的基址）
     uint64_t seg_start;
     uint64_t seg_end;
+    int writable;           // initprot 含 VM_PROT_WRITE
+    char segname[17];
     char uuid[40];
     char name[64];
 } memread_modseg_t;
@@ -1511,6 +1513,8 @@ static int macho_scan(task_t task, uint64_t hdr, memread_modseg_t *out, int cap,
     if (kr != KERN_SUCCESS || got != sizeofcmds) { free(cmds); return 0; }
 
     uint64_t seg_vm[32], seg_sz[32];
+    uint32_t seg_prot[32];
+    char seg_name[32][17];
     int nseg = 0;
     uint64_t text_vm = 0;
     int has_text = 0, has_uuid = 0;
@@ -1529,12 +1533,16 @@ static int macho_scan(task_t task, uint64_t hdr, memread_modseg_t *out, int cap,
             memcpy(sg, cmds + p + 8, 16);
             sg[16] = 0;
             uint64_t vmaddr, vmsize, fileoff;
+            uint32_t initprot = 0;
             memcpy(&vmaddr, cmds + p + 24, 8);
             memcpy(&vmsize, cmds + p + 32, 8);
             memcpy(&fileoff, cmds + p + 40, 8);
+            memcpy(&initprot, cmds + p + 60, 4);
             if (nseg < 32 && vmsize) {
                 seg_vm[nseg] = vmaddr;
                 seg_sz[nseg] = vmsize;
+                seg_prot[nseg] = initprot;
+                memcpy(seg_name[nseg], sg, sizeof(seg_name[nseg]));
                 nseg++;
             }
             if (strcmp(sg, "__TEXT") == 0 && fileoff == 0) {
@@ -1567,6 +1575,8 @@ static int macho_scan(task_t task, uint64_t hdr, memread_modseg_t *out, int cap,
         out[n].base = hdr;
         out[n].seg_start = start;
         out[n].seg_end = start + seg_sz[i];
+        out[n].writable = ((seg_prot[i] & 0x2) != 0);   // VM_PROT_WRITE
+        memcpy(out[n].segname, seg_name[i], sizeof(out[n].segname));
         memcpy(out[n].uuid, uuidstr, sizeof(out[n].uuid));
         memcpy(out[n].name, name, sizeof(out[n].name));
         n++;
@@ -2134,4 +2144,220 @@ int memread_coord_lock(pid_t pid, int *ptriplets, unsigned long long *pcands,
     fprintf(stderr, "坐标锁定: %d 组\n", found);
     if (ptriplets) *ptriplets = found;
     return 0;
+}
+
+#pragma mark - 指针链扫描（模块静态槽 + 多级偏移，跨重启复原堆地址）
+
+typedef struct {
+    uint64_t addr;       // 槽地址
+    int32_t off;         // 本跳偏移：槽内容 + off = 上一层要解释的地址
+    int32_t parent;      // 上一层节点下标
+} chainnode_t;
+
+static int chain_u64cmp(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return (x < y) ? -1 : (x > y ? 1 : 0);
+}
+
+static int chain_read_u64(task_t task, uint64_t addr, uint64_t *out) {
+    uint64_t v = 0;
+    mach_vm_size_t got = 0;
+    kern_return_t kr = mach_vm_read_overwrite(task, (mach_vm_address_t)addr, 8,
+                                             (mach_vm_address_t)&v, &got);
+    if (kr != KERN_SUCCESS || got != 8) return -1;
+    *out = v;
+    return 0;
+}
+
+static int chain_frontier_lower(const uint64_t *f, int n, uint64_t key) {
+    int lo = 0, hi = n;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (f[mid] < key) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+}
+
+// 扫一遍可写内存，找所有「8 字节槽，其内容 + off 落在 frontier 窗口内」的位置
+static int chain_scan_level(task_t task, const uint64_t *front, int fn,
+                            chainnode_t *out, int cap, int *outn,
+                            volatile int *cancel) {
+    *outn = 0;
+    if (!front || fn <= 0) return -2;
+    const mach_vm_size_t CHUNK = 4ULL * 1024 * 1024;
+    unsigned char *buf = (unsigned char *)malloc((size_t)CHUNK);
+    if (!buf) return -4;
+
+    mach_vm_address_t addr = 0;
+    int full = 0;
+    for (;;) {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        kern_return_t kr = mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
+                                         (vm_region_info_t)&info, &cnt, &obj);
+        if (kr != KERN_SUCCESS || size == 0) break;
+
+        if (snap_region_ok(&info, size)) {
+            uint64_t off = 0;
+            while (off + 8 <= (uint64_t)size && !full) {
+                if (cancel && *cancel) break;
+                mach_vm_size_t cur = (mach_vm_size_t)((size - off > CHUNK) ? CHUNK : (size - off));
+                cur -= (cur % 8);
+                if (cur == 0) break;
+                mach_vm_size_t got = 0;
+                kr = mach_vm_read_overwrite(task, addr + off, cur,
+                                           (mach_vm_address_t)buf, &got);
+                if (kr != KERN_SUCCESS || got != cur) {
+                    off += cur;
+                    continue;
+                }
+                for (mach_vm_size_t o = 0; o + 8 <= cur; o += 8) {
+                    uint64_t v;
+                    memcpy(&v, buf + o, 8);
+                    if (v < 0x100000000ULL) continue;
+                    uint64_t lo = v - MEMREAD_CHAIN_OFF_WIN;
+                    uint64_t hi = v + MEMREAD_CHAIN_OFF_WIN;
+                    int i = chain_frontier_lower(front, fn, lo);
+                    for (; i < fn && front[i] <= hi; i++) {
+                        int64_t d = (int64_t)front[i] - (int64_t)v;
+                        if (d < -(int64_t)MEMREAD_CHAIN_OFF_WIN || d > (int64_t)MEMREAD_CHAIN_OFF_WIN) continue;
+                        if (*outn >= cap) { full = 1; break; }
+                        out[*outn].addr = (uint64_t)addr + off + o;
+                        out[*outn].off = (int32_t)d;
+                        out[*outn].parent = i;
+                        (*outn)++;
+                    }
+                    if (full) break;
+                }
+                off += cur;
+            }
+        }
+        if (full) break;
+        addr += size;
+    }
+    free(buf);
+    return 0;
+}
+
+// 槽地址是否落在某个模块的可写段里（是 → 该地址可跨重启复原）
+static int chain_module_slot(uint64_t addr, memread_modseg_t *out) {
+    if (!g_modsegs) return -1;
+    for (int i = 0; i < g_modsegn; i++) {
+        if (g_modsegs[i].writable && addr >= g_modsegs[i].seg_start && addr < g_modsegs[i].seg_end) {
+            if (out) *out = g_modsegs[i];
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int chain_verify(task_t task, uint64_t slot, const int64_t *offs, int depth, uint64_t target) {
+    uint64_t a = slot;
+    for (int i = 0; i < depth; i++) {
+        uint64_t v = 0;
+        if (chain_read_u64(task, a, &v) != 0) return -1;
+        if (v < 0x100000000ULL) return 1;
+        a = (uint64_t)((int64_t)v + offs[i]);
+    }
+    return (a == target) ? 0 : 1;
+}
+
+int memread_chain_scan(pid_t pid, uint64_t target, int max_depth,
+                       memread_chain_t *out, int cap, int *found_depth,
+                       volatile int *cancel) {
+    if (found_depth) *found_depth = 0;
+    if (!out || cap <= 0) return -2;
+    if (max_depth < 1) max_depth = 1;
+    if (max_depth > MEMREAD_CHAIN_MAX_DEPTH) max_depth = MEMREAD_CHAIN_MAX_DEPTH;
+
+    task_t task = MACH_PORT_NULL;
+    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
+    if (module_cache_ensure(pid) != 0 || g_modsegn == 0) {
+        mach_port_deallocate(mach_task_self(), task);
+        return -3;
+    }
+
+    chainnode_t *lv[MEMREAD_CHAIN_MAX_DEPTH + 1] = {0};
+    int ln[MEMREAD_CHAIN_MAX_DEPTH + 1] = {0};
+    uint64_t *front = (uint64_t *)malloc(sizeof(uint64_t));
+    if (!front) {
+        mach_port_deallocate(mach_task_self(), task);
+        return -4;
+    }
+    front[0] = target;
+    int fn = 1;
+    int results = 0, stopdepth = 0;
+
+    for (int lvl = 1; lvl <= max_depth && results == 0; lvl++) {
+        lv[lvl] = (chainnode_t *)malloc(sizeof(chainnode_t) * MEMREAD_CHAIN_NODE_CAP);
+        if (!lv[lvl]) break;
+        chain_scan_level(task, front, fn, lv[lvl], MEMREAD_CHAIN_NODE_CAP, &ln[lvl], cancel);
+
+        if (ln[lvl] > 0) {
+            for (int j = 0; j < ln[lvl] && results < cap; j++) {
+                memread_modseg_t seg;
+                if (chain_module_slot(lv[lvl][j].addr, &seg) != 0) continue;
+                int64_t offs[MEMREAD_CHAIN_MAX_DEPTH] = {0};
+                int depth = lvl;
+                int p = j;
+                for (int k = 0; k < depth; k++) {
+                    chainnode_t *nd = &lv[depth - k][p];
+                    offs[k] = nd->off;
+                    p = nd->parent;
+                }
+                if (chain_verify(task, lv[lvl][j].addr, offs, depth, target) != 0) continue;
+                memread_chain_t *c = &out[results];
+                memset(c, 0, sizeof(*c));
+                memcpy(c->uuid, seg.uuid, sizeof(c->uuid));
+                memcpy(c->name, seg.name, sizeof(c->name));
+                c->static_off = lv[lvl][j].addr - seg.base;
+                c->depth = depth;
+                memcpy(c->offs, offs, sizeof(c->offs));
+                results++;
+            }
+            if (results > 0) { stopdepth = lvl; break; }
+        }
+
+        free(front);
+        front = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)(ln[lvl] > 0 ? ln[lvl] : 1));
+        if (!front) break;
+        for (int j = 0; j < ln[lvl]; j++) front[j] = lv[lvl][j].addr;
+        fn = ln[lvl];
+        qsort(front, (size_t)fn, sizeof(uint64_t), chain_u64cmp);
+    }
+
+    if (found_depth) *found_depth = stopdepth;
+    free(front);
+    for (int i = 0; i <= MEMREAD_CHAIN_MAX_DEPTH; i++) if (lv[i]) free(lv[i]);
+    mach_port_deallocate(mach_task_self(), task);
+    fprintf(stderr, "指针链扫描: 深度=%d 条数=%d\n", stopdepth, results);
+    return results;
+}
+
+// 按保存下来的链（模块 UUID + 静态槽偏移 + 各级偏移）算出本轮目标地址
+// 返回 0 成功；2 = 模块未加载；-3 = 链断了（指针不可读或越界）
+int memread_chain_resolve(pid_t pid, const char *uuid, uint64_t static_off,
+                          const int64_t *offs, int depth, uint64_t *out_addr) {
+    if (out_addr) *out_addr = 0;
+    if (depth <= 0 || depth > MEMREAD_CHAIN_MAX_DEPTH) return -2;
+    uint64_t base = 0;
+    char nm[64] = {0};
+    int br = memread_module_base(pid, uuid, &base, nm, sizeof(nm));
+    if (br == 1 || base == 0) return 2;
+    if (br != 0) return -1;
+
+    task_t task = MACH_PORT_NULL;
+    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
+    uint64_t a = base + static_off;
+    int rc = 0;
+    for (int i = 0; i < depth; i++) {
+        uint64_t v = 0;
+        if (chain_read_u64(task, a, &v) != 0 || v < 0x100000000ULL) { rc = -3; break; }
+        a = (uint64_t)((int64_t)v + offs[i]);
+    }
+    mach_port_deallocate(mach_task_self(), task);
+    if (rc == 0 && out_addr) *out_addr = a;
+    return rc;
 }

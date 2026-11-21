@@ -1,6 +1,7 @@
 #import "SavedViewController.h"
 #import "SavedAddressStore.h"
 #import "memread_core.h"
+#include <stdlib.h>
 
 static uint64_t SaveParseAddr(NSString *s) {
     NSString *t = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
@@ -121,6 +122,17 @@ static uint64_t SaveParseAddr(NSString *s) {
     if (self.pid <= 0) return;
     for (NSUInteger i = 0; i < self.items.count; i++) {
         SavedAddress *s = self.items[i];
+        if (s.hasChain) {
+            int64_t offs[MEMREAD_CHAIN_MAX_DEPTH] = {0};
+            int d = (int)MIN(s.chainOffsets.count, (NSUInteger)MEMREAD_CHAIN_MAX_DEPTH);
+            for (int k = 0; k < d; k++) offs[k] = [s.chainOffsets[(NSUInteger)k] longLongValue];
+            uint64_t t = 0;
+            if (memread_chain_resolve(self.pid, s.moduleUUID.UTF8String, s.chainStaticOff,
+                                      offs, d, &t) == 0 && t) {
+                self.resolved[@(i)] = @(t);
+            }
+            continue;
+        }
         if (!s.inModule) {
             self.resolved[@(i)] = @(s.addr);
             continue;
@@ -132,6 +144,17 @@ static uint64_t SaveParseAddr(NSString *s) {
         }
         // 解析不到就留空：这条会显示「模块未加载」
     }
+}
+
+// 链的文字摘要：main + 0x1234 → +0x20 → +0x8
+- (NSString *)chainSummary:(SavedAddress *)s {
+    NSMutableString *t = [NSMutableString stringWithFormat:@"%@ + 0x%llX",
+                          s.chainName.length ? s.chainName : @"mod", s.chainStaticOff];
+    for (NSNumber *n in s.chainOffsets) {
+        long long o = n.longLongValue;
+        [t appendFormat:@" → %@0x%llX", (o < 0 ? @"-" : @"+"), (unsigned long long)llabs(o)];
+    }
+    return t;
 }
 
 #pragma mark - 分组
@@ -208,10 +231,16 @@ static uint64_t SaveParseAddr(NSString *s) {
     if (!val) val = (self.pid > 0) ? @"读取中" : @"未绑定进程";
 
     NSNumber *ra = self.resolved[@(flat)];
-    NSString *addrText = ra ? [NSString stringWithFormat:@"0x%llX", ra.unsignedLongLongValue] : @"模块未加载";
-    NSString *modText = s.inModule
-        ? [NSString stringWithFormat:@"  %@+0x%llX", (s.moduleName.length ? s.moduleName : @"mod"), s.moduleOff]
-        : @"";
+    NSString *addrText = ra ? [NSString stringWithFormat:@"0x%llX", ra.unsignedLongLongValue]
+                            : (s.hasChain ? @"链断了/模块未加载" : @"模块未加载");
+    NSString *modText;
+    if (s.hasChain) {
+        modText = [NSString stringWithFormat:@"  链 %@", [self chainSummary:s]];
+    } else if (s.inModule) {
+        modText = [NSString stringWithFormat:@"  %@+0x%llX", (s.moduleName.length ? s.moduleName : @"mod"), s.moduleOff];
+    } else {
+        modText = @"";
+    }
     c.detailTextLabel.text = [NSString stringWithFormat:@"%@  %@%@\n= %@",
                               addrText, [SavedAddressStore typeName:s.type], modText, val];
     c.detailTextLabel.numberOfLines = 2;
@@ -269,12 +298,19 @@ static uint64_t SaveParseAddr(NSString *s) {
 
     NSString *val = self.values[@(flat)] ?: @"—";
     NSNumber *ra = self.resolved[@(flat)];
-    NSString *addrText = ra ? [NSString stringWithFormat:@"0x%llX", ra.unsignedLongLongValue] : @"模块未加载";
+    NSString *addrText = ra ? [NSString stringWithFormat:@"0x%llX", ra.unsignedLongLongValue]
+                            : (s.hasChain ? @"链断了/模块未加载" : @"模块未加载");
+    NSString *where;
+    if (s.hasChain) {
+        where = [NSString stringWithFormat:@"\n链: %@", [self chainSummary:s]];
+    } else if (s.inModule) {
+        where = [NSString stringWithFormat:@"\n模块: %@ + 0x%llX", (s.moduleName.length ? s.moduleName : @"mod"), s.moduleOff];
+    } else {
+        where = @"\n类型: 堆地址（仅本次运行）";
+    }
     NSString *msg = [NSString stringWithFormat:@"%@ · %@\n分组: %@%@\n当前值: %@",
                      addrText, [SavedAddressStore typeName:s.type],
-                     s.group.length ? s.group : @"未分组",
-                     s.inModule ? [NSString stringWithFormat:@"\n模块: %@ + 0x%llX", (s.moduleName.length ? s.moduleName : @"mod"), s.moduleOff] : @"\n类型: 堆地址（仅本次运行）",
-                     val];
+                     s.group.length ? s.group : @"未分组", where, val];
     UIAlertController *a = [UIAlertController alertControllerWithTitle:s.label
                                                                message:msg
                                                         preferredStyle:UIAlertControllerStyleAlert];
@@ -286,7 +322,9 @@ static uint64_t SaveParseAddr(NSString *s) {
                                         handler:^(UIAlertAction *x) { [ws promptGroupAt:flat]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"复制地址" style:UIAlertActionStyleDefault
                                         handler:^(UIAlertAction *x) {
-        [UIPasteboard generalPasteboard].string = [NSString stringWithFormat:@"0x%llX", s.addr];
+        NSNumber *rv = ws.resolved[@(flat)];
+        uint64_t copyAddr = rv ? rv.unsignedLongLongValue : s.addr;
+        [UIPasteboard generalPasteboard].string = [NSString stringWithFormat:@"0x%llX", copyAddr];
     }]];
     [a addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive
                                         handler:^(UIAlertAction *x) { [ws confirmDeleteAt:flat]; }]];

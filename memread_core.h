@@ -157,4 +157,27 @@ double memread_valscan_raw2double(uint64_t raw, int type);
 unsigned long long memread_valscan_count(void);
 void memread_valscan_reset(void);
 
+#pragma mark - 指针链扫描
+
+#define MEMREAD_CHAIN_MAX_DEPTH 4
+#define MEMREAD_CHAIN_OFF_WIN   0x8000   // 每跳偏移搜索窗口 ±32KB
+
+typedef struct {
+    char uuid[40];              // 模块 UUID（跨重启不变）
+    char name[64];
+    uint64_t static_off;        // 静态槽相对模块头的偏移
+    int depth;                  // 解引用层数 1..4
+    int64_t offs[MEMREAD_CHAIN_MAX_DEPTH];   // 每一跳偏移，offs[0] 最先加
+} memread_chain_t;
+
+// 从 target（数值地址）反推能跨重启复原的链；max_depth=4 时按 1→4 层依次试，
+// 哪层先命中就返回哪层（3 层找不到才用 4 层）。返回条数，负数=错误。
+int memread_chain_scan(pid_t pid, uint64_t target, int max_depth,
+                       memread_chain_t *out, int cap, int *found_depth,
+                       volatile int *cancel);
+
+// 用保存的链算出本轮目标地址：0 成功，2 模块未加载，-3 链断
+int memread_chain_resolve(pid_t pid, const char *uuid, uint64_t static_off,
+                          const int64_t *offs, int depth, uint64_t *out_addr);
+
 #endif
