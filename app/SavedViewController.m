@@ -583,15 +583,16 @@ static void MemSavedSigCacheInit(void) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         uint64_t cand[16] = {0};
         int n = memread_sig_scan(pid, sig, cand, 16, &gSigCancelFlag);
+        uint64_t best = (n > 0) ? cand[0] : 0;
         free(sig);
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(ws) self2 = ws;
             if (!self2) return;
             [self2 hideSigHUD];
             if (n > 0) {
-                self2.resolved[@(flat)] = @(cand[0]);
-                [self2 setCachedSigAddress:cand[0] for:s];
-                [self2 readValueAt:cand[0] flat:flat sender:nil];
+                self2.resolved[@(flat)] = @(best);
+                [self2 setCachedSigAddress:best for:s];
+                [self2 readValueAt:best flat:flat sender:nil];
             } else if (n == 0) {
                 self2.resolveNotes[@(flat)] = @"指纹没扫到（回对局再刷新）";
             }
