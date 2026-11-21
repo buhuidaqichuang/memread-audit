@@ -2245,6 +2245,31 @@ static int coord_addr_cmp(const void *pa, const void *pb) {
     return (a->addr < b->addr) ? -1 : 1;
 }
 
+// 指针值像「堆地址」：范围内、8 字节对齐、且不落在任何模块映像里（静态表里的指针都是模块内）
+static int coord_heap_ptr(uint64_t v) {
+    if (v < 0x100000000ULL || v >= 0x8000000000ULL) return 0;
+    if ((v & 7) != 0) return 0;
+    for (int i = 0; i < g_modsegn; i++) {
+        if (v >= g_modsegs[i].seg_start && v < g_modsegs[i].seg_end) return 0;
+    }
+    return 1;
+}
+
+// 坐标前后有没有指向堆的指针 → 说明它待在一个活对象里，而不是静态常量表
+static int coord_live_at(const unsigned char *p) {
+    uint64_t v = 0;
+    int hits = 0;
+    for (int d = 8; d <= 16; d += 8) {
+        memcpy(&v, p - d, 8);
+        if (coord_heap_ptr(v)) hits++;
+    }
+    for (int d = 24; d <= 40; d += 8) {
+        memcpy(&v, p + d, 8);
+        if (coord_heap_ptr(v)) hits++;
+    }
+    return hits >= 1;
+}
+
 // 全内存扫一遍，每个命中交给 visit；visit 返回 1 表示停止
 static int coord_scan(pid_t pid, int (*visit)(const memread_coord_hit_t *, void *), void *vctx,
                       unsigned long long *pscanned, volatile int *cancel,
@@ -2252,6 +2277,7 @@ static int coord_scan(pid_t pid, int (*visit)(const memread_coord_hit_t *, void 
     if (pscanned) *pscanned = 0;
     task_t task = MACH_PORT_NULL;
     if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
+    module_cache_ensure(pid);   // coord_heap_ptr 要用模块段范围
 
     const mach_vm_size_t CHUNK = 4ULL * 1024 * 1024;
     unsigned char *buf = (unsigned char *)malloc((size_t)CHUNK);
@@ -2285,6 +2311,8 @@ static int coord_scan(pid_t pid, int (*visit)(const memread_coord_hit_t *, void 
                         float v[3];
                         int qo = 0, vo = 0;
                         if (!coord_try(buf + o, v, &qo, &vo)) continue;
+                        // 弱判据（平凡四元数 / 角度旋转）要求身边有堆指针，否则就是静态常量表
+                        if ((qo < 0 || qo == 100) && !coord_live_at(buf + o)) continue;
                         memread_coord_hit_t h;
                         h.addr = (uint64_t)addr + off + o + (uint64_t)vo;
                         h.v[0] = v[0]; h.v[1] = v[1]; h.v[2] = v[2];
@@ -2309,12 +2337,25 @@ static int coord_scan(pid_t pid, int (*visit)(const memread_coord_hit_t *, void 
 typedef struct {
     memread_coord_hit_t *out;
     int cap, n;
+    int q[4];          // 各布局已收数量
+    int qcap[4];       // 各布局配额：0=四元数在后 1=平凡四元数 2=FTransform 3=FRotator
+    int dropped[4];
 } coord_collect_t;
+
+static int coord_kind(int quat_off) {
+    if (quat_off == 100) return 3;
+    if (quat_off == 0) return 2;
+    if (quat_off < 0) return 1;
+    return 0;
+}
 
 static int coord_collect_visit(const memread_coord_hit_t *h, void *vctx) {
     coord_collect_t *c = (coord_collect_t *)vctx;
     if (c->n >= c->cap) return 1;
+    int k = coord_kind(h->quat_off);
+    if (c->q[k] >= c->qcap[k]) { c->dropped[k]++; return 0; }
     c->out[c->n++] = *h;
+    c->q[k]++;
     return 0;
 }
 
@@ -2322,13 +2363,23 @@ int memread_coord_probe(pid_t pid, memread_coord_hit_t *out, int cap, int *found
                         volatile int *cancel, memread_region_cb cb, void *ctx) {
     if (found) *found = 0;
     if (!out || cap <= 0) return -2;
-    coord_collect_t c = { out, cap, 0 };
+    coord_collect_t c;
+    memset(&c, 0, sizeof(c));
+    c.out = out;
+    c.cap = cap;
+    // 按布局分配额，避免 FRotator（最宽松）把整个名额吃光
+    c.qcap[0] = cap / 2;              // 四元数在后（最可信）
+    c.qcap[1] = cap / 10;             // 平凡四元数
+    c.qcap[2] = cap * 3 / 10;         // FTransform
+    c.qcap[3] = cap / 10;             // FRotator
     unsigned long long scanned = 0;
     int rc = coord_scan(pid, coord_collect_visit, &c, &scanned, cancel, cb, ctx);
     if (rc != 0) return rc;
     qsort(out, (size_t)c.n, sizeof(memread_coord_hit_t), coord_hit_cmp);
     if (found) *found = c.n;
-    fprintf(stderr, "坐标结构扫描: %d 个候选（%llu 字节）\n", c.n, scanned);
+    fprintf(stderr, "坐标结构扫描: %d 个（四元数 %d / 平凡 %d / FTransform %d / 角度 %d；丢弃 %d/%d/%d/%d）\n",
+            c.n, c.q[0], c.q[1], c.q[2], c.q[3],
+            c.dropped[0], c.dropped[1], c.dropped[2], c.dropped[3]);
     return 0;
 }
 

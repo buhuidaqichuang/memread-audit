@@ -835,12 +835,19 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
                 if (old) free(old);
                 self2.coordA = buf;
                 self2.coordAn = found;
-                NSString *line = [NSString stringWithFormat:@"基准已记录：%d 个候选%@",
-                                  found, (found >= cap) ? @"（已到上限，可能被截断）" : @""];
+                int k[4] = {0, 0, 0, 0};
+                for (int i = 0; i < found; i++) {
+                    int q = buf[i].quat_off;
+                    int kk = (q == 100) ? 3 : ((q == 0) ? 2 : ((q < 0) ? 1 : 0));
+                    k[kk]++;
+                }
+                NSString *comp = [NSString stringWithFormat:
+                    @"四元数 %d · 平凡 %d · FTransform %d · 角度 %d", k[0], k[1], k[2], k[3]];
+                NSString *line = [NSString stringWithFormat:@"基准已记录：%d 个候选（%@）", found, comp];
                 self2.statusLabel.text = line;
                 [self2 appendProgressLine:line];
                 UIAlertController *ok = [UIAlertController alertControllerWithTitle:@"基准已记录"
-                                                                           message:[NSString stringWithFormat:@"%d 个候选。\n现在回游戏走 3~5 步，站住，再回来点『② 走动后：对比定位』。", found]
+                                                                           message:[NSString stringWithFormat:@"%d 个候选（%@）。\n\n现在回游戏走 3~5 步，站住，再回来点『② 走动后：对比定位』。", found, comp]
                                                                     preferredStyle:UIAlertControllerStyleAlert];
                 [ok addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
                 [self2 presentViewController:ok animated:YES completion:nil];
