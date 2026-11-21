@@ -1,5 +1,6 @@
 #import "FilesViewController.h"
 #import "DumpViewController.h"
+#import "FileTextViewController.h"
 
 static NSString *const kMediaDir = @"/var/mobile/Media";
 
@@ -131,22 +132,9 @@ static NSString *const kMediaDir = @"/var/mobile/Media";
     NSString *name = d[@"name"];
 
     if ([name.pathExtension.lowercaseString isEqualToString:@"txt"]) {
-        NSError *err = nil;
-        NSString *content = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err];
-        if (!content) {
-            content = [NSString stringWithFormat:@"读取失败: %@", err.localizedDescription];
-        }
-        UIViewController *vc = [[UIViewController alloc] init];
-        vc.title = name;
-        vc.view.backgroundColor = [UIColor systemBackgroundColor];
-        UITextView *tv = [[UITextView alloc] initWithFrame:vc.view.bounds];
-        tv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        tv.editable = NO;
-        tv.selectable = YES;
-        tv.font = [UIFont fontWithName:@"Menlo" size:11] ?: [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
-        tv.text = content;
-        [vc.view addSubview:tv];
-        self.navigationItem.backButtonTitle = @"返回";
+        // 文本页：分页浏览 + 文件内搜索（大文件也不会一次读进内存）
+        FileTextViewController *vc = [[FileTextViewController alloc] init];
+        vc.path = path;
         [self.navigationController pushViewController:vc animated:YES];
     } else {
         // 二进制 dump：进十六进制浏览页（分页读，不会把 842MB 全读进内存）

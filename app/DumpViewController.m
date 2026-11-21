@@ -1,10 +1,14 @@
 #import "DumpViewController.h"
+#import "MemFileSearch.h"
+#import "SearchResultsViewController.h"
 #include <stdlib.h>
 
 static const unsigned long long kPageSize = 16384;   // 16 KB / 页，避免一次读入整份 dump
+static const unsigned long long kNoHit = 0xFFFFFFFFFFFFFFFFULL;
 
 // 把一段字节渲染成 hex + ASCII 文本（16 字节一行）
-static NSString *MemReadHexPage(NSString *path, unsigned long long offset, unsigned long long want) {
+static NSString *MemReadHexPage(NSString *path, unsigned long long offset, unsigned long long want,
+                                unsigned long long hl) {
     NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:path];
     if (!fh) return @"无法打开文件";
 
@@ -24,6 +28,8 @@ static NSString *MemReadHexPage(NSString *path, unsigned long long offset, unsig
     NSMutableString *s = [NSMutableString stringWithCapacity:data.length * 5];
     const uint8_t *p = data.bytes;
     for (NSUInteger i = 0; i < data.length; i += 16) {
+        BOOL hitLine = (hl != kNoHit) && (hl >= offset + i) && (hl < offset + i + 16);
+        [s appendString:hitLine ? @"▶ " : @"  "];
         [s appendFormat:@"%010llX  ", offset + i];
         for (NSUInteger j = 0; j < 16; j++) {
             if (i + j < data.length) [s appendFormat:@"%02X ", p[i + j]];
@@ -46,6 +52,8 @@ static NSString *MemReadHexPage(NSString *path, unsigned long long offset, unsig
 @property (nonatomic, strong) UITextView *textView;
 @property (nonatomic, assign) unsigned long long offset;
 @property (nonatomic, assign) unsigned long long total;
+@property (nonatomic, assign) unsigned long long hitOffset;
+@property (nonatomic, assign) BOOL searching;
 @end
 
 @implementation DumpViewController
@@ -61,6 +69,12 @@ static NSString *MemReadHexPage(NSString *path, unsigned long long offset, unsig
                                          style:UIBarButtonItemStylePlain
                                         target:self
                                         action:@selector(onBack)];
+
+    // 在本文件里搜索
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemSearch
+                                                       target:self
+                                                       action:@selector(onSearch)];
 
     self.infoLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 8, self.view.bounds.size.width - 32, 40)];
     self.infoLabel.autoresizingMask = UIViewAutoresizingFlexibleWidth;
@@ -93,6 +107,7 @@ static NSString *MemReadHexPage(NSString *path, unsigned long long offset, unsig
     NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:self.path error:nil];
     self.total = [attrs[NSFileSize] unsignedLongLongValue];
     self.offset = 0;
+    self.hitOffset = kNoHit;
     [self render];
 }
 
@@ -108,12 +123,91 @@ static NSString *MemReadHexPage(NSString *path, unsigned long long offset, unsig
 - (void)render {
     unsigned long long pages = (self.total + kPageSize - 1) / kPageSize;
     unsigned long long page = self.offset / kPageSize + 1;
-    self.infoLabel.text = [NSString stringWithFormat:@"总大小 %@（%llu 字节）· 第 %llu/%llu 页 · 偏移 0x%llX",
-                           [NSByteCountFormatter stringFromByteCount:(long long)self.total
-                                                          countStyle:NSByteCountFormatterCountStyleFile],
-                           self.total, page, MAX(pages, (unsigned long long)1), self.offset];
-    self.textView.text = MemReadHexPage(self.path, self.offset, kPageSize);
+    NSString *info = [NSString stringWithFormat:@"总大小 %@（%llu 字节）· 第 %llu/%llu 页 · 偏移 0x%llX",
+                      [NSByteCountFormatter stringFromByteCount:(long long)self.total
+                                                     countStyle:NSByteCountFormatterCountStyleFile],
+                      self.total, page, MAX(pages, (unsigned long long)1), self.offset];
+    if (self.hitOffset != kNoHit && self.hitOffset >= self.offset
+        && self.hitOffset < self.offset + kPageSize) {
+        NSUInteger lineIdx = (NSUInteger)((self.hitOffset - self.offset) / 16);
+        info = [info stringByAppendingFormat:@" · ▶ 命中 0x%llX（本页第 %lu 行）",
+                self.hitOffset, (unsigned long)(lineIdx + 1)];
+    }
+    self.infoLabel.text = info;
+
+    self.textView.text = MemReadHexPage(self.path, self.offset, kPageSize, self.hitOffset);
     [self.textView setContentOffset:CGPointMake(0, 0) animated:NO];
+
+    if (self.hitOffset != kNoHit && self.hitOffset >= self.offset
+        && self.hitOffset < self.offset + kPageSize) {
+        NSUInteger lineIdx = (NSUInteger)((self.hitOffset - self.offset) / 16);
+        NSArray *lines = [self.textView.text componentsSeparatedByString:@"\n"];
+        NSUInteger loc = 0;
+        for (NSUInteger i = 0; i < lineIdx && i < lines.count; i++) {
+            loc += [lines[i] length] + 1;
+        }
+        NSUInteger tlen = self.textView.text.length;
+        if (loc < tlen) {
+            [self.textView scrollRangeToVisible:NSMakeRange(loc, MIN((NSUInteger)80, tlen - loc))];
+        }
+    }
+}
+
+#pragma mark - 在本文件中搜索
+
+- (void)onSearch {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"在本文件中搜索"
+                                                              message:@"任意字节字符串都能搜（ASCII / 中文均可）"
+                                                       preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"关键词，例如 MemoryReadDefense";
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+        tf.autocorrectionType = UITextAutocorrectionTypeNo;
+        tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    }];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf = self;
+    [a addAction:[UIAlertAction actionWithTitle:@"搜索" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *act) {
+        [weakSelf startSearch:a.textFields.firstObject.text];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)startSearch:(NSString *)kw {
+    kw = [kw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (!kw.length || self.searching) return;
+    self.searching = YES;
+    self.infoLabel.text = [NSString stringWithFormat:@"正在全文件搜索“%@”…", kw];
+
+    __weak typeof(self) weakSelf = self;
+    [MemFileSearch searchFile:self.path pattern:kw caseFold:YES maxHits:2000
+                     progress:^(double f) {
+        weakSelf.infoLabel.text = [NSString stringWithFormat:@"正在搜索“%@”… %d%%", kw, (int)(f * 100)];
+    } complete:^(NSArray<MemFileSearchHit *> *hits, BOOL truncated, NSError *err) {
+        weakSelf.searching = NO;
+        [weakSelf render];
+        if (err) {
+            [weakSelf toast:[NSString stringWithFormat:@"搜索失败：%@", err.localizedDescription]];
+            return;
+        }
+        if (!hits.count) {
+            [weakSelf toast:[NSString stringWithFormat:@"“%@”没有匹配内容", kw]];
+            return;
+        }
+        SearchResultsViewController *r =
+            [[SearchResultsViewController alloc] initWithHits:hits pattern:kw truncated:truncated];
+        r.onSelect = ^(MemFileSearchHit *h) { [weakSelf handleHit:h]; };
+        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:r];
+        nav.modalPresentationStyle = UIModalPresentationPageSheet;
+        [weakSelf presentViewController:nav animated:YES completion:nil];
+    }];
+}
+
+- (void)handleHit:(MemFileSearchHit *)h {
+    self.hitOffset = h.offset;
+    self.offset = (h.offset / kPageSize) * kPageSize;
+    [self render];
 }
 
 - (void)onPrev {
