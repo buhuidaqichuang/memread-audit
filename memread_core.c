@@ -2149,6 +2149,7 @@ int memread_coord_lock(pid_t pid, int *ptriplets, unsigned long long *pcands,
 #pragma mark - 指针链扫描（模块静态槽 + 多级偏移，跨重启复原堆地址）
 
 #define MEMREAD_CHAIN_NODE_CAP 120000    // 每层最多保留的候选槽
+#define MEMREAD_CHAIN_OFF_NEG  0x20      // 允许的极小负偏移，杜绝“指针指向对象中部”的别名命中
 
 static volatile int g_chain_level = 0;
 static volatile unsigned long long g_chain_bytes = 0;
@@ -2226,12 +2227,12 @@ static int chain_scan_level(task_t task, const uint64_t *front, int fn,
                     uint64_t v;
                     memcpy(&v, buf + o, 8);
                     if (v < 0x100000000ULL) continue;
-                    uint64_t lo = v - MEMREAD_CHAIN_OFF_WIN;
-                    uint64_t hi = v + MEMREAD_CHAIN_OFF_WIN;
+                    uint64_t lo = v - MEMREAD_CHAIN_OFF_NEG;   // 只允许极小的负偏移（成员指针指向对象内部时才有）
+                    uint64_t hi = v + MEMREAD_CHAIN_OFF_WIN;   // 结构体字段偏移，通常 < 0x1000
                     int i = chain_frontier_lower(front, fn, lo);
                     for (; i < fn && front[i] <= hi; i++) {
                         int64_t d = (int64_t)front[i] - (int64_t)v;
-                        if (d < -(int64_t)MEMREAD_CHAIN_OFF_WIN || d > (int64_t)MEMREAD_CHAIN_OFF_WIN) continue;
+                        if (d < -(int64_t)MEMREAD_CHAIN_OFF_NEG || d > (int64_t)MEMREAD_CHAIN_OFF_WIN) continue;
                         if (*outn >= cap) { full = 1; break; }
                         out[*outn].addr = (uint64_t)addr + off + o;
                         out[*outn].off = (int32_t)d;

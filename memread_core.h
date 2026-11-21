@@ -160,7 +160,7 @@ void memread_valscan_reset(void);
 #pragma mark - 指针链扫描
 
 #define MEMREAD_CHAIN_MAX_DEPTH 4
-#define MEMREAD_CHAIN_OFF_WIN   0x8000   // 每跳偏移搜索窗口 ±32KB
+#define MEMREAD_CHAIN_OFF_WIN   0x1000   // 每跳偏移搜索窗口：0 ~ +4KB（结构体字段偏移）
 
 typedef struct {
     char uuid[40];              // 模块 UUID（跨重启不变）
