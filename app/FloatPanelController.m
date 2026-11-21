@@ -124,6 +124,7 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
 @property (nonatomic, assign) BOOL retried;
 @property (nonatomic, assign) int frames;
 @property (nonatomic, assign) BOOL kvoAdded;
+@property (nonatomic, assign) int ticks;
 - (void)logMsg:(NSString *)fmt, ...;
 @property (nonatomic, assign) unsigned long long lastLeft;
 @end
@@ -274,6 +275,7 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
     self.paused = NO;
     self.retried = NO;
     self.frames = 0;
+    self.ticks = 0;
 
     [self startAudio];
 
@@ -357,6 +359,11 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
     unsigned long long left = memread_valscan_count();
     int changed = 0;
     int rc = memread_valscan_autorefine(pid, type, cond, 0, &left, &changed);
+    self.ticks++;
+    if (self.ticks % 10 == 0 || changed) {
+        [self logMsg:@"tick#%d 候选=%llu changed=%d rc=%d type=%d cond=%d",
+                 self.ticks, left, changed, rc, type, cond];
+    }
     if (rc != 0) return;
 
     NSMutableArray *rows = [NSMutableArray array];
@@ -422,6 +429,12 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
     [self enqueueImage:[self imageSaved:rows]];
 }
 
+- (NSString *)stampText {
+    NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    df.dateFormat = @"HH:mm:ss";
+    return [df stringFromDate:[NSDate date]];
+}
+
 - (UIImage *)imageLeft:(unsigned long long)left changed:(int)changed rows:(NSArray<NSDictionary *> *)rows {
     UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat defaultFormat];
     f.scale = 1;
@@ -436,6 +449,10 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
         MemDrawText(@"MEMREAD  自动收敛", CGRectMake(24, 16, 560, 26),
                     [UIFont systemFontOfSize:19 weight:UIFontWeightSemibold],
                     [UIColor colorWithWhite:0.58 alpha:1]);
+
+        MemDrawTextRight([self stampText], CGRectMake(430, 20, 186, 20),
+                         [UIFont monospacedSystemFontOfSize:14 weight:UIFontWeightRegular],
+                         [UIColor colorWithWhite:0.45 alpha:1]);
 
         MemDrawText([NSString stringWithFormat:@"%llu", left], CGRectMake(22, 44, 520, 58),
                     [UIFont monospacedSystemFontOfSize:48 weight:UIFontWeightBold],
@@ -488,6 +505,10 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
         MemDrawText(@"MEMREAD  地址监控", CGRectMake(24, 16, 560, 26),
                     [UIFont systemFontOfSize:19 weight:UIFontWeightSemibold],
                     [UIColor colorWithWhite:0.58 alpha:1]);
+
+        MemDrawTextRight([self stampText], CGRectMake(430, 20, 186, 20),
+                         [UIFont monospacedSystemFontOfSize:14 weight:UIFontWeightRegular],
+                         [UIColor colorWithWhite:0.45 alpha:1]);
 
         MemDrawText([NSString stringWithFormat:@"%lu 条", (unsigned long)rows.count],
                     CGRectMake(22, 44, 520, 44),
