@@ -804,7 +804,8 @@ static void find_lower(unsigned char *dst, const unsigned char *src, size_t n) {
 
 int memread_find_ex(pid_t pid, const char *out_path, const char *needle,
                     int as_hex, int fold, int rw_only,
-                    memread_region_cb cb, void *ctx, unsigned long long *phits) {
+                    memread_region_cb cb, void *ctx, unsigned long long *phits,
+                    volatile int *cancel) {
     if (phits) *phits = 0;
     if (!out_path || !needle || !*needle) return -2;
 
@@ -859,6 +860,7 @@ int memread_find_ex(pid_t pid, const char *out_path, const char *needle,
     mach_vm_address_t addr = 0;
 
     while (!stopped) {
+        if (cancel && *cancel) break;
         mach_vm_size_t size = 0;
         vm_region_basic_info_data_64_t info;
         mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
@@ -879,6 +881,7 @@ int memread_find_ex(pid_t pid, const char *out_path, const char *needle,
             size_t carry = 0;
 
             while (off < size && !stopped) {
+                if (cancel && *cancel) { stopped = 1; break; }
                 mach_vm_size_t cur = (size - off > CHUNK) ? CHUNK : (size - off);
                 mach_vm_size_t got = 0;
                 kr = mach_vm_read_overwrite(task, addr + off, cur,
@@ -896,9 +899,13 @@ int memread_find_ex(pid_t pid, const char *out_path, const char *needle,
                         int found = 0;
                         size_t j = i;
                         while (j + nlen <= wlen) {
-                            if (hay[j] == ndp[0] && memcmp(hay + j, ndp, nlen) == 0) {
-                                hp = j; found = 1; break;
-                            }
+                            // 用 memchr 跳着找首字节，比逐字节比较快一个量级
+                            size_t avail = wlen - j - (nlen - 1);
+                            const unsigned char *p2 =
+                                (const unsigned char *)memchr(hay + j, ndp[0], avail);
+                            if (!p2) break;
+                            j = (size_t)(p2 - hay);
+                            if (memcmp(hay + j, ndp, nlen) == 0) { hp = j; found = 1; break; }
                             j++;
                         }
                         if (!found) break;

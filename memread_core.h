@@ -42,10 +42,11 @@ int memread_strings_ex(pid_t pid, const char *out_path, int rw_only, int min_len
 // as_hex=1 时 needle 按十六进制解析（支持 "DE AD BE EF" / "0xdeadbeef"），否则按 UTF-8 文本
 // fold=1 表示 ASCII 不区分大小写；rw_only=1 只搜可写区域
 // 命中处写 out_path：地址 + 前后 16 字节 hex + 所在行文本；最多 500 处
-// 返回 0 成功；phits 回填命中数（可为 NULL）
+// 返回 0 成功；phits 回填命中数（可为 NULL）；cancel 指向非 0 时尽快停止（可为 NULL）
 int memread_find_ex(pid_t pid, const char *out_path, const char *needle,
                     int as_hex, int fold, int rw_only,
-                    memread_region_cb cb, void *ctx, unsigned long long *phits);
+                    memread_region_cb cb, void *ctx, unsigned long long *phits,
+                    volatile int *cancel);
 
 // 兼容旧签名：只有累计字节的进度回调
 int memread_dump(pid_t pid, const char *out_path, int rw_only,

@@ -14,12 +14,25 @@
 @property (nonatomic, strong) UITextView *logView;
 @property (nonatomic, strong) UIActivityIndicatorView *spinner;
 @property (nonatomic, assign) pid_t currentPid;
+@property (nonatomic, strong) UIAlertController *searchAlert;
+@property (nonatomic, assign) CFAbsoluteTime lastFindTick;
+@property (nonatomic, assign) CFAbsoluteTime lastLogTick;
 - (void)appendLogLine:(unsigned long long)addr
                 chunk:(unsigned long long)chunk
                 total:(unsigned long long)total
               skipped:(int)skipped;
 - (void)stringsPid:(pid_t)pid;
+- (void)onFindProgress:(unsigned long long)total;
 @end
+
+// 关键词搜索的取消标志（跨线程共享）
+static volatile int g_findCancel = 0;
+
+static void DetailFindProgressCb(unsigned long long addr, unsigned long long chunk,
+                                 unsigned long long total, int skipped, void *ctx) {
+    DetailViewController *vc = (__bridge DetailViewController *)ctx;
+    [vc onFindProgress:total];
+}
 
 // 读取过程中的实时回调（在后台线程触发，内部切到主线程刷 UI）
 static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
@@ -191,6 +204,10 @@ static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
         [live writeToFile:@"/var/mobile/Media/memread_live.txt"
                  atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }
+
+    CFAbsoluteTime nowT2 = CFAbsoluteTimeGetCurrent();
+    if (nowT2 - self.lastLogTick < 0.6) return;   // UI 每 0.6s 才刷一次，避免刷屏拖慢
+    self.lastLogTick = nowT2;
 
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!self.isViewLoaded) return;
@@ -366,41 +383,77 @@ static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
     self.currentPid = pid;
     self.pidLabel.text = [NSString stringWithFormat:@"PID: %d", pid];
     [self.spinner startAnimating];
-    self.resultLabel.text = [NSString stringWithFormat:@"全内存搜索“%@”（%@）…", kw, asHex ? @"hex" : @"文本"];
+    self.resultLabel.text = [NSString stringWithFormat:@"搜索“%@”（%@）…", kw, asHex ? @"hex" : @"文本"];
     self.logView.text = [NSString stringWithFormat:@"搜索 pid=%d  关键词=%@  mode=%@\n",
                          pid, kw, asHex ? @"hex" : @"text"];
+
+    g_findCancel = 0;
+    self.lastFindTick = 0;
+
+    // 常驻进度框：显示已扫描量，可随时取消（不用等它跑完）
+    UIAlertController *busy = [UIAlertController alertControllerWithTitle:@"正在搜索内存"
+                                                                 message:@"准备中…"
+                                                          preferredStyle:UIAlertControllerStyleAlert];
+    __weak typeof(self) weakSelf = self;
+    [busy addAction:[UIAlertAction actionWithTitle:@"取消搜索" style:UIAlertActionStyleCancel
+                                          handler:^(UIAlertAction *x) { g_findCancel = 1; }]];
+    self.searchAlert = busy;
+    [self presentViewController:busy animated:YES completion:nil];
 
     NSString *kwCopy = [kw copy];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         unsigned long long found = 0;
+        // rw_only=1：只扫可写区域（自写密钥都在这里），比全可读快数倍
         int rc = memread_find_ex(pid, "/var/mobile/Media/memread_find.txt",
-                                 kwCopy.UTF8String, asHex ? 1 : 0, 1, 0,
-                                 DetailRegionCb, (__bridge void *)self, &found);
+                                 kwCopy.UTF8String, asHex ? 1 : 0, 1, 1,
+                                 DetailFindProgressCb, (__bridge void *)self, &found,
+                                 &g_findCancel);
         unsigned long long h = found;
+        int cancelled = g_findCancel;
         dispatch_async(dispatch_get_main_queue(), ^{
-            [self.spinner stopAnimating];
-            self.resultLabel.text = [NSString stringWithFormat:
-                @"rc=%d  命中 %llu 处\n/var/mobile/Media/memread_find.txt", rc, h];
-            self.logView.text = [self.logView.text stringByAppendingFormat:
-                @"搜索完成 rc=%d  命中 %llu 处\n", rc, h];
+            [weakSelf.spinner stopAnimating];
+            UIAlertController *cur = weakSelf.searchAlert;
+            weakSelf.searchAlert = nil;
+            void (^after)(void) = ^{
+                weakSelf.resultLabel.text = [NSString stringWithFormat:
+                    @"rc=%d  命中 %llu 处\n/var/mobile/Media/memread_find.txt", rc, h];
+                weakSelf.logView.text = [weakSelf.logView.text stringByAppendingFormat:
+                    @"搜索结束 rc=%d  命中 %llu 处%@\n", rc, h, cancelled ? @"（已取消）" : @""];
 
-            NSString *msg = h
-                ? [NSString stringWithFormat:
-                   @"命中 %llu 处，报告里每条都有地址、前后 16 字节 hex 和所在行文本。", h]
-                : @"0 处命中：这个值现在不在目标进程的可读内存里（可能写入后已被释放/覆盖，或写进去的是别的形态）。";
+                NSString *msg = cancelled
+                    ? @"已取消。已扫到的结果仍写进了报告，可以直接看。"
+                    : (h ? [NSString stringWithFormat:
+                            @"命中 %llu 处，报告里每条都有地址、前后 16 字节 hex 和所在行文本。", h]
+                          : @"0 处命中：这个值现在不在目标进程的可写内存里（可能写入后已被释放/覆盖，或写进去的是别的形态）。");
 
-            UIAlertController *al = [UIAlertController alertControllerWithTitle:@"搜索结果"
-                                                                        message:msg
-                                                                 preferredStyle:UIAlertControllerStyleAlert];
-            [al addAction:[UIAlertAction actionWithTitle:@"稍后" style:UIAlertActionStyleCancel handler:nil]];
-            [al addAction:[UIAlertAction actionWithTitle:@"查看报告" style:UIAlertActionStyleDefault
-                                                handler:^(UIAlertAction *x) {
-                FileTextViewController *vc = [[FileTextViewController alloc] init];
-                vc.path = @"/var/mobile/Media/memread_find.txt";
-                [self.navigationController pushViewController:vc animated:YES];
-            }]];
-            [self presentViewController:al animated:YES completion:nil];
+                UIAlertController *al = [UIAlertController alertControllerWithTitle:@"搜索结果"
+                                                                            message:msg
+                                                                     preferredStyle:UIAlertControllerStyleAlert];
+                [al addAction:[UIAlertAction actionWithTitle:@"稍后" style:UIAlertActionStyleCancel handler:nil]];
+                [al addAction:[UIAlertAction actionWithTitle:@"查看报告" style:UIAlertActionStyleDefault
+                                                    handler:^(UIAlertAction *x) {
+                    FileTextViewController *vc = [[FileTextViewController alloc] init];
+                    vc.path = @"/var/mobile/Media/memread_find.txt";
+                    [weakSelf.navigationController pushViewController:vc animated:YES];
+                }]];
+                [weakSelf presentViewController:al animated:YES completion:nil];
+            };
+            if (cur && cur.presentingViewController) {
+                [cur dismissViewControllerAnimated:YES completion:after];
+            } else {
+                after();
+            }
         });
+    });
+}
+
+- (void)onFindProgress:(unsigned long long)total {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - self.lastFindTick < 0.3) return;
+    self.lastFindTick = now;
+    NSString *m = [NSString stringWithFormat:@"已扫描 %.1f MB（可取消）", total / 1048576.0];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.searchAlert) self.searchAlert.message = m;
     });
 }
 
