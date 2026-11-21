@@ -22,6 +22,24 @@
     self.table.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [self.view addSubview:self.table];
 
+    [self reloadCandidates];
+
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(onPiPSync:)
+                                                 name:@"MemReadPiPSync"
+                                               object:nil];
+}
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
+- (void)onPiPSync:(NSNotification *)n {
+    [self reloadCandidates];
+}
+
+// 候选可能被悬浮窗收敛改动：重建索引表并刷新表头
+- (void)reloadCandidates {
     unsigned long long n = memread_valscan_count();
     unsigned long long shown = n > 200 ? 200 : n;
     NSMutableArray *a = [NSMutableArray arrayWithCapacity:(NSUInteger)shown];
@@ -29,6 +47,7 @@
         [a addObject:@(i)];
     }
     self.rows = a;
+    [self.table reloadData];
 
     // 用可换行表头，避免 navigationItem.prompt 被系统截断成省略号
     if (n > shown) {
@@ -46,6 +65,8 @@
         UIView *h = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, head.frame.size.height + 16)];
         [h addSubview:head];
         self.table.tableHeaderView = h;
+    } else {
+        self.table.tableHeaderView = nil;
     }
 }
 

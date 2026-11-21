@@ -380,6 +380,7 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
     int cond = self.cond;
 
     unsigned long long left = memread_valscan_count();
+    unsigned long long before = left;
     int changed = 0;
     if (self.autoRefine) {
         int rc = memread_valscan_autorefine(pid, type, cond, 0, &left, &changed);
@@ -407,6 +408,13 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
 
     dispatch_async(dispatch_get_main_queue(), ^{
         [self renderLeft:left changed:changed rows:rows];
+        if (changed) {
+            // 悬浮窗收敛了：把结果同步回 App（候选数、候选列表）
+            [[NSNotificationCenter defaultCenter] postNotificationName:@"MemReadPiPSync"
+                                                                object:nil
+                                                              userInfo:@{@"before": @(before),
+                                                                         @"after": @(left)}];
+        }
     });
 }
 

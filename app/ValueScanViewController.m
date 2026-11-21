@@ -151,6 +151,11 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
         [ws appendProgressLine:line];
     };
 
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(onPiPSync:)
+                                                 name:@"MemReadPiPSync"
+                                               object:nil];
+
     self.progressView = [[UITextView alloc] initWithFrame:CGRectMake(10, 100, W - 20, panelH - 106)];
     self.progressView.editable = NO;
     self.progressView.selectable = NO;
@@ -219,6 +224,24 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
 
 - (void)onTypeChanged {
     // 换类型后旧候选不保证仍对应，只提示不强制清空
+}
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self refreshCount];
+}
+
+// 悬浮窗自动收敛后同步回来：更新候选数、状态行、进度框
+- (void)onPiPSync:(NSNotification *)n {
+    unsigned long long before = [n.userInfo[@"before"] unsignedLongLongValue];
+    unsigned long long after = [n.userInfo[@"after"] unsignedLongLongValue];
+    self.statusLabel.text = [NSString stringWithFormat:@"悬浮窗自动收敛：%llu → %llu", before, after];
+    [self refreshCount];
+    [self appendProgressLine:[NSString stringWithFormat:@"悬浮窗收敛  %llu → %llu", before, after]];
 }
 
 - (void)refreshCount {
