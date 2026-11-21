@@ -520,13 +520,18 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
                     [UIFont systemFontOfSize:16],
                     [UIColor colorWithWhite:0.55 alpha:1]);
 
-        [[UIColor colorWithWhite:1 alpha:0.12] setFill];
-        CGContextFillRect(ctx, CGRectMake(24, 114, 592, 1));
+        MemDrawText([NSString stringWithFormat:@"扫描候选 %llu", memread_valscan_count()],
+                    CGRectMake(24, 110, 560, 22),
+                    [UIFont systemFontOfSize:16],
+                    [UIColor colorWithWhite:0.55 alpha:1]);
 
-        NSUInteger n = MIN(rows.count, (NSUInteger)8);
+        [[UIColor colorWithWhite:1 alpha:0.12] setFill];
+        CGContextFillRect(ctx, CGRectMake(24, 136, 592, 1));
+
+        NSUInteger n = MIN(rows.count, (NSUInteger)7);
         for (NSUInteger i = 0; i < n; i++) {
             NSDictionary *row = rows[i];
-            CGFloat y = 122 + i * 26;
+            CGFloat y = 144 + i * 26;
             MemDrawText(row[@"label"], CGRectMake(26, y, 380, 24),
                         [UIFont systemFontOfSize:17 weight:UIFontWeightMedium],
                         [UIColor colorWithWhite:0.9 alpha:1]);
@@ -535,8 +540,8 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
                              [UIColor colorWithWhite:1 alpha:1]);
         }
 
-        NSString *foot = rows.count > 8
-            ? [NSString stringWithFormat:@"只显示前 8 条，共 %lu 条", (unsigned long)rows.count]
+        NSString *foot = rows.count > 7
+            ? [NSString stringWithFormat:@"只显示前 7 条，共 %lu 条", (unsigned long)rows.count]
             : @"切枪不影响，各枪弹匣各自一条";
         MemDrawText(foot, CGRectMake(24, 332, 580, 20),
                     [UIFont systemFontOfSize:14],
