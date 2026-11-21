@@ -630,3 +630,198 @@ int memread_strings_ex(pid_t pid, const char *out_path, int rw_only, int min_len
             bytes, hits, regions, out_path);
     return hits > 0 ? 0 : -3;
 }
+
+// ================= 关键词精确搜索 =================
+// 用途：自己往内存里写了一个值（密钥 / 标记串），想确认它到底在不在目标进程里
+// 扫描时无论内容长什么样都会被找出来（不受 A/B/C/D 分级规则限制）
+
+#define FIND_MAX_HITS 500
+
+static int find_hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// "DE AD BE EF" / "deadbeef" / "0xdeadbeef" → 字节
+static int find_parse_hex(const char *s, unsigned char *out, size_t cap, size_t *outn) {
+    size_t n = 0;
+    const char *p = s;
+    while (*p) {
+        if (*p == ' ' || *p == '\t' || *p == ':' || *p == ',' || *p == '\n' || *p == '-') { p++; continue; }
+        if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) { p += 2; continue; }
+        int hi = find_hexval(p[0]);
+        if (hi < 0) return -1;
+        int lo = find_hexval(p[1]);
+        if (lo < 0) return -1;
+        if (n >= cap) return -1;
+        out[n++] = (unsigned char)((hi << 4) | lo);
+        p += 2;
+    }
+    *outn = n;
+    return n > 0 ? 0 : -1;
+}
+
+static void find_lower(unsigned char *dst, const unsigned char *src, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = src[i];
+        dst[i] = (c >= 'A' && c <= 'Z') ? (unsigned char)(c + 32) : c;
+    }
+}
+
+int memread_find_ex(pid_t pid, const char *out_path, const char *needle,
+                    int as_hex, int fold, int rw_only,
+                    memread_region_cb cb, void *ctx, unsigned long long *phits) {
+    if (phits) *phits = 0;
+    if (!out_path || !needle || !*needle) return -2;
+
+    unsigned char nd[512];
+    size_t nlen = 0;
+    if (as_hex) {
+        if (find_parse_hex(needle, nd, sizeof(nd), &nlen) != 0) return -2;
+    } else {
+        nlen = strlen(needle);
+        if (nlen > sizeof(nd)) nlen = sizeof(nd);
+        memcpy(nd, needle, nlen);
+    }
+    if (nlen == 0) return -2;
+
+    unsigned char ndc[512];
+    if (fold) find_lower(ndc, nd, nlen);
+
+    task_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "task_for_pid 失败: (%d) %s\n", kr, mach_error_string(kr));
+        return -1;
+    }
+
+    FILE *f = fopen(out_path, "wb");
+    if (!f) { perror("fopen"); return -2; }
+
+    time_t now = time(NULL);
+    struct tm *tmv = localtime(&now);
+    fprintf(f, "========== 关键词搜索 ==========\n");
+    fprintf(f, "# pid=%d  %04d-%02d-%02d %02d:%02d:%02d  needle=\"%s\"  mode=%s  fold=%d  scope=%s\n\n",
+            pid, tmv ? tmv->tm_year + 1900 : 0, tmv ? tmv->tm_mon + 1 : 0, tmv ? tmv->tm_mday : 0,
+            tmv ? tmv->tm_hour : 0, tmv ? tmv->tm_min : 0, tmv ? tmv->tm_sec : 0,
+            needle, as_hex ? "hex" : "text", fold, rw_only ? "rw-only" : "all-readable");
+
+    const mach_vm_size_t CHUNK = 4ULL * 1024 * 1024;
+    unsigned char *buf = (unsigned char *)malloc((size_t)CHUNK);
+    unsigned char *work = (unsigned char *)malloc((size_t)CHUNK + nlen);
+    unsigned char *low = fold ? (unsigned char *)malloc((size_t)CHUNK + nlen) : NULL;
+    if (!buf || !work || (fold && !low)) {
+        free(buf); free(work); if (low) free(low);
+        fclose(f);
+        return -4;
+    }
+
+    unsigned long long nhits = 0;
+    unsigned long long bytes = 0;
+    int regions = 0;
+    int stopped = 0;
+    unsigned long long lastAbs = 0;
+    int hasLast = 0;
+    mach_vm_address_t addr = 0;
+
+    while (!stopped) {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+
+        kr = mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t)&info, &cnt, &obj);
+        if (kr != KERN_SUCCESS || size == 0) break;
+
+        int readable = (info.protection & VM_PROT_READ) != 0;
+        int writable = (info.protection & VM_PROT_WRITE) != 0;
+        int shared = info.shared;
+
+        if (readable && !shared && (!rw_only || writable) &&
+            size <= (mach_vm_size_t)(512ULL * 1024 * 1024)) {
+            regions++;
+            mach_vm_address_t off = 0;
+            size_t carry = 0;
+
+            while (off < size && !stopped) {
+                mach_vm_size_t cur = (size - off > CHUNK) ? CHUNK : (size - off);
+                mach_vm_size_t got = 0;
+                kr = mach_vm_read_overwrite(task, addr + off, cur,
+                                            (mach_vm_address_t)buf, &got);
+                if (kr == KERN_SUCCESS && got > 0) {
+                    memcpy(work + carry, buf, (size_t)got);
+                    size_t wlen = carry + (size_t)got;
+                    const unsigned char *hay = work;
+                    if (fold) { find_lower(low, work, wlen); hay = low; }
+                    const unsigned char *ndp = fold ? ndc : nd;
+
+                    size_t i = carry;
+                    while (i + nlen <= wlen) {
+                        size_t hp = 0;
+                        int found = 0;
+                        size_t j = i;
+                        while (j + nlen <= wlen) {
+                            if (hay[j] == ndp[0] && memcmp(hay + j, ndp, nlen) == 0) {
+                                hp = j; found = 1; break;
+                            }
+                            j++;
+                        }
+                        if (!found) break;
+
+                        unsigned long long abs =
+                            (unsigned long long)(addr + off - carry + hp);
+                        if (!(hasLast && abs == lastAbs)) {
+                            hasLast = 1; lastAbs = abs;
+                            nhits++;
+                            if (nhits <= FIND_MAX_HITS) {
+                                fprintf(f, "0x%016llX  len=%zu\n", abs, nlen);
+                                size_t hs = (hp >= 16) ? hp - 16 : 0;
+                                size_t he = hp + nlen + 16;
+                                if (he > wlen) he = wlen;
+                                fprintf(f, "    hex: ");
+                                for (size_t k = hs; k < he; k++) fprintf(f, "%02X ", work[k]);
+                                fprintf(f, "\n");
+                                size_t ts = hs, te = he;
+                                while (ts > 0 && work[ts - 1] != '\n') ts--;
+                                while (te < wlen && work[te] != '\n' && work[te] != '\r') te++;
+                                fprintf(f, "    ctx: ");
+                                size_t lim = ts + 160;
+                                for (size_t k = ts; k < te && k < lim; k++) {
+                                    unsigned char c = work[k];
+                                    fputc((c >= 0x20 && c < 0x7F) ? (int)c : '.', f);
+                                }
+                                fprintf(f, "\n\n");
+                            } else {
+                                stopped = 1;
+                                break;
+                            }
+                        }
+                        i = hp + 1;
+                    }
+
+                    // 末尾 nlen-1 字节留给下一块，避免跨界命中丢
+                    carry = (nlen > 1) ? nlen - 1 : 0;
+                    if (carry > wlen) carry = wlen;
+                    if (carry) memcpy(work, work + wlen - carry, carry);
+                }
+                bytes += (unsigned long long)got;
+                if (cb) cb((unsigned long long)(addr + off),
+                           (unsigned long long)cur, bytes, 0, ctx);
+                off += cur;
+            }
+        }
+        addr += size;
+    }
+
+    free(buf); free(work); if (low) free(low);
+    fprintf(f, "\n# 命中 %llu 处%s\n",
+            nhits, nhits > FIND_MAX_HITS ? "（已达上限 500，已停止扫描）" : "");
+    fclose(f);
+    fprintf(stderr, "关键词搜索完成: 扫描 %llu 字节, 命中 %llu 处, %d 个区域 -> %s\n",
+            bytes, nhits, regions, out_path);
+    if (phits) *phits = nhits;
+    return 0;
+}

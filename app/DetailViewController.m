@@ -1,5 +1,6 @@
 #import "DetailViewController.h"
 #import "FilesViewController.h"
+#import "FileTextViewController.h"
 #import "memread_core.h"
 
 @interface DetailViewController ()
@@ -31,6 +32,8 @@ static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    self.edgesForExtendedLayout = UIRectEdgeNone;
+    self.extendedLayoutIncludesOpaqueBars = NO;
     self.title = self.info[@"name"];
     self.view.backgroundColor = [UIColor systemBackgroundColor];
     self.currentPid = 0;
@@ -60,6 +63,7 @@ static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
     [self addButton:@"读取内存 (rw-only, 无注入)" width:W y:&y sel:@selector(onRead)];
     [self addButton:@"提取文本 (只导出字符串，体积小)" width:W y:&y sel:@selector(onStrings)];
     [self addButton:@"扫描敏感数据 (不落盘, 出报告)" width:W y:&y sel:@selector(onScan)];
+    [self addButton:@"验证写入：搜关键词 (文本 / hex)" width:W y:&y sel:@selector(onFindKeyword)];
     [self addButton:@"从剪贴板取 PID 读取" width:W y:&y sel:@selector(onManualPid)];
     [self addButton:@"把信息写入 Media" width:W y:&y sel:@selector(onSave)];
     [self addButton:@"查看结果文件（dump / 报告）" width:W y:&y sel:@selector(onShowFiles)];
@@ -320,6 +324,82 @@ static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
             [self.logView scrollRangeToVisible:NSMakeRange(self.logView.text.length - 1, 1)];
             self.resultLabel.text = [NSString stringWithFormat:
                 @"%@\n报告: /var/mobile/Media/memread_scan.txt", summary];
+        });
+    });
+}
+
+// 验证自己写进目标内存的值到底在不在：绕过 A/B/C 分级，直接按字节全内存找
+- (void)onFindKeyword {
+    pid_t pid = [self findPid];
+    if (pid <= 0) { self.resultLabel.text = @"目标未运行，请先启动"; return; }
+
+    UIAlertController *a =
+        [UIAlertController alertControllerWithTitle:@"在目标进程内存里搜索"
+                                            message:@"文本按原样找；二进制密钥用 hex（如 DE AD BE EF）"
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"MySecretKey123  或  DE AD BE EF";
+        tf.autocorrectionType = UITextAutocorrectionTypeNo;
+        tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf = self;
+    [a addAction:[UIAlertAction actionWithTitle:@"按文本搜" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) {
+        [weakSelf findKeyword:a.textFields.firstObject.text hex:NO];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"按 hex 搜" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) {
+        [weakSelf findKeyword:a.textFields.firstObject.text hex:YES];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)findKeyword:(NSString *)kw hex:(BOOL)asHex {
+    kw = [kw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (!kw.length) { self.resultLabel.text = @"关键词为空"; return; }
+
+    pid_t pid = [self findPid];
+    if (pid <= 0) { self.resultLabel.text = @"目标未运行，请先启动"; return; }
+
+    self.currentPid = pid;
+    self.pidLabel.text = [NSString stringWithFormat:@"PID: %d", pid];
+    [self.spinner startAnimating];
+    self.resultLabel.text = [NSString stringWithFormat:@"全内存搜索“%@”（%@）…", kw, asHex ? @"hex" : @"文本"];
+    self.logView.text = [NSString stringWithFormat:@"搜索 pid=%d  关键词=%@  mode=%@\n",
+                         pid, kw, asHex ? @"hex" : @"text"];
+
+    NSString *kwCopy = [kw copy];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        unsigned long long found = 0;
+        int rc = memread_find_ex(pid, "/var/mobile/Media/memread_find.txt",
+                                 kwCopy.UTF8String, asHex ? 1 : 0, 1, 0,
+                                 DetailRegionCb, (__bridge void *)self, &found);
+        unsigned long long h = found;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self.spinner stopAnimating];
+            self.resultLabel.text = [NSString stringWithFormat:
+                @"rc=%d  命中 %llu 处\n/var/mobile/Media/memread_find.txt", rc, h];
+            self.logView.text = [self.logView.text stringByAppendingFormat:
+                @"搜索完成 rc=%d  命中 %llu 处\n", rc, h];
+
+            NSString *msg = h
+                ? [NSString stringWithFormat:
+                   @"命中 %llu 处，报告里每条都有地址、前后 16 字节 hex 和所在行文本。", h]
+                : @"0 处命中：这个值现在不在目标进程的可读内存里（可能写入后已被释放/覆盖，或写进去的是别的形态）。";
+
+            UIAlertController *al = [UIAlertController alertControllerWithTitle:@"搜索结果"
+                                                                        message:msg
+                                                                 preferredStyle:UIAlertControllerStyleAlert];
+            [al addAction:[UIAlertAction actionWithTitle:@"稍后" style:UIAlertActionStyleCancel handler:nil]];
+            [al addAction:[UIAlertAction actionWithTitle:@"查看报告" style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *x) {
+                FileTextViewController *vc = [[FileTextViewController alloc] init];
+                vc.path = @"/var/mobile/Media/memread_find.txt";
+                [self.navigationController pushViewController:vc animated:YES];
+            }]];
+            [self presentViewController:al animated:YES completion:nil];
         });
     });
 }
