@@ -114,7 +114,7 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
     [self addButton:@"收敛：按变化筛选候选" width:W y:&y sel:@selector(onRefine)];
     [self addButton:@"查看候选列表（点一行读当前值）" width:W y:&y sel:@selector(onList)];
     [self addButton:@"已保存地址（自定义标签）" width:W y:&y sel:@selector(onSaved)];
-    [self addButton:@"画中画悬浮窗（后台自动收敛）" width:W y:&y sel:@selector(onFloat)];
+    [self addButton:@"画中画悬浮窗（后台监控）" width:W y:&y sel:@selector(onFloat)];
     [self addButton:@"重置候选" width:W y:&y sel:@selector(onReset)];
 
     self.scroll.contentSize = CGSizeMake(W, y + 20);
@@ -514,7 +514,7 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
     if (pid <= 0) return;
 
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"自动收敛条件"
-        message:@"每轮先探测是否变化，没变化就不动候选"
+        message:@"在游戏里开火后点 PiP 暂停键＝按此条件收敛一次，不会按秒乱筛"
         preferredStyle:UIAlertControllerStyleAlert];
     __weak typeof(self) ws = self;
     void (^addCond)(NSString *, int) = ^(NSString *title, int cond) {
@@ -622,7 +622,7 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
     BOOL ok = [[FloatPanelController shared] startWithPid:pid type:[self type] cond:cond interval:iv];
     if (ok) {
         self.statusLabel.text = @"悬浮窗已开启，直接切到游戏";
-        [self appendProgressLine:[NSString stringWithFormat:@"画中画悬浮窗已开启  每 %.1f 秒自动收敛一次", iv]];
+        [self appendProgressLine:[NSString stringWithFormat:@"画中画已开启：开火后点 PiP 暂停键收敛一次（条件已设置，每 %.1f 秒刷新数据）", iv]];
     } else {
         self.statusLabel.text = @"悬浮窗启动失败：设备不支持画中画或预览层未就绪";
         [self appendProgressLine:@"画中画启动失败"];

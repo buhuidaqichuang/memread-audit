@@ -128,6 +128,7 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
 @property (nonatomic, assign) BOOL paused;
 @property (nonatomic, assign) BOOL watchSaved;   // YES：监控已保存地址；NO：收敛候选
 @property (nonatomic, assign) BOOL autoRefine;   // NO：只显示，不自动收敛
+@property (nonatomic, assign) BOOL refineOnPause; // YES：点 PiP 暂停键时收敛一次
 @property (nonatomic, assign) BOOL retried;
 @property (nonatomic, assign) int frames;
 @property (nonatomic, assign) BOOL kvoAdded;
@@ -242,7 +243,9 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
 - (BOOL)startWithPid:(pid_t)pid type:(int)type cond:(int)cond interval:(double)interval {
     if (![self beginWithPid:pid interval:interval]) return NO;
     self.watchSaved = NO;
-    self.autoRefine = YES;
+    // 不再每秒自动收敛：只在点 PiP 暂停键时收敛一次，避免无关数值抖动把候选筛成一个
+    self.autoRefine = NO;
+    self.refineOnPause = YES;
     self.vtype = type;
     self.cond = cond;
     self.lastLeft = memread_valscan_count();
@@ -258,6 +261,7 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
     if (![self beginWithPid:pid interval:interval]) return NO;
     self.watchSaved = NO;
     self.autoRefine = NO;
+    self.refineOnPause = NO;
     self.vtype = type;
     self.cond = MEMREAD_VALCOND_CHANGED;
     self.lastLeft = memread_valscan_count();
@@ -296,6 +300,8 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
     self.pid = pid;
     self.interval = (interval < 0.5) ? 0.5 : interval;
     self.paused = NO;
+    self.autoRefine = NO;
+    self.refineOnPause = NO;
     self.retried = NO;
     self.frames = 0;
     self.ticks = 0;
@@ -365,7 +371,7 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
 }
 
 - (void)tick {
-    if (!_running || self.paused) return;
+    if (!_running) return;
     pid_t pid = self.pid;
 
     if (self.watchSaved) {
@@ -419,6 +425,36 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
 }
 
 #pragma mark 渲染
+
+// 点 PiP 暂停键 = 按当前条件收敛一次（不用切 App，也不会按秒乱筛）
+- (void)refineOnce {
+    if (self.watchSaved) return;
+    pid_t pid = self.pid;
+    int type = self.vtype, cond = self.cond;
+    unsigned long long before = memread_valscan_count();
+    unsigned long long left = before;
+    int rc = memread_valscan_refine(pid, type, cond, 0, NULL, NULL, &left, NULL);
+    [self logMsg:@"暂停键收敛  %llu → %llu rc=%d", before, left, rc];
+
+    NSMutableArray *rows = [NSMutableArray array];
+    unsigned long long n = memread_valscan_count();
+    for (unsigned long long i = 0; i < n && i < 5; i++) {
+        uint64_t addr = 0, prev = 0;
+        double cur = 0;
+        if (memread_valscan_get(i, &addr, &prev) != 0) continue;
+        int prc = memread_valscan_peek(pid, type, i, NULL, &cur);
+        NSString *v = (prc == 0) ? [SavedAddressStore formatValue:cur type:type] : @"?";
+        [rows addObject:@{@"addr": @(addr), @"v": v}];
+    }
+    unsigned long long after = left;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self renderLeft:after changed:1 rows:rows];
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"MemReadPiPSync"
+                                                            object:nil
+                                                          userInfo:@{@"before": @(before),
+                                                                     @"after": @(after)}];
+    });
+}
 
 - (NSArray<NSDictionary *> *)savedRowsWithPid:(pid_t)pid {
     NSArray<SavedAddress *> *items = [[SavedAddressStore shared] allItems];
@@ -500,9 +536,14 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
         NSString *condName = @"变小了";
         if (self.cond == MEMREAD_VALCOND_INCREASED) condName = @"变大了";
         else if (self.cond == MEMREAD_VALCOND_CHANGED) condName = @"变了";
-        NSString *line2 = self.autoRefine
-            ? [NSString stringWithFormat:@"条件 %@   每 %.1f 秒一轮", condName, self.interval]
-            : [NSString stringWithFormat:@"只看模式   每 %.1f 秒刷新", self.interval];
+        NSString *line2;
+        if (self.refineOnPause) {
+            line2 = [NSString stringWithFormat:@"条件 %@   点 PiP 暂停键收敛一次", condName];
+        } else if (self.autoRefine) {
+            line2 = [NSString stringWithFormat:@"条件 %@   每 %.1f 秒一轮", condName, self.interval];
+        } else {
+            line2 = [NSString stringWithFormat:@"只看模式   每 %.1f 秒刷新", self.interval];
+        }
         MemDrawText(line2, CGRectMake(24, 128, 560, 22),
                     [UIFont systemFontOfSize:16],
                     [UIColor colorWithWhite:0.55 alpha:1]);
@@ -521,10 +562,15 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
             i++;
         }
 
-        NSString *foot = !self.autoRefine
-            ? @"不自动收敛，回 App 手动点收敛"
-            : (changed ? [NSString stringWithFormat:@"刚收敛，剩余 %llu", left]
-                       : @"等待数值变化，候选保持不动");
+        NSString *foot;
+        if (self.refineOnPause) {
+            foot = @"开火后点 PiP 暂停键 = 收敛一次";
+        } else if (!self.autoRefine) {
+            foot = @"不自动收敛，回 App 手动点收敛";
+        } else {
+            foot = changed ? [NSString stringWithFormat:@"刚收敛，剩余 %llu", left]
+                           : @"等待数值变化，候选保持不动";
+        }
         MemDrawText(foot, CGRectMake(24, 324, 580, 22),
                     [UIFont systemFontOfSize:15],
                     [UIColor colorWithWhite:0.5 alpha:1]);
@@ -622,6 +668,9 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
 
 - (void)pictureInPictureController:(AVPictureInPictureController *)c setPlaying:(BOOL)playing {
     self.paused = !playing;
+    if (!playing && self.refineOnPause && !self.watchSaved) {
+        dispatch_async(_q, ^{ [self refineOnce]; });
+    }
 }
 
 - (CMTimeRange)pictureInPictureControllerTimeRangeForPlayback:(AVPictureInPictureController *)c {
