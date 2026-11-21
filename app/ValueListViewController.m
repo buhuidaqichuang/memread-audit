@@ -216,6 +216,8 @@
     uint64_t mbase = 0, moff = 0;
     int mrc = memread_addr_module_info(self.pid, addr, muuid, sizeof(muuid), mname, sizeof(mname), &mbase, &moff);
     BOOL inModule = (mrc == 0 && muuid[0]);
+    NSString *uuidStr = inModule ? [NSString stringWithUTF8String:muuid] : @"";
+    NSString *nameStr = inModule ? [NSString stringWithUTF8String:mname] : @"";
 
     NSString *where = inModule
         ? [NSString stringWithFormat:@"模块 %s + 0x%llX（重启后能复原）", mname, moff]
@@ -241,8 +243,8 @@
         NSString *label = a.textFields[0].text;
         NSString *group = a.textFields[1].text;
         [[SavedAddressStore shared] addAddr:addr type:vt label:label group:group note:@""
-                                  moduleUUID:(inModule ? [NSString stringWithUTF8String:muuid] : @"")
-                                  moduleName:(inModule ? [NSString stringWithUTF8String:mname] : @"")
+                                  moduleUUID:uuidStr
+                                  moduleName:nameStr
                                    moduleOff:moff];
         UIAlertController *ok = [UIAlertController alertControllerWithTitle:@"已保存"
                                                                    message:[NSString stringWithFormat:@"%@%@ → %@\n%@",
