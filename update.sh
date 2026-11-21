@@ -28,8 +28,6 @@ cat > "$ENT" <<'PLIST'
 	<true/>
 	<key>run-unsigned-code</key>
 	<true/>
-	<key>com.apple.private.security.no-sandbox</key>
-	<true/>
 	<key>com.apple.private.security.container-required</key>
 	<false/>
 </dict>

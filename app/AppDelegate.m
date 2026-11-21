@@ -11,8 +11,11 @@ extern BOOL MemReadGPUAvailable(void);
     MemReadEnvGPUCheck("launch");
 
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    // 不设背景色时顶部/边缘会露黑底，看起来像「大黑边」
+    self.window.backgroundColor = [UIColor systemBackgroundColor];
     UINavigationController *nav = [[UINavigationController alloc]
                                    initWithRootViewController:[[ViewController alloc] init]];
+    nav.view.backgroundColor = [UIColor systemBackgroundColor];
     self.window.rootViewController = nav;
     [self.window makeKeyAndVisible];
 

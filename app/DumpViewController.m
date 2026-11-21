@@ -55,6 +55,13 @@ static NSString *MemReadHexPage(NSString *path, unsigned long long offset, unsig
     self.title = self.path.lastPathComponent;
     self.view.backgroundColor = [UIColor systemBackgroundColor];
 
+    // 显式返回，避免长标题把系统返回按钮挤掉
+    self.navigationItem.leftBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"返回"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self
+                                        action:@selector(onBack)];
+
     self.infoLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 8, self.view.bounds.size.width - 32, 40)];
     self.infoLabel.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     self.infoLabel.font = [UIFont systemFontOfSize:12];
@@ -146,6 +153,10 @@ static NSString *MemReadHexPage(NSString *path, unsigned long long offset, unsig
     }
     self.offset = (v / kPageSize) * kPageSize;
     [self render];
+}
+
+- (void)onBack {
+    [self.navigationController popViewControllerAnimated:YES];
 }
 
 - (void)toast:(NSString *)msg {
