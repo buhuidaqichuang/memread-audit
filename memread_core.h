@@ -147,7 +147,7 @@ int memread_coord_lock(pid_t pid, int *ptriplets, unsigned long long *pcands,
 
 // ---- 坐标结构扫描（不依赖知道坐标值）----
 // 判据：某处连续 3 个 float 是合理坐标，紧跟（+12 或 +16）4 个 float 构成模长≈1 的四元数
-#define MEMREAD_COORD_HIT_CAP 300000
+#define MEMREAD_COORD_HIT_CAP 600000
 typedef struct {
     uint64_t addr;      // FVector 起始地址（4 字节对齐）
     float v[3];

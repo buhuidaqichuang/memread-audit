@@ -21,6 +21,8 @@
 @property (nonatomic, assign) pid_t currentPid;
 @property (nonatomic, assign) void *coordA;      // memread_coord_hit_t*：结构扫描基准
 @property (nonatomic, assign) int coordAn;
+@property (nonatomic, assign) void *coordB;      // 走动对比后的候选
+@property (nonatomic, assign) int coordBn;
 - (void)appendProgressLine:(NSString *)line;
 - (void)clearProgress;
 @end
@@ -773,12 +775,14 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
 - (void)onCoordProbe {
     __weak typeof(self) ws = self;
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"坐标结构扫描"
-                                                               message:@"不需要知道坐标值。判据是「3 个 float 坐标 + 紧跟一个模长=1 的四元数」，随机数据几乎不可能凑出来。\n\n① 站定别动 → 记录基准\n② 走 3~5 步、站住 → 对比，位移对得上就是人物坐标"
+                                                               message:@"三步，全程不用输坐标值。判据是「3 个 float 坐标 + 相邻的四元数/角度」，加上「走动时变、站住时不变」。\n\n① 站定别动 → 记录基准\n② 走 3~5 步、站住 → 对比，留下动过的\n③ 原地站 3 秒 → 过滤掉还在动的（相机抖动/动画）"
                                                         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"① 站定：记录基准" style:UIAlertActionStyleDefault
                                         handler:^(UIAlertAction *x) { [ws coordProbeSecond:NO]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"② 走动后：对比定位" style:UIAlertActionStyleDefault
                                         handler:^(UIAlertAction *x) { [ws coordProbeSecond:YES]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"③ 站住：静止过滤" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) { [ws coordProbeStill]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:a animated:YES completion:nil];
 }
@@ -844,7 +848,7 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
             }
 
             NSString *diag = [NSString stringWithFormat:
-                @"基准 %d 个 · 本次 %d 个 · 同地址 %d 个 · 位移非零 %d 个 · 最大位移 %.1f",
+                @"基准 %d 个 · 命中 %d 个 · 同地址 %d 个 · 位移非零 %d 个 · 最大位移 %.1f",
                 self2.coordAn, found, common, moved, maxdelta];
             [self2 appendProgressLine:diag];
 
@@ -874,6 +878,12 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
             memread_valscan_set(addrs, found, MEMREAD_VALTYPE_FLOAT);
             free(addrs);
 
+            // 这批候选留作 ③ 静止过滤的基准
+            memread_coord_hit_t *oldb = (memread_coord_hit_t *)self2.coordB;
+            if (oldb) free(oldb);
+            self2.coordB = buf;
+            self2.coordBn = found;
+
             NSString *line = [NSString stringWithFormat:@"结构扫描匹配：%d 个（位移从大到小）", found];
             self2.statusLabel.text = line;
             [self2 appendProgressLine:line];
@@ -881,16 +891,92 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
             [self2 refreshCount];
 
             NSMutableString *msg = [NSMutableString stringWithFormat:
-                @"%@\n\n位移最大的最可能是人物根组件（相机/挂点也会动）。\n\n", diag];
+                @"%@\n\n位移最大的最可能是人物根组件（相机/挂点也会动）。\n下一步：站住别动 3 秒，再点『③ 站住：静止过滤』，把还在动的（相机抖动/动画）筛掉。\n\n", diag];
             for (int i = 0; i < found && i < 3; i++) {
                 [msg appendFormat:@"%d) 0x%llX  (%.2f, %.2f, %.2f)%@\n", i + 1,
                  (unsigned long long)buf[i].addr,
                  buf[i].v[0], buf[i].v[1], buf[i].v[2],
                  (buf[i].quat_off == 100) ? @"  角度旋转" : ((buf[i].quat_off < 0) ? @"  平凡旋转" : @"  有旋转")];
             }
-            free(buf);
 
             UIAlertController *ok = [UIAlertController alertControllerWithTitle:@"已锁定坐标候选"
+                                                                       message:msg
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+            [ok addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+            [ok addAction:[UIAlertAction actionWithTitle:@"查看候选（点『链』）" style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *x) { [self2 onList]; }]];
+            [ok addAction:[UIAlertAction actionWithTitle:@"③ 静止过滤" style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *x) { [self2 coordProbeStill]; }]];
+            [self2 presentViewController:ok animated:YES completion:nil];
+        });
+    });
+}
+
+#pragma mark 坐标结构扫描 · ③ 静止过滤
+
+- (void)coordProbeStill {
+    pid_t pid = [self ensurePid];
+    if (pid <= 0) return;
+    if (!self.coordB || self.coordBn <= 0) {
+        [self appendProgressLine:@"还没有走动候选，先做 ② 走动后对比"];
+        self.statusLabel.text = @"先做 ②";
+        return;
+    }
+    memread_coord_hit_t *base = (memread_coord_hit_t *)self.coordB;
+    int nbase = self.coordBn;
+    [self.spinner startAnimating];
+    self.statusLabel.text = @"静止过滤：对比中…";
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        int cap = MEMREAD_COORD_HIT_CAP;
+        int m = 0, common = 0, moved = 0;
+        float maxdelta = 0;
+        memread_coord_hit_t *out = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * (size_t)cap);
+        int rc = out ? memread_coord_probe_diff(pid, base, nbase, out, cap, &m,
+                                                &common, &moved, &maxdelta,
+                                                0.02f, 3.0f, NULL, NULL, NULL) : -4;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) self2 = ws;
+            if (!self2) { free(out); return; }
+            [self2.spinner stopAnimating];
+
+            NSString *diag = [NSString stringWithFormat:
+                @"待筛 %d 个 · 同地址 %d 个 · 站住后仍在动 %d 个 · 稳定 %d 个（最大抖动 %.2f）",
+                nbase, common, moved, m, maxdelta];
+            [self2 appendProgressLine:diag];
+
+            if (rc != 0 || m <= 0) {
+                free(out);
+                NSString *why = (rc != 0)
+                    ? [NSString stringWithFormat:@"静止过滤失败 rc=%d", rc]
+                    : @"站住这段时间里这些候选还在动，或者站得不够久（位移还没稳定）";
+                self2.statusLabel.text = @"静止过滤没结果";
+                [self2 appendProgressLine:why];
+                [self2 appendProgressLine:diag];
+                return;
+            }
+
+            uint64_t *addrs = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)m);
+            for (int i = 0; i < m; i++) addrs[i] = out[i].addr;
+            memread_valscan_set(addrs, m, MEMREAD_VALTYPE_FLOAT);
+            free(addrs);
+
+            NSString *line = [NSString stringWithFormat:@"静止过滤后：%d 个稳定候选", m];
+            self2.statusLabel.text = line;
+            [self2 appendProgressLine:line];
+            [self2 appendProgressLine:diag];
+            [self2 refreshCount];
+
+            NSMutableString *msg = [NSMutableString stringWithFormat:@"%@\n\n", diag];
+            for (int i = 0; i < m && i < 3; i++) {
+                [msg appendFormat:@"%d) 0x%llX  (%.2f, %.2f, %.2f)%@\n", i + 1,
+                 (unsigned long long)out[i].addr,
+                 out[i].v[0], out[i].v[1], out[i].v[2],
+                 (out[i].quat_off == 100) ? @"  角度旋转" : ((out[i].quat_off < 0) ? @"  平凡旋转" : @"  有旋转")];
+            }
+            free(out);
+
+            UIAlertController *ok = [UIAlertController alertControllerWithTitle:@"稳定坐标候选"
                                                                        message:msg
                                                                 preferredStyle:UIAlertControllerStyleAlert];
             [ok addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
