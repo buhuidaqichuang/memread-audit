@@ -93,6 +93,17 @@ static void MemDrawText(NSString *s, CGRect r, UIFont *font, UIColor *color) {
     }];
 }
 
+static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color) {
+    NSMutableParagraphStyle *p = [[NSMutableParagraphStyle alloc] init];
+    p.lineBreakMode = NSLineBreakByClipping;
+    p.alignment = NSTextAlignmentRight;
+    [s drawInRect:r withAttributes:@{
+        NSFontAttributeName: font,
+        NSForegroundColorAttributeName: color,
+        NSParagraphStyleAttributeName: p
+    }];
+}
+
 #pragma mark - 控制器
 
 @interface FloatPanelController () <AVPictureInPictureControllerDelegate,
@@ -106,6 +117,7 @@ static void MemDrawText(NSString *s, CGRect r, UIFont *font, UIColor *color) {
 @property (nonatomic, assign) int cond;
 @property (nonatomic, assign) double interval;
 @property (nonatomic, assign) BOOL paused;
+@property (nonatomic, assign) BOOL watchSaved;   // YES：监控已保存地址；NO：收敛候选
 @property (nonatomic, assign) unsigned long long lastLeft;
 @end
 
@@ -180,6 +192,28 @@ static void MemDrawText(NSString *s, CGRect r, UIFont *font, UIColor *color) {
 }
 
 - (BOOL)startWithPid:(pid_t)pid type:(int)type cond:(int)cond interval:(double)interval {
+    if (![self beginWithPid:pid interval:interval]) return NO;
+    self.watchSaved = NO;
+    self.vtype = type;
+    self.cond = cond;
+    self.lastLeft = memread_valscan_count();
+    [self renderLeft:self.lastLeft changed:0 rows:@[]];
+    [self.pip startPictureInPicture];
+    [self startTimer];
+    return YES;
+}
+
+- (BOOL)startWatchSavedWithPid:(pid_t)pid interval:(double)interval {
+    if ([[SavedAddressStore shared] count] == 0) return NO;
+    if (![self beginWithPid:pid interval:interval]) return NO;
+    self.watchSaved = YES;
+    [self renderSaved:[self savedRowsWithPid:pid]];
+    [self.pip startPictureInPicture];
+    [self startTimer];
+    return YES;
+}
+
+- (BOOL)beginWithPid:(pid_t)pid interval:(double)interval {
     if (pid <= 0) return NO;
     if (!self.sbLayer || !self.host) return NO;
     if (![AVPictureInPictureController isPictureInPictureSupported]) return NO;
@@ -187,11 +221,8 @@ static void MemDrawText(NSString *s, CGRect r, UIFont *font, UIColor *color) {
     if (_running) [self stop];
 
     self.pid = pid;
-    self.vtype = type;
-    self.cond = cond;
     self.interval = (interval < 0.5) ? 0.5 : interval;
     self.paused = NO;
-    self.lastLeft = memread_valscan_count();
 
     [self startAudio];
 
@@ -206,9 +237,6 @@ static void MemDrawText(NSString *s, CGRect r, UIFont *font, UIColor *color) {
     self.pip.canStartPictureInPictureAutomaticallyFromInline = YES;
 
     _running = YES;
-    [self renderLeft:self.lastLeft changed:0 rows:@[]];
-    [self.pip startPictureInPicture];
-    [self startTimer];
     return YES;
 }
 
@@ -248,6 +276,15 @@ static void MemDrawText(NSString *s, CGRect r, UIFont *font, UIColor *color) {
 - (void)tick {
     if (!_running || self.paused) return;
     pid_t pid = self.pid;
+
+    if (self.watchSaved) {
+        NSArray<NSDictionary *> *savedRows = [self savedRowsWithPid:pid];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self renderSaved:savedRows];
+        });
+        return;
+    }
+
     int type = self.vtype;
     int cond = self.cond;
 
@@ -275,10 +312,20 @@ static void MemDrawText(NSString *s, CGRect r, UIFont *font, UIColor *color) {
 
 #pragma mark 渲染
 
-- (void)renderLeft:(unsigned long long)left changed:(int)changed rows:(NSArray<NSDictionary *> *)rows {
-    if (!self.sbLayer) return;
-    UIImage *img = [self imageLeft:left changed:changed rows:rows];
-    if (!img) return;
+- (NSArray<NSDictionary *> *)savedRowsWithPid:(pid_t)pid {
+    NSArray<SavedAddress *> *items = [[SavedAddressStore shared] allItems];
+    NSMutableArray *rows = [NSMutableArray array];
+    for (SavedAddress *it in items) {
+        double v = 0;
+        int rc = memread_read_scalar(pid, it.addr, it.type, &v);
+        NSString *val = (rc == 0) ? [SavedAddressStore formatValue:v type:it.type] : @"?";
+        [rows addObject:@{@"label": (it.label.length ? it.label : @"(未命名)"), @"v": val}];
+    }
+    return rows;
+}
+
+- (void)enqueueImage:(UIImage *)img {
+    if (!img || !self.sbLayer) return;
     CVPixelBufferRef pb = MemPixelBufferFromImage(img.CGImage);
     if (!pb) return;
     CMTime pts = kCMTimeZero;
@@ -292,6 +339,16 @@ static void MemDrawText(NSString *s, CGRect r, UIFont *font, UIColor *color) {
         CFRelease(sb);
     }
     CVPixelBufferRelease(pb);
+}
+
+- (void)renderLeft:(unsigned long long)left changed:(int)changed rows:(NSArray<NSDictionary *> *)rows {
+    if (!self.sbLayer) return;
+    [self enqueueImage:[self imageLeft:left changed:changed rows:rows]];
+}
+
+- (void)renderSaved:(NSArray<NSDictionary *> *)rows {
+    if (!self.sbLayer) return;
+    [self enqueueImage:[self imageSaved:rows]];
 }
 
 - (UIImage *)imageLeft:(unsigned long long)left changed:(int)changed rows:(NSArray<NSDictionary *> *)rows {
@@ -342,6 +399,55 @@ static void MemDrawText(NSString *s, CGRect r, UIFont *font, UIColor *color) {
         NSString *foot = changed ? [NSString stringWithFormat:@"刚收敛，剩余 %llu", left] : @"等待数值变化，候选保持不动";
         MemDrawText(foot, CGRectMake(24, 324, 580, 22),
                     [UIFont systemFontOfSize:15],
+                    [UIColor colorWithWhite:0.5 alpha:1]);
+    }];
+}
+
+- (UIImage *)imageSaved:(NSArray<NSDictionary *> *)rows {
+    UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat defaultFormat];
+    f.scale = 1;
+    f.opaque = YES;
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(640, 360)
+                                                                       format:f];
+    return [r imageWithActions:^(UIGraphicsImageRendererContext *c) {
+        CGContextRef ctx = c.CGContext;
+        [[UIColor colorWithRed:0.055 green:0.07 blue:0.09 alpha:1] setFill];
+        CGContextFillRect(ctx, CGRectMake(0, 0, 640, 360));
+
+        MemDrawText(@"MEMREAD  地址监控", CGRectMake(24, 16, 560, 26),
+                    [UIFont systemFontOfSize:19 weight:UIFontWeightSemibold],
+                    [UIColor colorWithWhite:0.58 alpha:1]);
+
+        MemDrawText([NSString stringWithFormat:@"%lu 条", (unsigned long)rows.count],
+                    CGRectMake(22, 44, 520, 44),
+                    [UIFont monospacedSystemFontOfSize:34 weight:UIFontWeightBold],
+                    [UIColor whiteColor]);
+
+        MemDrawText([NSString stringWithFormat:@"已保存地址   每 %.1f 秒刷新", self.interval],
+                    CGRectMake(24, 88, 560, 22),
+                    [UIFont systemFontOfSize:16],
+                    [UIColor colorWithWhite:0.55 alpha:1]);
+
+        [[UIColor colorWithWhite:1 alpha:0.12] setFill];
+        CGContextFillRect(ctx, CGRectMake(24, 114, 592, 1));
+
+        NSUInteger n = MIN(rows.count, (NSUInteger)8);
+        for (NSUInteger i = 0; i < n; i++) {
+            NSDictionary *row = rows[i];
+            CGFloat y = 122 + i * 26;
+            MemDrawText(row[@"label"], CGRectMake(26, y, 380, 24),
+                        [UIFont systemFontOfSize:17 weight:UIFontWeightMedium],
+                        [UIColor colorWithWhite:0.9 alpha:1]);
+            MemDrawTextRight(row[@"v"], CGRectMake(410, y, 208, 24),
+                             [UIFont monospacedSystemFontOfSize:17 weight:UIFontWeightBold],
+                             [UIColor colorWithWhite:1 alpha:1]);
+        }
+
+        NSString *foot = rows.count > 8
+            ? [NSString stringWithFormat:@"只显示前 8 条，共 %lu 条", (unsigned long)rows.count]
+            : @"切枪不影响，各枪弹匣各自一条";
+        MemDrawText(foot, CGRectMake(24, 332, 580, 20),
+                    [UIFont systemFontOfSize:14],
                     [UIColor colorWithWhite:0.5 alpha:1]);
     }];
 }

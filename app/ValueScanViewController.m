@@ -464,6 +464,20 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
         [self appendProgressLine:@"悬浮窗已停止"];
         return;
     }
+
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"监控对象"
+        message:@"不同枪的弹匣地址不同：各枪弹匣各存一条「已保存地址」，就能一起盯"
+        preferredStyle:UIAlertControllerStyleAlert];
+    __weak typeof(self) ws = self;
+    [a addAction:[UIAlertAction actionWithTitle:@"当前扫描候选（自动收敛）" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) { [ws askFloatCond]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"已保存地址（多把枪一起看）" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) { [ws askSavedInterval]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)askFloatCond {
     if (memread_valscan_count() == 0) {
         self.statusLabel.text = @"先做一次首扫，悬浮窗才有候选可收敛";
         return;
@@ -486,6 +500,43 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
     addCond(@"变了", MEMREAD_VALCOND_CHANGED);
     [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)askSavedInterval {
+    if ([[SavedAddressStore shared] count] == 0) {
+        self.statusLabel.text = @"还没有已保存地址：先把各枪的弹匣地址存进去";
+        return;
+    }
+    pid_t pid = [self ensurePid];
+    if (pid <= 0) return;
+
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"刷新间隔"
+                                                               message:nil
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    __weak typeof(self) ws = self;
+    NSArray<NSString *> *names = @[@"0.5 秒", @"1 秒", @"2 秒", @"3 秒"];
+    NSArray<NSNumber *> *vals = @[@0.5, @1.0, @2.0, @3.0];
+    for (NSUInteger i = 0; i < names.count; i++) {
+        [a addAction:[UIAlertAction actionWithTitle:names[i] style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *x) {
+            [ws startFloatSaved:[vals[i] doubleValue]];
+        }]];
+    }
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)startFloatSaved:(double)iv {
+    pid_t pid = [self ensurePid];
+    if (pid <= 0) return;
+    BOOL ok = [[FloatPanelController shared] startWatchSavedWithPid:pid interval:iv];
+    if (ok) {
+        self.statusLabel.text = @"地址监控已开启，直接切到游戏";
+        [self appendProgressLine:[NSString stringWithFormat:@"画中画已开启：监控全部已保存地址，每 %.1f 秒刷新", iv]];
+    } else {
+        self.statusLabel.text = @"监控启动失败：没有已保存地址，或画中画不可用";
+        [self appendProgressLine:@"地址监控启动失败"];
+    }
 }
 
 - (void)askFloatInterval:(int)cond {

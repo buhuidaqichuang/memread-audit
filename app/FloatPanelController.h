@@ -13,6 +13,10 @@
 
 // cond 用 MEMREAD_VALCOND_*；interval 秒
 - (BOOL)startWithPid:(pid_t)pid type:(int)type cond:(int)cond interval:(double)interval;
+
+// 监控「已保存地址」：不同枪的弹匣地址不同，各自存一条标签后一起看
+- (BOOL)startWatchSavedWithPid:(pid_t)pid interval:(double)interval;
+
 - (void)stop;
 
 @end
