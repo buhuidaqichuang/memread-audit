@@ -22,6 +22,11 @@ static uint64_t SaveParseAddr(NSString *s) {
 @property (nonatomic, strong) UIBarButtonItem *selectItem;
 @property (nonatomic, strong) UIBarButtonItem *deleteItem;
 @property (nonatomic, strong) UIToolbar *editBar;
+// 指纹定位进度浮层
+@property (nonatomic, strong) UIView *sigHud;
+@property (nonatomic, strong) UILabel *sigHudLabel;
+@property (nonatomic, strong) NSTimer *sigHudTimer;
+@property (nonatomic, strong) NSDate *sigHudStart;
 @end
 
 @implementation SavedViewController
@@ -461,12 +466,7 @@ static volatile int gSigCancelFlag = 0;
         sig->vals[i] = (unsigned char)[s.sigVals[(NSUInteger)i] unsignedIntValue];
     }
     gSigCancelFlag = 0;
-    UIAlertController *busy = [UIAlertController alertControllerWithTitle:@"定位指纹"
-                                                                  message:@"正在扫可写内存…"
-                                                           preferredStyle:UIAlertControllerStyleAlert];
-    [busy addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel
-                                          handler:^(UIAlertAction *x) { gSigCancelFlag = 1; }]];
-    [self presentViewController:busy animated:YES completion:nil];
+    [self showSigHUD];
 
     pid_t pid = self.pid;
     __weak typeof(self) ws = self;
@@ -479,6 +479,7 @@ static volatile int gSigCancelFlag = 0;
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(ws) self2 = ws;
             if (!self2) return;
+            [self2 hideSigHUD];
             void (^afterDismiss)(void) = ^{
                 if (n < 0) {
                     NSString *m = (n == -5) ? @"已取消" : [NSString stringWithFormat:@"扫描失败 rc=%d", n];
@@ -508,6 +509,75 @@ static volatile int gSigCancelFlag = 0;
             }
         });
     });
+}
+
+#pragma mark - 指纹定位进度浮层
+
+- (void)showSigHUD {
+    [self hideSigHUD];
+    CGFloat w = MIN(320, self.view.bounds.size.width - 40), h = 128;
+    UIView *v = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
+    v.center = CGPointMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds));
+    v.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin |
+                         UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
+    v.backgroundColor = [UIColor colorWithWhite:0 alpha:0.86];
+    v.layer.cornerRadius = 14;
+    v.clipsToBounds = YES;
+
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, w - 32, 68)];
+    l.numberOfLines = 3;
+    l.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
+    l.textColor = [UIColor whiteColor];
+    l.text = @"定位指纹  准备中…";
+    [v addSubview:l];
+
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.frame = CGRectMake(16, 86, w - 32, 32);
+    [b setTitle:@"取消定位" forState:UIControlStateNormal];
+    [b setTitleColor:[UIColor systemRedColor] forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    [b addTarget:self action:@selector(onCancelSigHUD) forControlEvents:UIControlEventTouchUpInside];
+    [v addSubview:b];
+
+    [self.view addSubview:v];
+    self.sigHud = v;
+    self.sigHudLabel = l;
+    self.sigHudStart = [NSDate date];
+    __weak typeof(self) ws = self;
+    self.sigHudTimer = [NSTimer scheduledTimerWithTimeInterval:0.3 repeats:YES block:^(NSTimer *t) {
+        [ws updateSigHUD];
+    }];
+}
+
+- (void)updateSigHUD {
+    int phase = 0, hits = 0;
+    unsigned long long done = 0, total = 0;
+    memread_sig_progress(&phase, &done, &total, &hits);
+    double el = self.sigHudStart ? -[self.sigHudStart timeIntervalSinceNow] : 0;
+    if (phase == 1) {
+        self.sigHudLabel.text = [NSString stringWithFormat:
+            @"采样指纹  第 %llu/%d 次\n保持数值在变化（开枪/切枪）\n用时 %.1fs",
+            done, 4, el];
+        return;
+    }
+    double pct = (total > 0) ? (100.0 * (double)done / (double)total) : 0.0;
+    if (pct > 100.0) pct = 100.0;
+    self.sigHudLabel.text = [NSString stringWithFormat:
+        @"定位指纹  已扫 %.0f%%\n%.0f / %.0f MB  命中 %d 处\n用时 %.0fs",
+        pct, (double)done / 1048576.0, (double)total / 1048576.0, hits, el];
+}
+
+- (void)hideSigHUD {
+    [self.sigHudTimer invalidate];
+    self.sigHudTimer = nil;
+    [self.sigHud removeFromSuperview];
+    self.sigHud = nil;
+    self.sigHudLabel = nil;
+}
+
+- (void)onCancelSigHUD {
+    gSigCancelFlag = 1;
+    [self hideSigHUD];
 }
 
 - (void)chooseSignatureCandidate:(NSArray<NSNumber *> *)arr flat:(NSUInteger)flat sender:(UIButton *)sender {

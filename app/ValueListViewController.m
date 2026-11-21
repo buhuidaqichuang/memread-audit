@@ -16,6 +16,7 @@
 @property (nonatomic, strong) NSDate *hudStart;
 @property (nonatomic, assign) BOOL hudCancel;
 @property (nonatomic, assign) int *chainCancelFlag;
+@property (nonatomic, assign) int hudMode;   // 0 = 指针链扫描，1 = 值指纹采样
 @end
 
 @implementation ValueListViewController
@@ -272,10 +273,7 @@
 }
 
 - (void)captureSignatureAt:(uint64_t)addr type:(int)vt bytes:(int)vb {
-    UIAlertController *busy = [UIAlertController alertControllerWithTitle:@"采样中"
-                                                                  message:@"保持数值在变化（开枪/切枪）"
-                                                           preferredStyle:UIAlertControllerStyleAlert];
-    [self presentViewController:busy animated:YES completion:nil];
+    [self showSigSampleHUD];
     memread_sig_t *sig = (memread_sig_t *)calloc(1, sizeof(memread_sig_t));
     pid_t pid = self.pid;
     __weak typeof(self) ws = self;
@@ -284,7 +282,8 @@
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(ws) self2 = ws;
             if (!self2) { free(sig); return; }
-            [self2 dismissViewControllerAnimated:YES completion:^{
+            [self2 hideChainHUD];
+            void (^after)(void) = ^{
                 if (!sig || rc != 0) {
                     UIAlertController *e = [UIAlertController
                         alertControllerWithTitle:@"采样失败"
@@ -305,7 +304,12 @@
                 [self2 promptSaveSigWin:sig->win targetOff:sig->target_off offs:offs vals:vals
                                     type:vt stable:sig->stable_n];
                 free(sig);
-            }];
+            };
+            if (self2.presentedViewController) {
+                [self2 dismissViewControllerAnimated:YES completion:after];
+            } else {
+                after();
+            }
         });
     });
 }
@@ -416,10 +420,53 @@
     self.hud = v;
     self.hudLabel = l;
     self.hudStart = [NSDate date];
+    self.hudMode = 0;
 
     __weak typeof(self) ws = self;
     self.hudTimer = [NSTimer scheduledTimerWithTimeInterval:0.4 repeats:YES block:^(NSTimer *t) {
-        [ws updateChainHUD];
+        if (ws.hudMode == 1) [ws updateSigHUD];
+        else [ws updateChainHUD];
+    }];
+}
+
+- (void)updateSigHUD {
+    int phase = 0, hits = 0;
+    unsigned long long done = 0, total = 0;
+    memread_sig_progress(&phase, &done, &total, &hits);
+    double el = self.hudStart ? -[self.hudStart timeIntervalSinceNow] : 0;
+    self.hudLabel.text = [NSString stringWithFormat:
+        @"采样值指纹  第 %llu/%d 次\n保持数值在变化（开枪 / 切枪）\n用时 %.1fs",
+        done, 4, el];
+}
+
+// 采样时的轻量进度条（1.2 秒，无取消）
+- (void)showSigSampleHUD {
+    [self hideChainHUD];
+    CGFloat w = 280, h = 104;
+    UIView *v = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
+    v.center = CGPointMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds));
+    v.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin |
+                         UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
+    v.backgroundColor = [UIColor colorWithWhite:0 alpha:0.85];
+    v.layer.cornerRadius = 14;
+    v.clipsToBounds = YES;
+
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(16, 14, w - 32, 76)];
+    l.numberOfLines = 3;
+    l.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
+    l.textColor = [UIColor whiteColor];
+    l.text = @"采样值指纹  第 0/4 次";
+    [v addSubview:l];
+
+    [self.view addSubview:v];
+    self.hud = v;
+    self.hudLabel = l;
+    self.hudStart = [NSDate date];
+    self.hudMode = 1;
+
+    __weak typeof(self) ws = self;
+    self.hudTimer = [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *t) {
+        [ws updateSigHUD];
     }];
 }
 

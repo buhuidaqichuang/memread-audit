@@ -2400,6 +2400,18 @@ static int sig_read_block(task_t task, uint64_t addr, int len, unsigned char *bu
     return 0;
 }
 
+// 进度（扫描线程写、UI 定时读）：phase 0=空闲 1=采样 2=扫描
+static volatile int g_sig_phase = 0;
+static volatile unsigned long long g_sig_done = 0, g_sig_total = 0;
+static volatile int g_sig_hits = 0;
+
+void memread_sig_progress(int *phase, unsigned long long *done, unsigned long long *total, int *hits) {
+    if (phase) *phase = g_sig_phase;
+    if (done) *done = g_sig_done;
+    if (total) *total = g_sig_total;
+    if (hits) *hits = g_sig_hits;
+}
+
 // 采样：连读 4 次（每次间隔 300ms），只保留完全不变的字节；目标数值本身的字节强制排除
 int memread_sig_capture(pid_t pid, uint64_t addr, int value_size, memread_sig_t *out) {
     if (!out) return -2;
@@ -2408,15 +2420,21 @@ int memread_sig_capture(pid_t pid, uint64_t addr, int value_size, memread_sig_t 
     task_t task = MACH_PORT_NULL;
     if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
 
+    g_sig_phase = 1;
+    g_sig_done = 0;
+    g_sig_total = MEMREAD_SIG_SAMPLES;
+    g_sig_hits = 0;
+
     uint64_t start = addr - MEMREAD_SIG_PRE;
     unsigned char buf[MEMREAD_SIG_SAMPLES][MEMREAD_SIG_LEN];
     int ok = 1;
     for (int k = 0; k < MEMREAD_SIG_SAMPLES; k++) {
         if (sig_read_block(task, start, MEMREAD_SIG_LEN, buf[k]) != 0) { ok = 0; break; }
+        g_sig_done = (unsigned long long)(k + 1);
         if (k + 1 < MEMREAD_SIG_SAMPLES) usleep(300 * 1000);
     }
     mach_port_deallocate(mach_task_self(), task);
-    if (!ok) return -3;
+    if (!ok) { g_sig_phase = 0; return -3; }
 
     out->win = MEMREAD_SIG_LEN;
     out->target_off = MEMREAD_SIG_PRE;
@@ -2434,6 +2452,7 @@ int memread_sig_capture(pid_t pid, uint64_t addr, int value_size, memread_sig_t 
         n++;
     }
     out->stable_n = n;
+    g_sig_phase = 0;
     fprintf(stderr, "签名采样: 稳定字节 %d/%d\n", n, MEMREAD_SIG_LEN);
     return (n >= 12) ? 0 : -4;
 }
@@ -2459,6 +2478,26 @@ int memread_sig_scan(pid_t pid, const memread_sig_t *sig, uint64_t *out, int cap
     int need = sig->stable_n * 3 / 4;
     if (need < 8) need = 8;
     if (need > sig->stable_n) need = sig->stable_n;
+
+    // 先量一遍可写区域总量（只枚举 region，不读内存），给进度条用
+    g_sig_phase = 2;
+    g_sig_done = 0;
+    g_sig_total = 0;
+    g_sig_hits = 0;
+    {
+        mach_vm_address_t a0 = 0;
+        for (;;) {
+            mach_vm_size_t s0 = 0;
+            vm_region_basic_info_data_64_t i0;
+            mach_msg_type_number_t c0 = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t o0 = MACH_PORT_NULL;
+            kern_return_t k0 = mach_vm_region(task, &a0, &s0, VM_REGION_BASIC_INFO_64,
+                                              (vm_region_info_t)&i0, &c0, &o0);
+            if (k0 != KERN_SUCCESS || s0 == 0) break;
+            if (snap_region_ok(&i0, s0)) g_sig_total += (unsigned long long)s0;
+            a0 += s0;
+        }
+    }
 
     const mach_vm_size_t CHUNK = 4ULL * 1024 * 1024;
     unsigned char *buf = (unsigned char *)malloc((size_t)CHUNK);
@@ -2521,7 +2560,9 @@ int memread_sig_scan(pid_t pid, const memread_sig_t *sig, uint64_t *out, int cap
                     }
                     if (merged) continue;
                     if (nh < HIT_CAP) { hits[nh].addr = cand; hits[nh].score = score; nh++; }
+                    g_sig_hits = nh;
                 }
+                g_sig_done += (unsigned long long)cur;
                 off += cur;
             }
         }
@@ -2536,6 +2577,7 @@ int memread_sig_scan(pid_t pid, const memread_sig_t *sig, uint64_t *out, int cap
     free(hits);
     free(buf);
     mach_port_deallocate(mach_task_self(), task);
+    g_sig_phase = 0;
     fprintf(stderr, "签名扫描: 命中 %d 处（阈值 %d/%d）\n", n, need, sig->stable_n);
     if (cancelled && n == 0) return -5;
     return n;

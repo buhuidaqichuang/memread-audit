@@ -209,5 +209,8 @@ int memread_sig_capture(pid_t pid, uint64_t addr, int value_size, memread_sig_t 
 // 返回候选条数；-5 = 已取消且无结果，-1 取进程失败，-2 参数错，-4 内存不足
 int memread_sig_scan(pid_t pid, const memread_sig_t *sig, uint64_t *out, int cap,
                      volatile int *cancel);
+// 采样/扫描进度（后台线程写、UI 定时读）：phase 0=空闲 1=采样(共 4 次) 2=扫描
+void memread_sig_progress(int *phase, unsigned long long *done, unsigned long long *total,
+                          int *hits);
 
 #endif

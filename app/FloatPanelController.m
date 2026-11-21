@@ -562,7 +562,17 @@ static void MemSigLockInit(void) {
             if (cached) {
                 addr = cached.unsignedLongLongValue;
             } else {
-                val = @"指纹定位中";
+                int ph = 0, hits = 0;
+                unsigned long long dn = 0, tt = 0;
+                memread_sig_progress(&ph, &dn, &tt, &hits);
+                if (ph == 2 && tt > 0) {
+                    val = [NSString stringWithFormat:@"指纹定位 %.0f%% 命中%d",
+                                                   100.0 * (double)dn / (double)tt, hits];
+                } else if (ph == 1) {
+                    val = @"指纹采样中";
+                } else {
+                    val = @"指纹定位中";
+                }
                 ok = NO;
                 [self startSigScanFor:it key:key pid:pid];
             }
