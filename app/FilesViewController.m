@@ -16,6 +16,8 @@ static NSString *const kMediaDir = @"/var/mobile/Media";
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    self.edgesForExtendedLayout = UIRectEdgeNone;
+    self.extendedLayoutIncludesOpaqueBars = NO;
     self.title = @"读取结果";
     self.view.backgroundColor = [UIColor systemBackgroundColor];
     self.items = [NSMutableArray array];

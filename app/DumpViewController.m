@@ -60,6 +60,8 @@ static NSString *MemReadHexPage(NSString *path, unsigned long long offset, unsig
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    self.edgesForExtendedLayout = UIRectEdgeNone;
+    self.extendedLayoutIncludesOpaqueBars = NO;
     self.title = self.path.lastPathComponent;
     self.view.backgroundColor = [UIColor systemBackgroundColor];
 

@@ -21,6 +21,9 @@ static const unsigned long long kTextPage = 262144;   // 256 KB / 页
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    // 关键：不让内容延伸到导航栏下面（否则顶部搜索框会被导航栏盖住，点不到）
+    self.edgesForExtendedLayout = UIRectEdgeNone;
+    self.extendedLayoutIncludesOpaqueBars = NO;
     self.view.backgroundColor = [UIColor systemBackgroundColor];
     self.title = self.path.lastPathComponent;
 
