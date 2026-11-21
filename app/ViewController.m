@@ -75,18 +75,30 @@ static UIImage *MemReadResizeIcon(UIImage *img, CGFloat side) {
     [self.view addSubview:self.table];
 
     // 系统搜索框：位置由导航栏管理，不会被状态栏压住
-    self.searchController = [[UISearchController alloc] initWithSearchResultsController:nil];
-    self.searchController.searchResultsUpdater = self;
-    self.searchController.obscuresBackgroundDuringPresentation = NO;
-    self.searchController.searchBar.placeholder = @"搜索名字或 Bundle ID";
-    self.searchController.searchBar.autocorrectionType = UITextAutocorrectionTypeNo;
-    self.searchController.searchBar.spellCheckingType = UITextSpellCheckingTypeNo;
-    self.searchController.searchBar.autocapitalizationType = UITextAutocapitalizationTypeNone;
-    self.searchController.searchBar.smartQuotesType = UITextSmartQuotesTypeNo;
-    self.searchController.searchBar.smartDashesType = UITextSmartDashesTypeNo;
-    self.navigationItem.searchController = self.searchController;
-    self.navigationItem.hidesSearchBarWhenScrolling = NO;
-    self.definesPresentationContext = YES;
+    // 但本进程若拿不到 GPU（EAGL/Metal 均为 nil），键盘候选栏会触发 CoreImage 崩，
+    // 这时自动退回「字母索引 + 剪贴板」模式，保证能用不崩。
+    extern BOOL MemReadGPUAvailable(void);
+    BOOL gpuOK = MemReadGPUAvailable();
+    if (gpuOK) {
+        self.searchController = [[UISearchController alloc] initWithSearchResultsController:nil];
+        self.searchController.searchResultsUpdater = self;
+        self.searchController.obscuresBackgroundDuringPresentation = NO;
+        self.searchController.searchBar.placeholder = @"搜索名字或 Bundle ID";
+        self.searchController.searchBar.autocorrectionType = UITextAutocorrectionTypeNo;
+        self.searchController.searchBar.spellCheckingType = UITextSpellCheckingTypeNo;
+        self.searchController.searchBar.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        self.searchController.searchBar.smartQuotesType = UITextSmartQuotesTypeNo;
+        self.searchController.searchBar.smartDashesType = UITextSmartDashesTypeNo;
+        self.navigationItem.searchController = self.searchController;
+        self.navigationItem.hidesSearchBarWhenScrolling = NO;
+        self.definesPresentationContext = YES;
+    } else {
+        self.navigationItem.leftBarButtonItem =
+            [[UIBarButtonItem alloc] initWithTitle:@"剪贴板"
+                                             style:UIBarButtonItemStylePlain
+                                            target:self
+                                            action:@selector(onClipboard)];
+    }
 
     // 结果页放右上，读取产物（dump / 扫描报告）都在这里看和删
     self.navigationItem.rightBarButtonItem =

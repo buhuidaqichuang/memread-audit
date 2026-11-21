@@ -31,6 +31,20 @@ static void MemReadEnvLine(NSString *fmt, ...) {
     [s writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
+static BOOL g_memread_gpu_ok = YES;
+
+BOOL MemReadGPUAvailable(void) { return g_memread_gpu_ok; }
+
+// 可在运行期重复调用的 GPU 自检（写进 memread_env.txt）
+void MemReadEnvGPUCheck(const char *tag) {
+    EAGLContext *g = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2];
+    MemReadEnvLine(@"gpu@%s eagl_es2=%@", tag, g ? @"OK" : @"NIL");
+    if (g) MemReadEnvLine(@"gpu@%s eagl=%@", tag, [g debugDescription]);
+    id<MTLDevice> d = MTLCreateSystemDefaultDevice();
+    MemReadEnvLine(@"gpu@%s metal=%@", tag, d ? d.name : @"NIL");
+    g_memread_gpu_ok = (g != nil || d != nil);
+}
+
 static void MemReadEnvSelfCheck(void) {
     MemReadEnvLine(@"========== launch %@", [NSDate date]);
     MemReadEnvLine(@"uid=%d euid=%d gid=%d pid=%d", getuid(), geteuid(), getgid(), getpid());
@@ -55,6 +69,7 @@ static void MemReadEnvSelfCheck(void) {
 
     EAGLContext *gl = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2];
     MemReadEnvLine(@"eagl_es2=%@", gl ? @"OK" : @"NIL");
+    g_memread_gpu_ok = (gl != nil);
 
     // CoreImage 走的是 OpenGL ES；这里记录能否加载驱动与拿到 glGetString
     void *hGL = dlopen("/System/Library/Frameworks/OpenGLES.framework/OpenGLES", RTLD_NOW | RTLD_GLOBAL);
@@ -66,6 +81,7 @@ static void MemReadEnvSelfCheck(void) {
 
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     MemReadEnvLine(@"metal_device=%@", dev ? dev.name : @"NIL");
+    if (dev) g_memread_gpu_ok = YES;
 
     // 图标资源是否真的进包
     NSString *b = [[NSBundle mainBundle] bundlePath];
