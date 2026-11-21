@@ -6,8 +6,11 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <QuartzCore/QuartzCore.h>
+#include <stdarg.h>
 
 #pragma mark - 静默音频（后台保活）
+
+static void *MemPipPossibleCtx = &MemPipPossibleCtx;
 
 static NSString *MemSilencePath(void) {
     NSString *p = @"/tmp/memread_silence.wav";
@@ -118,6 +121,10 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
 @property (nonatomic, assign) double interval;
 @property (nonatomic, assign) BOOL paused;
 @property (nonatomic, assign) BOOL watchSaved;   // YES：监控已保存地址；NO：收敛候选
+@property (nonatomic, assign) BOOL retried;
+@property (nonatomic, assign) int frames;
+@property (nonatomic, assign) BOOL kvoAdded;
+- (void)logMsg:(NSString *)fmt, ...;
 @property (nonatomic, assign) unsigned long long lastLeft;
 @end
 
@@ -144,6 +151,35 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
 
 - (void)dealloc {
     if (_timer) dispatch_source_cancel(_timer);
+    if (self.kvoAdded) {
+        @try { [self.pip removeObserver:self forKeyPath:@"pictureInPicturePossible"]; } @catch (NSException *e) {}
+    }
+}
+
+- (void)logMsg:(NSString *)fmt, ... {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSLog(@"[PiP] %@", msg);
+
+    NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    df.dateFormat = @"HH:mm:ss";
+    NSString *line = [NSString stringWithFormat:@"%@  %@\n", [df stringFromDate:[NSDate date]], msg];
+    NSString *path = @"/var/mobile/Media/memread_pip.log";
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (fh) {
+        @try {
+            [fh seekToEndOfFile];
+            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        } @catch (NSException *e) {}
+    } else {
+        [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+    }
+
+    void (^h)(NSString *) = self.statusHandler;
+    if (h) dispatch_async(dispatch_get_main_queue(), ^{ h(msg); });
 }
 
 - (BOOL)isRunning {
@@ -171,6 +207,10 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
     if (self.sbLayer.superlayer != host.layer) {
         [host.layer addSublayer:self.sbLayer];
     }
+    [self logMsg:@"挂载预览 host=%.0fx%.0f layer=%.0fx%.0f window=%@",
+             host.bounds.size.width, host.bounds.size.height,
+             self.sbLayer.frame.size.width, self.sbLayer.frame.size.height,
+             host.window ? @"有" : @"无"];
 }
 
 #pragma mark 启停
@@ -199,6 +239,8 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
     self.lastLeft = memread_valscan_count();
     [self renderLeft:self.lastLeft changed:0 rows:@[]];
     [self.pip startPictureInPicture];
+    [self logMsg:@"已请求 startPictureInPicture（候选模式）active=%d possible=%d",
+             (int)self.pip.isPictureInPictureActive, (int)self.pip.isPictureInPicturePossible];
     [self startTimer];
     return YES;
 }
@@ -209,11 +251,18 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
     self.watchSaved = YES;
     [self renderSaved:[self savedRowsWithPid:pid]];
     [self.pip startPictureInPicture];
+    [self logMsg:@"已请求 startPictureInPicture（地址监控）active=%d possible=%d",
+             (int)self.pip.isPictureInPictureActive, (int)self.pip.isPictureInPicturePossible];
     [self startTimer];
     return YES;
 }
 
 - (BOOL)beginWithPid:(pid_t)pid interval:(double)interval {
+    [self logMsg:@"开始: pid=%d layer=%@ host=%@ supported=%d possible=%d window=%@",
+             (int)pid, self.sbLayer ? @"Y" : @"N", self.host ? @"Y" : @"N",
+             (int)[AVPictureInPictureController isPictureInPictureSupported],
+             (int)self.pip.isPictureInPicturePossible,
+             self.host.window ? @"有" : @"无"];
     if (pid <= 0) return NO;
     if (!self.sbLayer || !self.host) return NO;
     if (![AVPictureInPictureController isPictureInPictureSupported]) return NO;
@@ -223,6 +272,8 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
     self.pid = pid;
     self.interval = (interval < 0.5) ? 0.5 : interval;
     self.paused = NO;
+    self.retried = NO;
+    self.frames = 0;
 
     [self startAudio];
 
@@ -236,8 +287,23 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
     }
     self.pip.canStartPictureInPictureAutomaticallyFromInline = YES;
 
+    if (!self.kvoAdded) {
+        [self.pip addObserver:self forKeyPath:@"pictureInPicturePossible"
+                      options:NSKeyValueObservingOptionNew context:MemPipPossibleCtx];
+        self.kvoAdded = YES;
+    }
     _running = YES;
     return YES;
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
+                        change:(NSDictionary *)change context:(void *)context {
+    if (context == MemPipPossibleCtx) {
+        [self logMsg:@"pictureInPicturePossible=%d",
+                 (int)[(AVPictureInPictureController *)object isPictureInPicturePossible]];
+        return;
+    }
+    [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
 }
 
 - (void)stop {
@@ -337,6 +403,11 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
         }
         [self.sbLayer enqueueSampleBuffer:sb];
         CFRelease(sb);
+        self.frames++;
+        if (self.frames <= 3 || self.frames % 20 == 0) {
+            [self logMsg:@"入队第 %d 帧 layer.status=%ld ready=%d",
+                     self.frames, (long)self.sbLayer.status, (int)self.sbLayer.readyForMoreMediaData];
+        }
     }
     CVPixelBufferRelease(pb);
 }
@@ -455,18 +526,30 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
 #pragma mark - PiP 代理
 
 - (void)pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)c {
+    [self logMsg:@"PiP 已启动 active=%d", (int)c.isPictureInPictureActive];
     [self renderLeft:memread_valscan_count() changed:0 rows:@[]];
 }
 
 - (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)c {
+    [self logMsg:@"PiP 已被系统关闭"];
     [self stop];
 }
 
 - (void)pictureInPictureController:(AVPictureInPictureController *)c
         failedToStartPictureInPictureWithError:(NSError *)error {
-    NSLog(@"[FloatPanel] PiP 启动失败: %@", error);
-    _running = NO;
-    [self stopTimer];
+    [self logMsg:@"PiP 启动失败: %@ code=%ld %@", error.domain, (long)error.code, error.localizedDescription];
+    if (!self.retried) {
+        self.retried = YES;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (!_running) return;
+            [self logMsg:@"重试 startPictureInPicture possible=%d", (int)self.pip.isPictureInPicturePossible];
+            [self.pip startPictureInPicture];
+        });
+    } else {
+        _running = NO;
+        [self stopTimer];
+    }
 }
 
 #pragma mark - 播放代理

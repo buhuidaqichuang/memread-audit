@@ -8,6 +8,9 @@
 
 @property (nonatomic, readonly, getter=isRunning) BOOL running;
 
+// 诊断输出（App 内进度框直接显示，同时写 /var/mobile/Media/memread_pip.log）
+@property (nonatomic, copy) void (^statusHandler)(NSString *line);
+
 // 预览层挂到给定容器（必须在窗口内、非隐藏），建议 16:9
 - (void)attachPreviewTo:(UIView *)host;
 

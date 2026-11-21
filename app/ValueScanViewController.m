@@ -146,6 +146,11 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
     self.previewBox = previewBox;
     [[FloatPanelController shared] attachPreviewTo:previewBox];
 
+    __weak typeof(self) ws = self;
+    [FloatPanelController shared].statusHandler = ^(NSString *line) {
+        [ws appendProgressLine:line];
+    };
+
     self.progressView = [[UITextView alloc] initWithFrame:CGRectMake(10, 100, W - 20, panelH - 106)];
     self.progressView.editable = NO;
     self.progressView.selectable = NO;
