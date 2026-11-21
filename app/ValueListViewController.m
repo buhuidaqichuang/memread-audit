@@ -399,10 +399,20 @@
         }
     }
 
+    // 数值字节在三帧之间是否真的变了：这才是「指纹是否够松」的唯一判据
+    BOOL valueChanged = NO;
+    for (NSUInteger f = 1; f < n && !valueChanged; f++) {
+        unsigned char other[MEMREAD_SIG_LEN];
+        [self.sigFrames[f] getBytes:other length:MEMREAD_SIG_LEN];
+        for (int i = MEMREAD_SIG_PRE; i < MEMREAD_SIG_PRE + vb; i++) {
+            if (other[i] != first[i]) { valueChanged = YES; break; }
+        }
+    }
+
     if (stable >= 12) {
         [self hideSigPanel];
         [self promptSaveSigWin:MEMREAD_SIG_LEN targetOff:MEMREAD_SIG_PRE
-                           offs:offs vals:vals type:self.sigVt stable:stable];
+                           offs:offs vals:vals type:self.sigVt stable:stable valueChanged:valueChanged];
         return;
     }
     if (n >= 6) {
@@ -435,23 +445,22 @@
 
 
 - (void)promptSaveSigWin:(int)win targetOff:(int)toff offs:(NSArray<NSNumber *> *)offs
-                     vals:(NSArray<NSNumber *> *)vals type:(int)vt stable:(int)stable {
+                     vals:(NSArray<NSNumber *> *)vals type:(int)vt stable:(int)stable
+              valueChanged:(BOOL)valueChanged {
     char pbuf[MEMREAD_PROC_PATH_MAX] = {0};
     NSString *procPath = @"";
     if (memread_proc_path(self.pid, pbuf, sizeof(pbuf)) == 0 && pbuf[0]) {
         procPath = [NSString stringWithUTF8String:pbuf] ?: @"";
     }
-    NSString *extra = @"";
-    if (stable >= 110) {
-        extra = [NSString stringWithFormat:
-            @"\n\n注意：这次采样数值几乎没变化（稳定字节 %d/%d）。指纹太严，重启后可能扫不到；"
-            @"建议退回游戏让数值变化（开枪/切枪）再重采一次。", stable, win];
-    }
+    NSString *extra = valueChanged
+        ? @"\n\n三帧里数值确实变了，指纹正常（数值那 4 字节已单独剔除）。"
+        : @"\n\n⚠️ 三帧里数值一个字节都没变：说明这三枪没有改到这个地址的数值（可能开的不是这把枪，"
+          @"或者这行不是数值本身）。这时指纹几乎整窗绑定，重启后很难扫到，建议取消重采。";
     UIAlertController *a = [UIAlertController
-        alertControllerWithTitle:@"保存值指纹"
+        alertControllerWithTitle:(valueChanged ? @"保存值指纹" : @"指纹可能不可靠")
                          message:[NSString stringWithFormat:
-                                  @"窗口 %d 字节，稳定字节 %d 个，类型 %@\n\n"
-                                  @"重启游戏后点这行的「读」会先扫堆找指纹，找到再按同一偏移读值。%@",
+                                  @"窗口 %d 字节，稳定字节 %d 个，类型 %@%@\n\n"
+                                  @"重启游戏后点这行的「读」会先扫堆找指纹，找到再按同一偏移读值。",
                                   win, stable, [SavedAddressStore typeName:vt], extra]
                   preferredStyle:UIAlertControllerStyleAlert];
     [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
