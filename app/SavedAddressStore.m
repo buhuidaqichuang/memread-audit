@@ -18,6 +18,9 @@ static uint64_t MemParseAddr(NSString *s) {
 - (BOOL)hasChain {
     return self.moduleUUID.length > 0 && self.chainOffsets.count > 0;
 }
+- (BOOL)hasSig {
+    return self.sigOffs.count > 0 && self.sigVals.count == self.sigOffs.count;
+}
 @end
 
 @implementation SavedAddressStore {
@@ -96,6 +99,18 @@ static uint64_t MemParseAddr(NSString *s) {
         }
         NSString *pp = d[@"proc"];
         s.procPath = [pp isKindOfClass:[NSString class]] ? pp : @"";
+        NSNumber *sw = d[@"swin"];
+        s.sigWin = [sw isKindOfClass:[NSNumber class]] ? sw.intValue : 0;
+        NSNumber *st = d[@"stoff"];
+        s.sigTargetOff = [st isKindOfClass:[NSNumber class]] ? st.intValue : 0;
+        id so = d[@"soffs"], sv = d[@"svals"];
+        if ([so isKindOfClass:[NSArray class]] && [sv isKindOfClass:[NSArray class]]) {
+            s.sigOffs = (NSArray *)so;
+            s.sigVals = (NSArray *)sv;
+        } else {
+            s.sigOffs = @[];
+            s.sigVals = @[];
+        }
         [out addObject:s];
     }
     return out;
@@ -158,6 +173,34 @@ static uint64_t MemParseAddr(NSString *s) {
         @"cname": (name.length ? name : @""),
         @"coff": @(staticOff),
         @"cchain": co,
+        @"proc": (procPath.length ? procPath : @""),
+        @"ts": [NSString stringWithFormat:@"%.0f", [NSDate date].timeIntervalSince1970]
+    };
+    [_items addObject:d];
+    return [self persist];
+}
+
+- (BOOL)addSignatureWin:(int)win targetOff:(int)toff
+                    offs:(NSArray<NSNumber *> *)offs vals:(NSArray<NSNumber *> *)vals
+                    type:(int)type label:(NSString *)label group:(NSString *)group
+                procPath:(NSString *)procPath {
+    if (!offs.count || offs.count != vals.count || win <= 0) return NO;
+    NSString *lb = [label stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (!lb.length) lb = @"未命名";
+    NSString *gp = [group stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSDictionary *d = @{
+        @"addr": @"0x0",
+        @"type": @(type),
+        @"label": lb,
+        @"group": gp.length ? gp : @"",
+        @"note": @"",
+        @"muuid": @"",
+        @"mname": @"",
+        @"moff": @(0),
+        @"swin": @(win),
+        @"stoff": @(toff),
+        @"soffs": offs,
+        @"svals": vals,
         @"proc": (procPath.length ? procPath : @""),
         @"ts": [NSString stringWithFormat:@"%.0f", [NSDate date].timeIntervalSince1970]
     };

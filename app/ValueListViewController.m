@@ -125,11 +125,11 @@
         c.detailTextLabel.font = [UIFont systemFontOfSize:12];
         c.detailTextLabel.textColor = [UIColor secondaryLabelColor];
 
-        UIView *acc = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 92, 32)];
+        UIView *acc = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 132, 32)];
         UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
         [b setTitle:@"读" forState:UIControlStateNormal];
         b.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
-        b.frame = CGRectMake(0, 0, 44, 32);
+        b.frame = CGRectMake(0, 0, 40, 32);
         b.tag = (NSInteger)idx;
         [b addTarget:self action:@selector(readRowTapped:) forControlEvents:UIControlEventTouchUpInside];
         [acc addSubview:b];
@@ -137,10 +137,18 @@
         UIButton *cb = [UIButton buttonWithType:UIButtonTypeSystem];
         [cb setTitle:@"链" forState:UIControlStateNormal];
         cb.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
-        cb.frame = CGRectMake(48, 0, 44, 32);
+        cb.frame = CGRectMake(44, 0, 40, 32);
         cb.tag = (NSInteger)idx;
         [cb addTarget:self action:@selector(chainRowTapped:) forControlEvents:UIControlEventTouchUpInside];
         [acc addSubview:cb];
+
+        UIButton *sb = [UIButton buttonWithType:UIButtonTypeSystem];
+        [sb setTitle:@"签" forState:UIControlStateNormal];
+        sb.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+        sb.frame = CGRectMake(88, 0, 40, 32);
+        sb.tag = (NSInteger)idx;
+        [sb addTarget:self action:@selector(sigRowTapped:) forControlEvents:UIControlEventTouchUpInside];
+        [acc addSubview:sb];
 
         c.accessoryView = acc;
     } else {
@@ -230,6 +238,117 @@
         [ws runChainScan:pid target:a type:vt cancel:cancelFlag];
     }]];
     [self presentViewController:ask animated:YES completion:nil];
+}
+
+#pragma mark - 值签名（网络同步数据：不靠指针链，靠周围字节指纹）
+
+- (int)valueBytesForType:(int)vt {
+    if (vt == MEMREAD_VALTYPE_INT64 || vt == MEMREAD_VALTYPE_DOUBLE) return 8;
+    return 4;
+}
+
+- (void)sigRowTapped:(UIButton *)sender {
+    unsigned long long idx = (unsigned long long)sender.tag;
+    if (idx >= memread_valscan_count()) return;
+    uint64_t a = 0, prev = 0;
+    int vt = self.type;
+    if (memread_valscan_get_ex(idx, &a, &prev, &vt) != 0) return;
+    if (vt == MEMREAD_VALTYPE_AUTO) vt = MEMREAD_VALTYPE_INT32;
+
+    NSString *msg = [NSString stringWithFormat:
+        @"目标 0x%llX（%@）\n\n采样会连读 4 次（约 1.2 秒），期间请让这个数值变化（开枪/切枪/走两步）。\n"
+        @"只保留完全不变的字节做指纹，会变的字节自动排除。",
+        a, [SavedAddressStore typeName:vt]];
+    UIAlertController *ask = [UIAlertController alertControllerWithTitle:@"采样值指纹"
+                                                                message:msg
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ask addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) ws = self;
+    [ask addAction:[UIAlertAction actionWithTitle:@"开始采样" style:UIAlertActionStyleDefault
+                                          handler:^(UIAlertAction *x) {
+        [ws captureSignatureAt:a type:vt bytes:[ws valueBytesForType:vt]];
+    }]];
+    [self presentViewController:ask animated:YES completion:nil];
+}
+
+- (void)captureSignatureAt:(uint64_t)addr type:(int)vt bytes:(int)vb {
+    UIAlertController *busy = [UIAlertController alertControllerWithTitle:@"采样中"
+                                                                  message:@"保持数值在变化（开枪/切枪）"
+                                                           preferredStyle:UIAlertControllerStyleAlert];
+    [self presentViewController:busy animated:YES completion:nil];
+    memread_sig_t *sig = (memread_sig_t *)calloc(1, sizeof(memread_sig_t));
+    pid_t pid = self.pid;
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        int rc = sig ? memread_sig_capture(pid, addr, vb, sig) : -4;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) self2 = ws;
+            if (!self2) { free(sig); return; }
+            [self2 dismissViewControllerAnimated:YES completion:^{
+                if (!sig || rc != 0) {
+                    UIAlertController *e = [UIAlertController
+                        alertControllerWithTitle:@"采样失败"
+                                         message:[NSString stringWithFormat:
+                                                  @"rc=%d\n稳定字节不够（至少 12 个）。可能这个地址周围本身都是易变字段，换个相邻地址再试。", rc]
+                                  preferredStyle:UIAlertControllerStyleAlert];
+                    [e addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+                    [self2 presentViewController:e animated:YES completion:nil];
+                    free(sig);
+                    return;
+                }
+                NSMutableArray<NSNumber *> *offs = [NSMutableArray array];
+                NSMutableArray<NSNumber *> *vals = [NSMutableArray array];
+                for (int i = 0; i < sig->stable_n; i++) {
+                    [offs addObject:@(sig->offs[i])];
+                    [vals addObject:@(sig->vals[i])];
+                }
+                [self2 promptSaveSigWin:sig->win targetOff:sig->target_off offs:offs vals:vals
+                                    type:vt stable:sig->stable_n];
+                free(sig);
+            }];
+        });
+    });
+}
+
+- (void)promptSaveSigWin:(int)win targetOff:(int)toff offs:(NSArray<NSNumber *> *)offs
+                     vals:(NSArray<NSNumber *> *)vals type:(int)vt stable:(int)stable {
+    char pbuf[MEMREAD_PROC_PATH_MAX] = {0};
+    NSString *procPath = @"";
+    if (memread_proc_path(self.pid, pbuf, sizeof(pbuf)) == 0 && pbuf[0]) {
+        procPath = [NSString stringWithUTF8String:pbuf] ?: @"";
+    }
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"保存值指纹"
+                         message:[NSString stringWithFormat:
+                                  @"窗口 %d 字节，稳定字节 %d 个，类型 %@\n\n"
+                                  @"重启游戏后点这行的「读」会先扫堆找指纹，找到再按同一偏移读值。",
+                                  win, stable, [SavedAddressStore typeName:vt]]
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"标签名，如 M4 弹匣 / 玩家血量";
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    NSArray<NSString *> *groups = [[SavedAddressStore shared] groupNames];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = groups.count
+            ? [NSString stringWithFormat:@"分组（已有：%@）", [groups componentsJoinedByString:@"/"]]
+            : @"分组，如 M4 / AK（可留空）";
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) {
+        NSString *label = a.textFields[0].text;
+        NSString *group = a.textFields[1].text;
+        BOOL ok = [[SavedAddressStore shared] addSignatureWin:win targetOff:toff offs:offs vals:vals
+                                                         type:vt label:label group:group procPath:procPath];
+        UIAlertController *r = [UIAlertController alertControllerWithTitle:(ok ? @"已保存" : @"保存失败")
+                                                                   message:(ok ? @"指纹已写入 memread_saved.json" : @"字段缺失")
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+        [r addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:r animated:YES completion:nil];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 - (void)runChainScan:(pid_t)pid target:(uint64_t)addr type:(int)vt cancel:(int *)cancelFlag {

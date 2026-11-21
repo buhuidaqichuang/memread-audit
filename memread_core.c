@@ -2384,6 +2384,163 @@ void memread_chain_progress(int *level, unsigned long long *done, unsigned long 
     if (results) *results = g_chain_results;
 }
 
+#pragma mark - 值签名重定位（网络同步的数值：不靠指针链，靠周围字节指纹）
+
+#define MEMREAD_SIG_PRE         32
+#define MEMREAD_SIG_LEN         128
+#define MEMREAD_SIG_MAX_STABLE  128
+#define MEMREAD_SIG_SAMPLES     4
+#define MEMREAD_SIG_RESULT_CAP  32
+
+static int sig_read_block(task_t task, uint64_t addr, int len, unsigned char *buf) {
+    mach_vm_size_t got = 0;
+    kern_return_t kr = mach_vm_read_overwrite(task, (mach_vm_address_t)addr, (mach_vm_size_t)len,
+                                             (mach_vm_address_t)buf, &got);
+    if (kr != KERN_SUCCESS || got != (mach_vm_size_t)len) return -1;
+    return 0;
+}
+
+// 采样：连读 4 次（每次间隔 300ms），只保留完全不变的字节；目标数值本身的字节强制排除
+int memread_sig_capture(pid_t pid, uint64_t addr, int value_size, memread_sig_t *out) {
+    if (!out) return -2;
+    memset(out, 0, sizeof(*out));
+    if (addr < MEMREAD_SIG_PRE) return -3;
+    task_t task = MACH_PORT_NULL;
+    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
+
+    uint64_t start = addr - MEMREAD_SIG_PRE;
+    unsigned char buf[MEMREAD_SIG_SAMPLES][MEMREAD_SIG_LEN];
+    int ok = 1;
+    for (int k = 0; k < MEMREAD_SIG_SAMPLES; k++) {
+        if (sig_read_block(task, start, MEMREAD_SIG_LEN, buf[k]) != 0) { ok = 0; break; }
+        if (k + 1 < MEMREAD_SIG_SAMPLES) usleep(300 * 1000);
+    }
+    mach_port_deallocate(mach_task_self(), task);
+    if (!ok) return -3;
+
+    out->win = MEMREAD_SIG_LEN;
+    out->target_off = MEMREAD_SIG_PRE;
+    int n = 0;
+    for (int i = 0; i < MEMREAD_SIG_LEN; i++) {
+        if (i >= MEMREAD_SIG_PRE && i < MEMREAD_SIG_PRE + value_size) continue;   // 数值会变，不能进指纹
+        int same = 1;
+        for (int k = 1; k < MEMREAD_SIG_SAMPLES; k++) {
+            if (buf[k][i] != buf[0][i]) { same = 0; break; }
+        }
+        if (!same) continue;
+        if (n >= MEMREAD_SIG_MAX_STABLE) break;
+        out->offs[n] = (uint8_t)i;
+        out->vals[n] = buf[0][i];
+        n++;
+    }
+    out->stable_n = n;
+    fprintf(stderr, "签名采样: 稳定字节 %d/%d\n", n, MEMREAD_SIG_LEN);
+    return (n >= 12) ? 0 : -4;
+}
+
+// 在可写内存里找指纹，返回候选目标地址（按匹配度降序，最多 cap 条）
+// 网络同步的结构体会带时间戳/序号等易变字段，所以不要求 100% 命中：≥75% 稳定字节即可，
+// 再按匹配度高低的顺序返回。取消返回 -5。
+typedef struct { uint64_t addr; int score; } sig_hit_t;
+
+static int sig_hit_cmp(const void *a, const void *b) {
+    const sig_hit_t *x = (const sig_hit_t *)a;
+    const sig_hit_t *y = (const sig_hit_t *)b;
+    if (x->score != y->score) return (y->score - x->score);
+    return (x->addr < y->addr) ? -1 : (x->addr > y->addr);
+}
+
+int memread_sig_scan(pid_t pid, const memread_sig_t *sig, uint64_t *out, int cap,
+                     volatile int *cancel) {
+    if (!sig || !out || cap <= 0 || sig->stable_n <= 0) return -2;
+    task_t task = MACH_PORT_NULL;
+    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
+
+    int need = sig->stable_n * 3 / 4;
+    if (need < 8) need = 8;
+    if (need > sig->stable_n) need = sig->stable_n;
+
+    const mach_vm_size_t CHUNK = 4ULL * 1024 * 1024;
+    unsigned char *buf = (unsigned char *)malloc((size_t)CHUNK);
+    if (!buf) {
+        mach_port_deallocate(mach_task_self(), task);
+        return -4;
+    }
+
+    enum { HIT_CAP = 512 };
+    sig_hit_t *hits = (sig_hit_t *)calloc(HIT_CAP, sizeof(sig_hit_t));
+    if (!hits) { free(buf); mach_port_deallocate(mach_task_self(), task); return -4; }
+    int nh = 0;
+    int cancelled = 0;
+
+    mach_vm_address_t addr = 0;
+    for (;;) {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        kern_return_t kr = mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
+                                         (vm_region_info_t)&info, &cnt, &obj);
+        if (kr != KERN_SUCCESS || size == 0) break;
+
+        if (snap_region_ok(&info, size)) {
+            uint64_t off = 0;
+            while (off + 8 <= (uint64_t)size) {
+                if (cancel && *cancel) { cancelled = 1; break; }
+                mach_vm_size_t cur = (mach_vm_size_t)((size - off > CHUNK) ? CHUNK : (size - off));
+                if (cur < (mach_vm_size_t)(sig->win + 8)) { off += cur; continue; }
+                mach_vm_size_t got = 0;
+                kr = mach_vm_read_overwrite(task, addr + off, cur, (mach_vm_address_t)buf, &got);
+                if (kr != KERN_SUCCESS || got != cur) { off += cur; continue; }
+
+                for (mach_vm_size_t pos = sig->target_off; pos + 4 <= cur; pos += 4) {
+                    int base = (int)pos - sig->target_off;
+                    if (base + sig->win > (int)cur) break;
+                    // 先用前 6 个稳定字节快速过滤
+                    int quick = (sig->stable_n < 6) ? sig->stable_n : 6;
+                    int pass = 1;
+                    for (int i = 0; i < quick; i++) {
+                        if (buf[base + sig->offs[i]] != sig->vals[i]) { pass = 0; break; }
+                    }
+                    if (!pass) continue;
+                    int score = 0;
+                    for (int i = 0; i < sig->stable_n; i++) {
+                        if (buf[base + sig->offs[i]] == sig->vals[i]) score++;
+                    }
+                    if (score < need) continue;
+                    uint64_t cand = (uint64_t)addr + off + pos;
+                    // 64 字节内视为同一对象，只保留分数高的那个
+                    int merged = 0;
+                    for (int i = 0; i < nh; i++) {
+                        uint64_t d = hits[i].addr > cand ? hits[i].addr - cand : cand - hits[i].addr;
+                        if (d <= 64) {
+                            if (score > hits[i].score) { hits[i].addr = cand; hits[i].score = score; }
+                            merged = 1;
+                            break;
+                        }
+                    }
+                    if (merged) continue;
+                    if (nh < HIT_CAP) { hits[nh].addr = cand; hits[nh].score = score; nh++; }
+                }
+                off += cur;
+            }
+        }
+        if (cancelled) break;
+        addr += size;
+    }
+
+    qsort(hits, (size_t)nh, sizeof(sig_hit_t), sig_hit_cmp);
+    int n = 0;
+    for (int i = 0; i < nh && n < cap; i++) out[n++] = hits[i].addr;
+
+    free(hits);
+    free(buf);
+    mach_port_deallocate(mach_task_self(), task);
+    fprintf(stderr, "签名扫描: 命中 %d 处（阈值 %d/%d）\n", n, need, sig->stable_n);
+    if (cancelled && n == 0) return -5;
+    return n;
+}
+
 // 按保存下来的链（模块 UUID + 静态槽偏移 + 各级偏移）算出本轮目标地址
 // 返回 0 成功；2 = 模块未加载；-3 = 链断了（指针不可读或越界）
 int memread_chain_resolve(pid_t pid, const char *uuid, uint64_t static_off,

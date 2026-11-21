@@ -192,7 +192,7 @@ static uint64_t SaveParseAddr(NSString *s) {
         for (NSUInteger i = 0; i < items.count; i++) {
             SavedAddress *s = items[i];
             NSNumber *ra = resolved[@(i)];
-            if (!ra) { res[@(i)] = @"模块未加载"; continue; }
+            if (!ra) { res[@(i)] = s.hasSig ? @"指纹（未定位）" : @"模块未加载"; continue; }
             double v = 0;
             int rc = memread_read_scalar(pid, ra.unsignedLongLongValue, s.type, &v);
             res[@(i)] = (rc == 0)
@@ -236,6 +236,11 @@ static uint64_t SaveParseAddr(NSString *s) {
             } else {
                 self.resolveNotes[@(i)] = [NSString stringWithFormat:@"解析失败 rc=%d（进程可能已变）", rc];
             }
+            continue;
+        }
+        if (s.hasSig) {
+            // 指纹不预先扫（要遍历整块可写内存），点「读」时再定位
+            self.resolveNotes[@(i)] = @"指纹（点读定位）";
             continue;
         }
         if (!s.inModule) {
@@ -368,6 +373,8 @@ static pid_t SavedFindPidForPath(NSString *path) {
     NSString *modText;
     if (s.hasChain) {
         modText = [NSString stringWithFormat:@"  链 %@", [self chainSummary:s]];
+    } else if (s.hasSig) {
+        modText = [NSString stringWithFormat:@"  指纹 %lu字节/窗%d", (unsigned long)s.sigOffs.count, s.sigWin];
     } else if (s.inModule) {
         modText = [NSString stringWithFormat:@"  %@+0x%llX", (s.moduleName.length ? s.moduleName : @"mod"), s.moduleOff];
     } else {
@@ -391,19 +398,12 @@ static pid_t SavedFindPidForPath(NSString *path) {
     return c;
 }
 
-// 「读」按钮：立刻读这条地址的最新值并刷新本行
-- (void)readRowTapped:(UIButton *)sender {
-    NSUInteger flat = (NSUInteger)sender.tag;
+// 「读」按钮：立刻读这条地址的最新值并刷新本行（指纹条目先定位再读）
+static volatile int gSigCancelFlag = 0;
+
+- (void)readValueAt:(uint64_t)addr flat:(NSUInteger)flat sender:(UIButton *)sender {
     if (flat >= self.items.count) return;
     SavedAddress *s = self.items[flat];
-    NSNumber *ra = self.resolved[@(flat)];
-    if (!ra) {
-        self.values[@(flat)] = (self.resolveNotes[@(flat)] ?: @"未解析");
-        NSIndexPath *ip = [self indexPathForFlat:flat];
-        if (ip) [self.table reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
-        return;
-    }
-    uint64_t addr = ra.unsignedLongLongValue;
     pid_t pid = self.pid;
     sender.enabled = NO;
     __weak typeof(self) ws = self;
@@ -421,6 +421,117 @@ static pid_t SavedFindPidForPath(NSString *path) {
             if (ip) [self2.table reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
         });
     });
+}
+
+- (void)readRowTapped:(UIButton *)sender {
+    NSUInteger flat = (NSUInteger)sender.tag;
+    if (flat >= self.items.count) return;
+    SavedAddress *s = self.items[flat];
+    NSNumber *ra = self.resolved[@(flat)];
+    if (!ra && s.hasSig) {
+        [self locateSignatureFor:s flat:flat sender:sender];
+        return;
+    }
+    if (!ra) {
+        self.values[@(flat)] = (self.resolveNotes[@(flat)] ?: @"未解析");
+        NSIndexPath *ip = [self indexPathForFlat:flat];
+        if (ip) [self.table reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
+        return;
+    }
+    [self readValueAt:ra.unsignedLongLongValue flat:flat sender:sender];
+}
+
+// 扫描指纹定位：命中 1 处直接读；多处让用户挑
+- (void)locateSignatureFor:(SavedAddress *)s flat:(NSUInteger)flat sender:(UIButton *)sender {
+    if (self.pid <= 0) {
+        UIAlertController *e = [UIAlertController alertControllerWithTitle:@"没有进程"
+                                                                   message:@"先绑定游戏进程再定位指纹"
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+        [e addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:e animated:YES completion:nil];
+        return;
+    }
+    memread_sig_t *sig = (memread_sig_t *)calloc(1, sizeof(memread_sig_t));
+    if (!sig) return;
+    sig->win = s.sigWin;
+    sig->target_off = s.sigTargetOff;
+    sig->stable_n = (int)MIN(s.sigOffs.count, (NSUInteger)MEMREAD_SIG_MAX_STABLE);
+    for (int i = 0; i < sig->stable_n; i++) {
+        sig->offs[i] = (unsigned char)[s.sigOffs[(NSUInteger)i] unsignedIntValue];
+        sig->vals[i] = (unsigned char)[s.sigVals[(NSUInteger)i] unsignedIntValue];
+    }
+    gSigCancelFlag = 0;
+    UIAlertController *busy = [UIAlertController alertControllerWithTitle:@"定位指纹"
+                                                                  message:@"正在扫可写内存…"
+                                                           preferredStyle:UIAlertControllerStyleAlert];
+    [busy addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel
+                                          handler:^(UIAlertAction *x) { gSigCancelFlag = 1; }]];
+    [self presentViewController:busy animated:YES completion:nil];
+
+    pid_t pid = self.pid;
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        uint64_t cand[64] = {0};
+        int n = memread_sig_scan(pid, sig, cand, 64, &gSigCancelFlag);
+        free(sig);
+        NSMutableArray<NSNumber *> *arr = [NSMutableArray array];
+        for (int i = 0; i < n && i < 64; i++) [arr addObject:@(cand[i])];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) self2 = ws;
+            if (!self2) return;
+            void (^afterDismiss)(void) = ^{
+                if (n < 0) {
+                    NSString *m = (n == -5) ? @"已取消" : [NSString stringWithFormat:@"扫描失败 rc=%d", n];
+                    UIAlertController *e = [UIAlertController alertControllerWithTitle:@"定位失败"
+                                                                               message:m
+                                                                        preferredStyle:UIAlertControllerStyleAlert];
+                    [e addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+                    [self2 presentViewController:e animated:YES completion:nil];
+                } else if (n == 0) {
+                    UIAlertController *e = [UIAlertController
+                        alertControllerWithTitle:@"没找到指纹"
+                                         message:@"这段字节已被改写或对象已销毁。\n回到游戏让这个数值出现（进对局/开镜），再点「读」。"
+                                  preferredStyle:UIAlertControllerStyleAlert];
+                    [e addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+                    [self2 presentViewController:e animated:YES completion:nil];
+                } else if (n == 1) {
+                    self2.resolved[@(flat)] = arr.firstObject;
+                    [self2 readValueAt:arr.firstObject.unsignedLongLongValue flat:flat sender:sender];
+                } else {
+                    [self2 chooseSignatureCandidate:arr flat:flat sender:sender];
+                }
+            };
+            if (self2.presentedViewController) {
+                [self2 dismissViewControllerAnimated:YES completion:afterDismiss];
+            } else {
+                afterDismiss();
+            }
+        });
+    });
+}
+
+- (void)chooseSignatureCandidate:(NSArray<NSNumber *> *)arr flat:(NSUInteger)flat sender:(UIButton *)sender {
+    NSString *title = [NSString stringWithFormat:@"找到 %lu 处相同指纹", (unsigned long)arr.count];
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:title
+                                                               message:@"挑一个，读到合理数值（比如弹匣数对上）就记住它"
+                                                        preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) ws = self;
+    NSUInteger shown = MIN(arr.count, 8);
+    for (NSUInteger i = 0; i < shown; i++) {
+        uint64_t ad = arr[i].unsignedLongLongValue;
+        [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"0x%llX", ad]
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *x) {
+            __strong typeof(ws) self2 = ws;
+            if (!self2) return;
+            self2.resolved[@(flat)] = @(ad);
+            [self2 readValueAt:ad flat:flat sender:sender];
+        }]];
+    }
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    a.popoverPresentationController.sourceView = sender;
+    a.popoverPresentationController.sourceRect = sender.bounds;
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {

@@ -20,6 +20,12 @@
 @property (nonatomic, readonly) BOOL hasChain;
 // 保存时记录的进程可执行路径：游戏重启后用它自动找回新 pid
 @property (nonatomic, copy) NSString *procPath;
+// 值签名指纹（网络同步数据用）：窗口内不随数值变化的字节
+@property (nonatomic, assign) int sigWin;
+@property (nonatomic, assign) int sigTargetOff;
+@property (nonatomic, copy) NSArray<NSNumber *> *sigOffs;
+@property (nonatomic, copy) NSArray<NSNumber *> *sigVals;
+@property (nonatomic, readonly) BOOL hasSig;
 @end
 
 // 已保存地址仓库：落盘 /var/mobile/Media/memread_saved.json，重装 App 不丢
@@ -48,6 +54,11 @@
 - (BOOL)addChain:(NSString *)uuid name:(NSString *)name staticOff:(uint64_t)staticOff
             offs:(NSArray<NSNumber *> *)offs type:(int)type label:(NSString *)label
            group:(NSString *)group note:(NSString *)note procPath:(NSString *)procPath;
+// 保存值指纹：offs/vals 为稳定字节在窗口内的偏移与值（0~255）
+- (BOOL)addSignatureWin:(int)win targetOff:(int)toff
+                    offs:(NSArray<NSNumber *> *)offs vals:(NSArray<NSNumber *> *)vals
+                    type:(int)type label:(NSString *)label group:(NSString *)group
+                procPath:(NSString *)procPath;
 - (BOOL)removeAtIndex:(NSUInteger)idx;
 - (BOOL)removeIndexes:(NSIndexSet *)indexes;   // 批量删除，一次落盘
 - (BOOL)renameAtIndex:(NSUInteger)idx label:(NSString *)label;

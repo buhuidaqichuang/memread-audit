@@ -485,7 +485,53 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
     });
 }
 
+// 指纹条目的定位缓存：同一进程内只扫一次，之后直接读；换 pid 自动失效（多线程访问用锁）
+static NSMutableDictionary<NSString *, NSNumber *> *MemSigCache = nil;
+static NSMutableSet<NSString *> *MemSigBusy = nil;
+static NSLock *MemSigLock = nil;
+
+static void MemSigLockInit(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        MemSigCache = [NSMutableDictionary dictionary];
+        MemSigBusy = [NSMutableSet set];
+        MemSigLock = [[NSLock alloc] init];
+    });
+}
+
+- (void)startSigScanFor:(SavedAddress *)it key:(NSString *)key pid:(pid_t)pid {
+    MemSigLockInit();
+    [MemSigLock lock];
+    BOOL busy = [MemSigBusy containsObject:key];
+    if (!busy) [MemSigBusy addObject:key];
+    [MemSigLock unlock];
+    if (busy) return;
+
+    memread_sig_t *sig = (memread_sig_t *)calloc(1, sizeof(memread_sig_t));
+    if (!sig) {
+        [MemSigLock lock]; [MemSigBusy removeObject:key]; [MemSigLock unlock];
+        return;
+    }
+    sig->win = it.sigWin;
+    sig->target_off = it.sigTargetOff;
+    sig->stable_n = (int)MIN(it.sigOffs.count, (NSUInteger)MEMREAD_SIG_MAX_STABLE);
+    for (int i = 0; i < sig->stable_n; i++) {
+        sig->offs[i] = (unsigned char)[it.sigOffs[(NSUInteger)i] unsignedIntValue];
+        sig->vals[i] = (unsigned char)[it.sigVals[(NSUInteger)i] unsignedIntValue];
+    }
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        uint64_t cand[8] = {0};
+        int n = memread_sig_scan(pid, sig, cand, 8, NULL);
+        free(sig);
+        [MemSigLock lock];
+        if (n > 0) MemSigCache[key] = @(cand[0]);
+        [MemSigBusy removeObject:key];
+        [MemSigLock unlock];
+    });
+}
+
 - (NSArray<NSDictionary *> *)savedRowsWithPid:(pid_t)pid {
+    MemSigLockInit();
     NSArray<SavedAddress *> *items = [[SavedAddressStore shared] allItems];
     NSMutableArray *rows = [NSMutableArray array];
     for (SavedAddress *it in items) {
@@ -507,6 +553,18 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
                 val = (rc == 2) ? @"模块未加载"
                                 : (rc == -3 ? [NSString stringWithFormat:@"链断@%d跳", hop] : @"链断了");
                 ok = NO;
+            }
+        } else if (it.hasSig) {
+            NSString *key = [NSString stringWithFormat:@"%d|%@|%@|%d", (int)pid,
+                             it.label ?: @"", it.group ?: @"", (int)it.type];
+            NSNumber *cached = nil;
+            [MemSigLock lock]; cached = MemSigCache[key]; [MemSigLock unlock];
+            if (cached) {
+                addr = cached.unsignedLongLongValue;
+            } else {
+                val = @"指纹定位中";
+                ok = NO;
+                [self startSigScanFor:it key:key pid:pid];
             }
         } else if (it.inModule) {
             uint64_t base = 0;
