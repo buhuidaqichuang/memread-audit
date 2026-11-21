@@ -58,4 +58,50 @@ int memread_list_procs(pid_t *pids, int max);
 // 取某 pid 的可执行文件路径，返回写入长度
 int memread_proc_path(pid_t pid, char *buf, size_t bufsz);
 
+// ================= 数值扫描 =================
+// 用途：找二进制 int/float 这类战斗数值（血量、子弹、坐标等），
+//       不走 A/B/C/D 字符串分级，也不落 dump，直接对可写区按类型对齐比对。
+
+// 数值类型
+#define MEMREAD_VALTYPE_INT32  0
+#define MEMREAD_VALTYPE_INT64  1
+#define MEMREAD_VALTYPE_FLOAT  2   // float32
+#define MEMREAD_VALTYPE_DOUBLE 3
+
+// 收敛条件
+#define MEMREAD_VALCOND_EQUAL     0   // 当前值 == target
+#define MEMREAD_VALCOND_NOT_EQUAL 1   // 当前值 != target
+#define MEMREAD_VALCOND_GREATER   2   // 当前值 >  target
+#define MEMREAD_VALCOND_LESS      3   // 当前值 <  target
+#define MEMREAD_VALCOND_INCREASED 4   // 当前值 >  上一轮
+#define MEMREAD_VALCOND_DECREASED 5   // 当前值 <  上一轮
+#define MEMREAD_VALCOND_CHANGED   6   // 当前值 != 上一轮
+#define MEMREAD_VALCOND_UNCHANGED 7   // 当前值 == 上一轮
+#define MEMREAD_VALCOND_DELTA     8   // (当前 - 上一轮) == target
+
+// 首扫：枚举可写区，按 type 步进比对，value±tol 内的地址写入候选（进程内保存）
+// 返回 0 成功；phits 回填候选数（可为 NULL）；cancel 指向非 0 时尽快停止（可为 NULL）
+int memread_valscan_first(pid_t pid, int rw_only, int type, double value, double tol,
+                          memread_region_cb cb, void *ctx,
+                          unsigned long long *phits, volatile int *cancel);
+
+// 收敛：对现有候选逐个重读当前值，按 cond 过滤（DELTA 用 target 作差值）
+// 返回 0 成功；phits 回填剩余候选数
+int memread_valscan_refine(pid_t pid, int type, int cond, double target,
+                           memread_region_cb cb, void *ctx,
+                           unsigned long long *phits, volatile int *cancel);
+
+// 读某个候选的当前值（结果列表点按查看）；返回 0 成功
+int memread_valscan_peek(pid_t pid, int type, unsigned long long index,
+                         uint64_t *out_addr, double *out_value);
+
+// 取候选的地址与上一轮原始位（列表展示）；返回 0 成功
+int memread_valscan_get(unsigned long long index, uint64_t *out_addr, uint64_t *out_prev);
+
+// 原始位 -> 数值（供 UI 把上一轮原始位显示成可读数字）
+double memread_valscan_raw2double(uint64_t raw, int type);
+
+unsigned long long memread_valscan_count(void);
+void memread_valscan_reset(void);
+
 #endif

@@ -65,7 +65,7 @@ jobs:
             -I . \
             -framework UIKit -framework Foundation -framework Metal -framework OpenGLES \
             -o build/Payload/memread.app/memread \
-            app/main.m app/AppDelegate.m app/ViewController.m app/DetailViewController.m app/FilesViewController.m app/DumpViewController.m app/FileTextViewController.m app/MemFileSearch.m app/SearchResultsViewController.m memread_core.c
+            app/main.m app/AppDelegate.m app/ViewController.m app/DetailViewController.m app/FilesViewController.m app/DumpViewController.m app/FileTextViewController.m app/MemFileSearch.m app/SearchResultsViewController.m app/ValueScanViewController.m app/ValueListViewController.m memread_core.c
           file build/Payload/memread.app/memread
           cp app/Info.plist build/Payload/memread.app/Info.plist
           cp ent.plist build/ent.plist

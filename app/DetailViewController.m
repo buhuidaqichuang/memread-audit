@@ -1,6 +1,7 @@
 #import "DetailViewController.h"
 #import "FilesViewController.h"
 #import "FileTextViewController.h"
+#import "ValueScanViewController.h"
 #import "memread_core.h"
 
 @interface DetailViewController ()
@@ -77,6 +78,7 @@ static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
     [self addButton:@"提取文本 (只导出字符串，体积小)" width:W y:&y sel:@selector(onStrings)];
     [self addButton:@"扫描敏感数据 (不落盘, 出报告)" width:W y:&y sel:@selector(onScan)];
     [self addButton:@"验证写入：搜关键词 (文本 / hex)" width:W y:&y sel:@selector(onFindKeyword)];
+    [self addButton:@"数值扫描 (找血量/子弹等数值)" width:W y:&y sel:@selector(onValueScan)];
     [self addButton:@"从剪贴板取 PID 读取" width:W y:&y sel:@selector(onManualPid)];
     [self addButton:@"把信息写入 Media" width:W y:&y sel:@selector(onSave)];
     [self addButton:@"查看结果文件（dump / 报告）" width:W y:&y sel:@selector(onShowFiles)];
@@ -480,6 +482,13 @@ static void DetailRegionCb(unsigned long long addr, unsigned long long chunk,
         self.info[@"bundlePath"], self.info[@"dataPath"]];
     [s writeToFile:@"/var/mobile/Media/memread_appinfo.txt" atomically:YES encoding:NSUTF8StringEncoding error:nil];
     self.resultLabel.text = @"已写入 /var/mobile/Media/memread_appinfo.txt";
+}
+
+// 数值扫描：找 int/float 这类二进制战斗数值（血量、子弹、坐标等）
+- (void)onValueScan {
+    ValueScanViewController *vc = [[ValueScanViewController alloc] init];
+    vc.info = self.info;
+    [self.navigationController pushViewController:vc animated:YES];
 }
 
 @end

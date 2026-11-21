@@ -986,3 +986,249 @@ int memread_find_ex(pid_t pid, const char *out_path, const char *needle,
     if (phits) *phits = nhits;
     return 0;
 }
+
+// ================= 数值扫描 =================
+// 两段式：首扫按 4/8 字节对齐收集候选（只存地址 + 上一轮值），
+// 之后每轮只重读候选地址，用条件收敛。候选常驻本进程，供多轮 refine 与结果列表 peek。
+
+#define MEMREAD_VALSCAN_MAX 2000000
+
+typedef struct {
+    uint64_t addr;
+    uint64_t prev;   // 上一轮原始位：int 零扩展存值；float/double 存位模式
+} memread_valent_t;
+
+static memread_valent_t *g_valents = NULL;
+static unsigned long long g_valcount = 0;
+
+void memread_valscan_reset(void) {
+    if (g_valents) { free(g_valents); g_valents = NULL; }
+    g_valcount = 0;
+}
+
+unsigned long long memread_valscan_count(void) {
+    return g_valcount;
+}
+
+static size_t valsize(int type) {
+    return (type == MEMREAD_VALTYPE_INT64 || type == MEMREAD_VALTYPE_DOUBLE) ? 8 : 4;
+}
+
+double memread_valscan_raw2double(uint64_t raw, int type) {
+    if (type == MEMREAD_VALTYPE_INT32) return (double)(int32_t)(uint32_t)raw;
+    if (type == MEMREAD_VALTYPE_INT64) return (double)(int64_t)raw;
+    if (type == MEMREAD_VALTYPE_FLOAT) {
+        uint32_t u = (uint32_t)raw;
+        float f;
+        memcpy(&f, &u, 4);
+        return (double)f;
+    }
+    double d;
+    memcpy(&d, &raw, 8);
+    return d;
+}
+
+static int val_read_raw(task_t task, uint64_t addr, int type, uint64_t *out) {
+    size_t sz = valsize(type);
+    unsigned char b[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    mach_vm_size_t got = 0;
+    kern_return_t kr = mach_vm_read_overwrite(task, (mach_vm_address_t)addr, sz,
+                                              (mach_vm_address_t)b, &got);
+    if (kr != KERN_SUCCESS || got != sz) return -1;
+    if (sz == 4) {
+        uint32_t v;
+        memcpy(&v, b, 4);
+        *out = (uint64_t)v;
+    } else {
+        memcpy(out, b, 8);
+    }
+    return 0;
+}
+
+int memread_valscan_first(pid_t pid, int rw_only, int type, double value, double tol,
+                          memread_region_cb cb, void *ctx,
+                          unsigned long long *phits, volatile int *cancel) {
+    if (phits) *phits = 0;
+    if (type < MEMREAD_VALTYPE_INT32 || type > MEMREAD_VALTYPE_DOUBLE) return -2;
+    if (tol < 0) tol = -tol;
+
+    memread_valscan_reset();
+    size_t sz = valsize(type);
+
+    task_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "task_for_pid 失败: (%d) %s\n", kr, mach_error_string(kr));
+        return -1;
+    }
+
+    g_valents = (memread_valent_t *)calloc(MEMREAD_VALSCAN_MAX, sizeof(memread_valent_t));
+    if (!g_valents) return -4;
+
+    const mach_vm_size_t CHUNK = 4ULL * 1024 * 1024;
+    unsigned char *buf = (unsigned char *)malloc((size_t)CHUNK + 8);
+    if (!buf) { memread_valscan_reset(); return -4; }
+
+    unsigned long long count = 0;
+    unsigned long long bytes = 0;
+    int regions = 0;
+    int stopped = 0;
+    mach_vm_address_t addr = 0;
+
+    while (!stopped) {
+        if (cancel && *cancel) break;
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        kr = mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t)&info, &cnt, &obj);
+        if (kr != KERN_SUCCESS || size == 0) break;
+
+        int readable = (info.protection & VM_PROT_READ) != 0;
+        int writable = (info.protection & VM_PROT_WRITE) != 0;
+        int shared = info.shared;
+
+        if (readable && !shared && (!rw_only || writable) &&
+            size <= (mach_vm_size_t)(512ULL * 1024 * 1024)) {
+            regions++;
+            mach_vm_address_t off = 0;
+            while (off < size && !stopped) {
+                if (cancel && *cancel) { stopped = 1; break; }
+                mach_vm_size_t cur = (size - off > CHUNK) ? CHUNK : (size - off);
+                mach_vm_size_t got = 0;
+                kr = mach_vm_read_overwrite(task, addr + off, cur,
+                                            (mach_vm_address_t)buf, &got);
+                if (kr == KERN_SUCCESS && got == cur) {
+                    bytes += cur;
+                    size_t i = 0;
+                    size_t limit = (size_t)cur;
+                    if (sz == 4) {
+                        for (; i + 4 <= limit; i += 4) {
+                            uint32_t v;
+                            memcpy(&v, buf + i, 4);
+                            uint64_t raw = (uint64_t)v;
+                            double curd = memread_valscan_raw2double(raw, type);
+                            double d = curd - value;
+                            if (d < 0) d = -d;
+                            if (d <= tol) {
+                                if (count < MEMREAD_VALSCAN_MAX) {
+                                    g_valents[count].addr = (uint64_t)(addr + off + i);
+                                    g_valents[count].prev = raw;
+                                    count++;
+                                }
+                            }
+                        }
+                    } else {
+                        for (; i + 8 <= limit; i += 8) {
+                            uint64_t raw;
+                            memcpy(&raw, buf + i, 8);
+                            double curd = memread_valscan_raw2double(raw, type);
+                            double d = curd - value;
+                            if (d < 0) d = -d;
+                            if (d <= tol) {
+                                if (count < MEMREAD_VALSCAN_MAX) {
+                                    g_valents[count].addr = (uint64_t)(addr + off + i);
+                                    g_valents[count].prev = raw;
+                                    count++;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (cb) cb((unsigned long long)(addr + off),
+                           (unsigned long long)cur, bytes, 0, ctx);
+                off += cur;
+            }
+        }
+        addr += size;
+    }
+
+    g_valcount = count;
+    free(buf);
+    fprintf(stderr, "数值首扫完成: 扫描 %llu 字节, 候选 %llu, %d 个区域\n",
+            bytes, count, regions);
+    if (phits) *phits = count;
+    return 0;
+}
+
+static int val_eq(double a, double b, int type) {
+    if (type == MEMREAD_VALTYPE_INT32 || type == MEMREAD_VALTYPE_INT64) return a == b;
+    double d = a - b;
+    if (d < 0) d = -d;
+    return d <= 1e-6;
+}
+
+int memread_valscan_refine(pid_t pid, int type, int cond, double target,
+                           memread_region_cb cb, void *ctx,
+                           unsigned long long *phits, volatile int *cancel) {
+    if (phits) *phits = 0;
+    if (type < MEMREAD_VALTYPE_INT32 || type > MEMREAD_VALTYPE_DOUBLE) return -2;
+    if (!g_valents || g_valcount == 0) return 0;
+
+    task_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "task_for_pid 失败: (%d) %s\n", kr, mach_error_string(kr));
+        return -1;
+    }
+
+    unsigned long long n = g_valcount;
+    unsigned long long kept = 0;
+
+    for (unsigned long long i = 0; i < n; i++) {
+        if (cancel && *cancel) break;
+        uint64_t raw = 0;
+        if (val_read_raw(task, g_valents[i].addr, type, &raw) != 0) {
+            continue;  // 地址已不可读（内存被回收/释放），丢弃
+        }
+        double cur = memread_valscan_raw2double(raw, type);
+        double prev = memread_valscan_raw2double(g_valents[i].prev, type);
+        int match = 0;
+        switch (cond) {
+            case MEMREAD_VALCOND_EQUAL:     match = val_eq(cur, target, type); break;
+            case MEMREAD_VALCOND_NOT_EQUAL: match = !val_eq(cur, target, type); break;
+            case MEMREAD_VALCOND_GREATER:   match = cur > target; break;
+            case MEMREAD_VALCOND_LESS:      match = cur < target; break;
+            case MEMREAD_VALCOND_INCREASED: match = cur > prev; break;
+            case MEMREAD_VALCOND_DECREASED: match = cur < prev; break;
+            case MEMREAD_VALCOND_CHANGED:   match = !val_eq(cur, prev, type); break;
+            case MEMREAD_VALCOND_UNCHANGED: match = val_eq(cur, prev, type); break;
+            case MEMREAD_VALCOND_DELTA:     match = val_eq(cur - prev, target, type); break;
+            default: break;
+        }
+        if (match) {
+            g_valents[kept].addr = g_valents[i].addr;
+            g_valents[kept].prev = raw;
+            kept++;
+        }
+        if (cb && ((i & 0x3FFF) == 0)) {
+            cb((unsigned long long)i, n, i, 0, ctx);
+        }
+    }
+
+    g_valcount = kept;
+    fprintf(stderr, "数值收敛完成: %llu -> %llu\n", n, kept);
+    if (phits) *phits = kept;
+    return 0;
+}
+
+int memread_valscan_peek(pid_t pid, int type, unsigned long long index,
+                         uint64_t *out_addr, double *out_value) {
+    if (!g_valents || index >= g_valcount) return -1;
+    task_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS) return -2;
+    uint64_t raw = 0;
+    if (val_read_raw(task, g_valents[index].addr, type, &raw) != 0) return -3;
+    if (out_addr) *out_addr = g_valents[index].addr;
+    if (out_value) *out_value = memread_valscan_raw2double(raw, type);
+    return 0;
+}
+
+int memread_valscan_get(unsigned long long index, uint64_t *out_addr, uint64_t *out_prev) {
+    if (!g_valents || index >= g_valcount) return -1;
+    if (out_addr) *out_addr = g_valents[index].addr;
+    if (out_prev) *out_prev = g_valents[index].prev;
+    return 0;
+}
