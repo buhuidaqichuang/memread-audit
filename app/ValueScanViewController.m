@@ -774,7 +774,7 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
     __weak typeof(self) ws = self;
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"坐标结构扫描"
                                                                message:@"不需要知道坐标值。判据是「3 个 float 坐标 + 紧跟一个模长=1 的四元数」，随机数据几乎不可能凑出来。\n\n① 站定别动 → 记录基准\n② 走 3~5 步、站住 → 对比，位移对得上就是人物坐标"
-                                                        preferredStyle:UIAlertControllerStyleActionSheet];
+                                                        preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"① 站定：记录基准" style:UIAlertActionStyleDefault
                                         handler:^(UIAlertAction *x) { [ws coordProbeSecond:NO]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"② 走动后：对比定位" style:UIAlertActionStyleDefault
