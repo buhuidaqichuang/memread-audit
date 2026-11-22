@@ -2286,6 +2286,9 @@ static int coord_live_at(const unsigned char *p) {
 }
 
 // 全内存扫一遍，每个命中交给 visit；visit 返回 1 表示停止
+// 1=严格（只要完整 FTransform）；0=宽松（也收 loc+非平凡四元数）
+static int coord_strict_mode = 1;
+
 static int coord_scan(pid_t pid, int (*visit)(const memread_coord_hit_t *, void *), void *vctx,
                       unsigned long long *pscanned, volatile int *cancel,
                       memread_region_cb cb, void *ctx) {
@@ -2333,8 +2336,16 @@ static int coord_scan(pid_t pid, int (*visit)(const memread_coord_hit_t *, void 
                         float v[3];
                         int qo = 0, vo = 0;
                         if (!coord_try(buf + o, v, &qo, &vo)) continue;
-                        // 弱判据（平凡四元数 / 角度旋转）要求身边有堆指针，否则就是静态常量表
-                        if ((qo < 0 || qo == 100) && !coord_live_at(buf + o)) continue;
+                        // 平凡四元数、FRotator 布局噪声最大，一律不要
+                        if (qo < 0 || qo == 100) continue;
+                        if (coord_strict_mode) {
+                            // 严格：只认完整 FTransform（四元数在前、位移 +16、scale 在 +28≈(1,1,1)）
+                            if (qo != 0) continue;
+                            float sc[3];
+                            memcpy(sc, buf + o + 28, 12);
+                            if (!(fabsf(sc[0] - 1.0f) < 0.02f && fabsf(sc[1] - 1.0f) < 0.02f &&
+                                  fabsf(sc[2] - 1.0f) < 0.02f)) continue;
+                        }
                         memread_coord_hit_t h;
                         h.addr = (uint64_t)addr + off + o + (uint64_t)vo;
                         h.v[0] = v[0]; h.v[1] = v[1]; h.v[2] = v[2];
@@ -2389,18 +2400,29 @@ int memread_coord_probe(pid_t pid, memread_coord_hit_t *out, int cap, int *found
     memset(&c, 0, sizeof(c));
     c.out = out;
     c.cap = cap;
-    // 按布局分配额，避免 FRotator（最宽松）把整个名额吃光
-    c.qcap[0] = cap / 2;              // 四元数在后（最可信）
-    c.qcap[1] = cap / 10;             // 平凡四元数
-    c.qcap[2] = cap * 3 / 10;         // FTransform
-    c.qcap[3] = cap / 10;             // FRotator
+    // 第一遍：严格模式，只要完整 FTransform（四元数在前 + 位移 + scale≈1）
+    c.qcap[0] = 0;
+    c.qcap[1] = 0;
+    c.qcap[2] = cap;
+    c.qcap[3] = 0;
     unsigned long long scanned = 0;
+    coord_strict_mode = 1;
     int rc = coord_scan(pid, coord_collect_visit, &c, &scanned, cancel, cb, ctx);
+    if (rc == 0 && c.n == 0) {
+        // 严格模式一个都没命中（可能不是 UE 的 FTransform 排布）→ 退回宽松模式重扫
+        memset(c.q, 0, sizeof(c.q));
+        memset(c.dropped, 0, sizeof(c.dropped));
+        c.n = 0;
+        c.qcap[0] = cap * 3 / 4;
+        c.qcap[2] = cap / 4;
+        coord_strict_mode = 0;
+        rc = coord_scan(pid, coord_collect_visit, &c, &scanned, cancel, cb, ctx);
+    }
     if (rc != 0) return rc;
     qsort(out, (size_t)c.n, sizeof(memread_coord_hit_t), coord_hit_cmp);
     if (found) *found = c.n;
-    fprintf(stderr, "坐标结构扫描: %d 个（四元数 %d / 平凡 %d / FTransform %d / 角度 %d；丢弃 %d/%d/%d/%d）\n",
-            c.n, c.q[0], c.q[1], c.q[2], c.q[3],
+    fprintf(stderr, "坐标结构扫描(%s): %d 个（四元数 %d / 平凡 %d / FTransform %d / 角度 %d；丢弃 %d/%d/%d/%d）\n",
+            coord_strict_mode ? "严格" : "宽松", c.n, c.q[0], c.q[1], c.q[2], c.q[3],
             c.dropped[0], c.dropped[1], c.dropped[2], c.dropped[3]);
     return 0;
 }
@@ -2437,6 +2459,16 @@ static int coord_diff_visit(const memread_coord_hit_t *h, void *vctx) {
     return 0;
 }
 
+typedef struct { memread_coord_hit_t h; float dl; } cddelta_t;
+
+static int cddelta_cmp(const void *pa, const void *pb) {
+    float x = ((const cddelta_t *)pa)->dl, y = ((const cddelta_t *)pb)->dl;
+    if (x == y) return 0;
+    return (x > y) ? -1 : 1;      // 位移大的在前
+}
+
+#define MEMREAD_COORD_KEEP 300
+
 int memread_coord_probe_diff(pid_t pid, const memread_coord_hit_t *base, int nbase,
                              memread_coord_hit_t *out, int cap, int *found,
                              int *pcommon, int *pmoved, float *pmaxdelta,
@@ -2461,6 +2493,27 @@ int memread_coord_probe_diff(pid_t pid, const memread_coord_hit_t *base, int nba
 
     unsigned long long scanned = 0;
     int rc = coord_scan(pid, coord_diff_visit, &d, &scanned, cancel, cb, ctx);
+    if (rc == 0 && d.n > 1) {
+        // 按位移从大到小排，只留前 MEMREAD_COORD_KEEP 条：人物的走路位移通常落在最大那一档
+        cddelta_t *tmp = (cddelta_t *)malloc(sizeof(cddelta_t) * (size_t)d.n);
+        if (tmp) {
+            for (int i = 0; i < d.n; i++) {
+                memread_coord_hit_t key = out[i];
+                const memread_coord_hit_t *b = (const memread_coord_hit_t *)bsearch(
+                    &key, sorted, (size_t)nbase, sizeof(memread_coord_hit_t), coord_addr_cmp);
+                float dx = out[i].v[0] - b->v[0];
+                float dy = out[i].v[1] - b->v[1];
+                float dz = out[i].v[2] - b->v[2];
+                tmp[i].h = out[i];
+                tmp[i].dl = sqrtf(dx * dx + dy * dy + dz * dz);
+            }
+            qsort(tmp, (size_t)d.n, sizeof(cddelta_t), cddelta_cmp);
+            int keep = d.n > MEMREAD_COORD_KEEP ? MEMREAD_COORD_KEEP : d.n;
+            for (int i = 0; i < keep; i++) out[i] = tmp[i].h;
+            d.n = keep;
+            free(tmp);
+        }
+    }
     free(sorted);
     if (rc != 0) return rc;
 
