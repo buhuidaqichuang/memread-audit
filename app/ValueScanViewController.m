@@ -24,8 +24,20 @@
 @property (nonatomic, assign) void *coordB;      // 走动对比后的候选
 @property (nonatomic, assign) int coordBn;
 @property (nonatomic, assign) BOOL coordCandidates;   // 当前候选来自坐标扫描（列表按三元组显示）
+
+// ⑤ 后台自动捕捉（画中画保活，人不用切来切去）
+@property (nonatomic, strong) NSTimer *autoTimer;
+@property (nonatomic, assign) uint64_t *autoAddrs;
+@property (nonatomic, assign) float *autoPrev;
+@property (nonatomic, assign) int autoN;
+@property (nonatomic, assign) int *autoMoved;   // 走动期间变过几次
+@property (nonatomic, assign) int *autoVert;    // 只动竖直轴（蹲下）几次
+@property (nonatomic, assign) float *autoMax;   // 最大位移
+@property (nonatomic, assign) int autoTicks;
+@property (nonatomic, assign) BOOL autoRunning;
 - (void)appendProgressLine:(NSString *)line;
 - (void)clearProgress;
+- (int)autoVertCount;
 @end
 
 typedef struct {
@@ -127,6 +139,7 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
     [self addButton:@"未知值扫描（不知道数值）" width:W y:&y sel:@selector(onUnknown)];
     [self addButton:@"坐标扫描（走动→站定→跳）" width:W y:&y sel:@selector(onCoord)];
     [self addButton:@"坐标结构扫描（不用输坐标值）" width:W y:&y sel:@selector(onCoordProbe)];
+    [self addButton:@"⑤ 后台自动捕捉坐标（不用切来切去）" width:W y:&y sel:@selector(onAutoCapture)];
     [self addButton:@"释放内存快照（省内存）" width:W y:&y sel:@selector(onFreeSnap)];
     [self addButton:@"查看候选列表（点一行读当前值）" width:W y:&y sel:@selector(onList)];
     [self addButton:@"已保存地址（自定义标签）" width:W y:&y sel:@selector(onSaved)];
@@ -772,6 +785,175 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
             [self2 presentViewController:ok animated:YES completion:nil];
         });
     });
+}
+
+#pragma mark ⑤ 后台自动捕捉坐标（画中画保活，一次回 App 出结果）
+
+- (void)onAutoCapture {
+    if (self.autoRunning) { [self onAutoFinish]; return; }
+    if (memread_valscan_count() == 0) {
+        self.statusLabel.text = @"先做 ①→②，拿到候选再来";
+        [self appendProgressLine:@"⑤ 需要先有候选：先 ① 站定记基准，② 走动后对比"];
+        return;
+    }
+    pid_t pid = [self ensurePid];
+    if (pid <= 0) return;
+
+    int n = (int)memread_valscan_count();
+    if (n > 300) n = 300;
+    self.autoAddrs = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)n);
+    self.autoPrev = (float *)calloc((size_t)n * 3, sizeof(float));
+    self.autoMoved = (int *)calloc((size_t)n, sizeof(int));
+    self.autoVert = (int *)calloc((size_t)n, sizeof(int));
+    self.autoMax = (float *)calloc((size_t)n, sizeof(float));
+    if (!self.autoAddrs || !self.autoPrev || !self.autoMoved || !self.autoVert || !self.autoMax) {
+        [self appendProgressLine:@"⑤ 内存分配失败"];
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        uint64_t a = 0, pv = 0;
+        int vt = MEMREAD_VALTYPE_FLOAT;
+        if (memread_valscan_get_ex((unsigned long long)i, &a, &pv, &vt) != 0) a = 0;
+        self.autoAddrs[i] = a;
+    }
+    self.autoN = n;
+    self.autoTicks = 0;
+    memread_read_vec3_batch(pid, self.autoAddrs, n, self.autoPrev);
+
+    self.autoRunning = YES;
+    self.statusLabel.text = @"后台采样中：走动 → 蹲下";
+    [self appendProgressLine:[NSString stringWithFormat:
+        @"⑤ 已开始后台采样（%d 条候选，每 0.5 秒一帧）。\n   现在回游戏：走几步 → 站住 → 蹲下（保持 1 秒）→ 起身。\n   做完回这里再点一次『⑤ 后台自动捕捉坐标』出结果。", n]];
+
+    // 画中画保活：PiP 在跑，App 才不会被挂起，定时器才能继续采样
+    if (![FloatPanelController shared].isRunning) {
+        [[FloatPanelController shared] startMonitorWithPid:pid type:[self type] interval:1.0];
+        [self appendProgressLine:@"   已开画中画保活（跑在游戏上层），采样继续"];
+    }
+
+    __weak typeof(self) ws = self;
+    self.autoTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+        __strong typeof(ws) self2 = ws;
+        if (self2) [self2 onAutoTick];
+    }];
+}
+
+- (void)onAutoTick {
+    if (!self.autoRunning || self.autoN <= 0 || self.currentPid <= 0) return;
+    int n = self.autoN;
+    float *cur = (float *)malloc(sizeof(float) * (size_t)n * 3);
+    if (!cur) return;
+    int ok = memread_read_vec3_batch(self.currentPid, self.autoAddrs, n, cur);
+    if (ok <= 0) { free(cur); return; }
+    int changed = 0;
+    for (int i = 0; i < n; i++) {
+        float dx = cur[i * 3] - self.autoPrev[i * 3];
+        float dy = cur[i * 3 + 1] - self.autoPrev[i * 3 + 1];
+        float dz = cur[i * 3 + 2] - self.autoPrev[i * 3 + 2];
+        float len = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (len > 1.0f) {
+            changed++;
+            self.autoMoved[i] = MIN(self.autoMoved[i] + 1, 9999);
+            if (len > self.autoMax[i]) self.autoMax[i] = len;
+        }
+        // 蹲下：一个轴动 >=10，另两轴 <=5
+        float dd[3] = {dx, dy, dz};
+        int big = 0, small = 0;
+        for (int k = 0; k < 3; k++) {
+            if (fabsf(dd[k]) >= 10.0f) big++;
+            else if (fabsf(dd[k]) <= 5.0f) small++;
+        }
+        if (big == 1 && small == 2) self.autoVert[i] = MIN(self.autoVert[i] + 1, 9999);
+    }
+    memcpy(self.autoPrev, cur, sizeof(float) * (size_t)n * 3);
+    free(cur);
+    self.autoTicks++;
+    self.countLabel.text = [NSString stringWithFormat:@"采样 %d 帧 · 本帧变化 %d 条 · 蹲下命中 %d 条",
+                            self.autoTicks, changed, [self autoVertCount]];
+}
+
+- (int)autoVertCount {
+    int c = 0;
+    for (int i = 0; i < self.autoN; i++) if (self.autoVert[i] > 0) c++;
+    return c;
+}
+
+- (void)onAutoFinish {
+    [self.autoTimer invalidate];
+    self.autoTimer = nil;
+    self.autoRunning = NO;
+    int n = self.autoN;
+    if (n <= 0) return;
+
+    // 判据：走动时变过 且 蹲下时只动竖直轴
+    int *pick = (int *)malloc(sizeof(int) * (size_t)n);
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        if (self.autoMoved[i] > 0 && self.autoVert[i] > 0) pick[m++] = i;
+    }
+    if (m == 0) {
+        // 没捕捉到蹲下（可能没蹲/挂起）：退回「走动时变过」里位移最大的前 50
+        for (int i = 0; i < n; i++) if (self.autoMoved[i] > 0) pick[m++] = i;
+        for (int i = 1; i < m; i++) {
+            int key = pick[i], j = i - 1;
+            while (j >= 0 && self.autoMax[pick[j]] < self.autoMax[key]) { pick[j + 1] = pick[j]; j--; }
+            pick[j + 1] = key;
+        }
+        if (m > 50) m = 50;
+    }
+
+    if (m == 0) {
+        free(pick);
+        self.statusLabel.text = @"⑤ 没捕捉到变化";
+        [self appendProgressLine:@"⑤ 一帧都没变化：游戏在前台被挂起了？先确认画中画在播、进程号没过期"];
+        return;
+    }
+
+    uint64_t *addrs = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)m);
+    for (int i = 0; i < m; i++) addrs[i] = self.autoAddrs[pick[i]];
+    memread_valscan_set(self.currentPid, addrs, m, MEMREAD_VALTYPE_FLOAT);
+    free(addrs);
+    self.coordCandidates = YES;
+    [self refreshCount];
+
+    NSMutableString *msg = [NSMutableString stringWithFormat:
+        @"采样 %d 帧，候选 %d → %d 条。\n\n", self.autoTicks, n, m];
+    float *vals = (float *)malloc(sizeof(float) * (size_t)m * 3);
+    if (vals) {
+        uint64_t *tmp = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)m);
+        for (int i = 0; i < m; i++) tmp[i] = self.autoAddrs[pick[i]];
+        memread_read_vec3_batch(self.currentPid, tmp, m, vals);
+        free(tmp);
+    }
+    for (int i = 0; i < m && i < 5; i++) {
+        int k = pick[i];
+        if (vals) {
+            [msg appendFormat:@"%d) 0x%llX  (%.1f, %.1f, %.1f)\n", i + 1,
+             (unsigned long long)self.autoAddrs[k], vals[i * 3], vals[i * 3 + 1], vals[i * 3 + 2]];
+        }
+    }
+    free(vals);
+    free(pick);
+
+    [msg appendString:@"\n点『查看候选』进去点每行的『链』，找跨重启的静态路径。"];
+
+    UIAlertController *ok = [UIAlertController alertControllerWithTitle:@"⑤ 自动捕捉完成"
+                                                               message:msg
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [ok addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) ws = self;
+    [ok addAction:[UIAlertAction actionWithTitle:@"查看候选" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) { [ws onList]; }]];
+    [self presentViewController:ok animated:YES completion:nil];
+    [self appendProgressLine:[NSString stringWithFormat:@"⑤ 完成：%d 条（走动变过 + 蹲下只动竖直轴）", m]];
+    self.statusLabel.text = [NSString stringWithFormat:@"⑤ 完成：%d 条候选", m];
+
+    if (self.autoAddrs) { free(self.autoAddrs); self.autoAddrs = NULL; }
+    if (self.autoPrev) { free(self.autoPrev); self.autoPrev = NULL; }
+    if (self.autoMoved) { free(self.autoMoved); self.autoMoved = NULL; }
+    if (self.autoVert) { free(self.autoVert); self.autoVert = NULL; }
+    if (self.autoMax) { free(self.autoMax); self.autoMax = NULL; }
+    self.autoN = 0;
 }
 
 #pragma mark 坐标结构扫描（不用知道坐标值）

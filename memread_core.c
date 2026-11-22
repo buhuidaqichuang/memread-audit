@@ -1081,6 +1081,24 @@ int memread_read_vec3(pid_t pid, uint64_t addr, float *out3) {
     return 0;
 }
 
+// 批量读 3 个 float：一次 task_for_pid，然后逐个 12 字节读（后台跟踪候选时用）
+int memread_read_vec3_batch(pid_t pid, const uint64_t *addrs, int n, float *out) {
+    if (!addrs || !out || n <= 0) return -2;
+    task_t task = MACH_PORT_NULL;
+    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
+    int ok = 0;
+    for (int i = 0; i < n; i++) {
+        unsigned char b[12] = {0};
+        mach_vm_size_t got = 0;
+        kern_return_t kr = mach_vm_read_overwrite(task, (mach_vm_address_t)addrs[i], 12,
+                                                 (mach_vm_address_t)b, &got);
+        memcpy(out + i * 3, b, 12);
+        if (kr == KERN_SUCCESS && got == 12) ok++;
+    }
+    mach_port_deallocate(mach_task_self(), task);
+    return ok;   // 成功读到的条数
+}
+
 // 预统计与首扫完全相同的区域过滤条件，得到总量用于进度百分比（只枚举，不读内存）
 int memread_writable_bytes(pid_t pid, int rw_only,
                            unsigned long long *out_bytes, unsigned long long *out_regions) {

@@ -119,6 +119,9 @@ int memread_read_scalar(pid_t pid, uint64_t addr, int type, double *out_value);
 // 读 3 个连续 float（坐标三元组）；0 成功，-1 取进程失败，-3 不可读
 int memread_read_vec3(pid_t pid, uint64_t addr, float *out3);
 
+// 批量读 3 个 float（一次取 task，逐条 12 字节读）；返回成功条数，负数=错误
+int memread_read_vec3_batch(pid_t pid, const uint64_t *addrs, int n, float *out);
+
 // ============ 模块基址 + 偏移（跨进程重启定位模块内地址） ============
 // 判断 addr 落在哪个 Mach-O 模块里；命中回填模块 UUID / 名字 / 基址 / 偏移
 // 返回 0 命中，1 不在任何模块（堆地址），-1 取进程失败
