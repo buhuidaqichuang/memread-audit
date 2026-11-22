@@ -2455,12 +2455,13 @@ static int coord_diff_visit(const memread_coord_hit_t *h, void *vctx) {
     if (len > 1e-3f) d->moved++;
     if (len > d->maxdelta) d->maxdelta = len;
     if (d->mode == 1) {
-        // 跳跃判据：只有一个轴明显变化（>=3），另外两个轴几乎不动（<=1）——竖直位移，水平不动
+        // 姿态判据：蹲下/趴下这种「保持住的」单轴位移——一个轴变 >=10，另外两个轴挪动 <=5
+        // （跳跃是瞬时状态，切回 App 时人已经落地，抓不到）
         float dd[3] = {dx, dy, dz};
         int big = 0, small = 0;
         for (int i = 0; i < 3; i++) {
-            if (fabsf(dd[i]) >= 3.0f) big++;
-            else if (fabsf(dd[i]) <= 1.0f) small++;
+            if (fabsf(dd[i]) >= 10.0f) big++;
+            else if (fabsf(dd[i]) <= 5.0f) small++;
         }
         if (!(big == 1 && small == 2)) return 0;
     } else {

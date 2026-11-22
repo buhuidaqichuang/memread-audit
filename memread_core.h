@@ -167,8 +167,8 @@ int memread_coord_probe_diff(pid_t pid, const memread_coord_hit_t *base, int nba
                              float min_len, float max_len,
                              volatile int *cancel, memread_region_cb cb, void *ctx);
 
-// 跳跃过滤：相对基准只留「一个轴明显变化(>=3)、另两轴几乎不动(<=1)」的候选；
-// 竖直位移成立说明这是人物/挂点位置，而不是随手乱动的东西
+// 姿态过滤：相对基准只留「一个轴变化>=10、另两轴挪动<=5」的候选。
+// 用蹲下/趴下这种能保持住的姿态（跳跃瞬时状态切回 App 时已落地）；竖直变、水平不变 = 人物/挂点位置
 int memread_coord_probe_jump(pid_t pid, const memread_coord_hit_t *base, int nbase,
                              memread_coord_hit_t *out, int cap, int *found,
                              int *pcommon, int *pmoved, float *pdelta,
