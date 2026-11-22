@@ -779,13 +779,15 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
 - (void)onCoordProbe {
     __weak typeof(self) ws = self;
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"坐标结构扫描"
-                                                               message:@"三步，全程不用输坐标值。判据是「3 个 float 坐标 + 相邻的四元数/角度」，加上「走动时变、转视角时不变」。\n\n① 站定别动 → 记录基准\n② 走 3~5 步、站住 → 对比，留下动过的\n③ 站住不动、原地左右转视角 2 秒 → 回来点③：筛掉跟着镜头走的副本（相机/挂点），人物位置不会因为转视角而变"
+                                                               message:@"四步，全程不用输坐标值。判据是「完整 FTransform（四元数 + 位移 + scale≈1）」，加上「走动时变、跳起来只动竖直轴」。\n\n① 站定别动 → 记录基准\n② 走 3~5 步、站住 → 对比，留下动过的\n③ 站住、原地跳一下 → 只留「一个轴变、另两轴不变」的，基本就剩个位数\n④（可选）站住原地转视角 → 把跟着镜头走的那份筛掉"
                                                         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"① 站定：记录基准" style:UIAlertActionStyleDefault
                                         handler:^(UIAlertAction *x) { [ws coordProbeSecond:NO]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"② 走动后：对比定位" style:UIAlertActionStyleDefault
                                         handler:^(UIAlertAction *x) { [ws coordProbeSecond:YES]; }]];
-    [a addAction:[UIAlertAction actionWithTitle:@"③ 转视角：筛掉相机副本" style:UIAlertActionStyleDefault
+    [a addAction:[UIAlertAction actionWithTitle:@"③ 跳一下：筛到个位数" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) { [ws coordProbeJump]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"④ 转视角（可选）" style:UIAlertActionStyleDefault
                                         handler:^(UIAlertAction *x) { [ws coordProbeStill]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:a animated:YES completion:nil];
@@ -903,7 +905,7 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
             [self2 refreshCount];
 
             NSMutableString *msg = [NSMutableString stringWithFormat:
-                @"%@\n\n位移最大的最可能是人物根组件（相机/挂点也会动）。\n下一步：回游戏站住不动、原地左右转视角 2 秒，再回来点『③ 转视角：筛掉相机副本』——转视角时人物位置不变，跟着镜头走的副本会被筛掉。\n\n", diag];
+                @"%@\n\n位移最大的最可能是人物根组件（相机/挂点也会动）。\n下一步：回游戏站住不动、原地跳一下，再回来点『③ 跳一下过滤』——跳起来只有竖直轴变、水平不动，能筛到个位数。\n\n", diag];
             for (int i = 0; i < found && i < 3; i++) {
                 [msg appendFormat:@"%d) 0x%llX  (%.2f, %.2f, %.2f)%@\n", i + 1,
                  (unsigned long long)buf[i].addr,
@@ -917,14 +919,100 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
             [ok addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
             [ok addAction:[UIAlertAction actionWithTitle:@"查看候选（点『链』）" style:UIAlertActionStyleDefault
                                                 handler:^(UIAlertAction *x) { [self2 onList]; }]];
-            [ok addAction:[UIAlertAction actionWithTitle:@"③ 转视角过滤" style:UIAlertActionStyleDefault
+            [ok addAction:[UIAlertAction actionWithTitle:@"③ 跳一下过滤" style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *x) { [self2 coordProbeJump]; }]];
+            [self2 presentViewController:ok animated:YES completion:nil];
+        });
+    });
+}
+
+#pragma mark 坐标结构扫描 · ③ 跳一下过滤（单轴变化）
+
+- (void)coordProbeJump {
+    pid_t pid = [self ensurePid];
+    if (pid <= 0) return;
+    if (!self.coordB || self.coordBn <= 0) {
+        [self appendProgressLine:@"还没有走动候选，先做 ② 走动后对比"];
+        self.statusLabel.text = @"先做 ②";
+        return;
+    }
+    memread_coord_hit_t *base = (memread_coord_hit_t *)self.coordB;
+    int nbase = self.coordBn;
+    [self.spinner startAnimating];
+    self.statusLabel.text = @"跳跃过滤：对比中…";
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        int cap = MEMREAD_COORD_HIT_CAP;
+        int m = 0, common = 0, moved = 0;
+        float maxdelta = 0;
+        memread_coord_hit_t *out = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * (size_t)cap);
+        // 只留「某个轴变了 ≥3、另外两个轴几乎没动 ≤1」的：竖直跳起、水平不动
+        int rc = out ? memread_coord_probe_jump(pid, base, nbase, out, cap, &m,
+                                                &common, &moved, &maxdelta, NULL, NULL, NULL) : -4;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) self2 = ws;
+            if (!self2) { free(out); return; }
+            [self2.spinner stopAnimating];
+
+            NSString *diag = [NSString stringWithFormat:
+                @"待筛 %d 个 · 同地址 %d 个 · 变了 %d 个 · 单轴位移(保留) %d 个（最大位移 %.1f）",
+                nbase, common, moved, m, maxdelta];
+            [self2 appendProgressLine:diag];
+
+            if (rc != 0 || m <= 0) {
+                free(out);
+                NSString *why = (rc != 0)
+                    ? [NSString stringWithFormat:@"跳跃过滤失败 rc=%d", rc]
+                    : (moved == 0
+                       ? @"跳前后一个都没变：没有回游戏跳，或者游戏在后台被挂起了（回游戏原地跳一下再回来）"
+                       : @"没有「只动一个轴」的候选：这些地址是乱动的特效/粒子，不是人物位置");
+                self2.statusLabel.text = @"跳跃过滤没结果";
+                [self2 appendProgressLine:why];
+                [self2 appendProgressLine:diag];
+                return;
+            }
+
+            uint64_t *addrs = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)m);
+            for (int i = 0; i < m; i++) addrs[i] = out[i].addr;
+            memread_valscan_set(pid, addrs, m, MEMREAD_VALTYPE_FLOAT);
+            free(addrs);
+            self2.coordCandidates = YES;
+
+            // 这一批当作 ④ 转视角的基准
+            memread_coord_hit_t *oldb = (memread_coord_hit_t *)self2.coordB;
+            if (oldb) free(oldb);
+            self2.coordB = out;
+            self2.coordBn = m;
+
+            NSString *line = [NSString stringWithFormat:@"跳跃过滤后：%d 个候选（竖直变、水平不变）", m];
+            self2.statusLabel.text = line;
+            [self2 appendProgressLine:line];
+            [self2 appendProgressLine:diag];
+            [self2 refreshCount];
+
+            NSMutableString *msg = [NSMutableString stringWithFormat:@"%@\n\n", diag];
+            for (int i = 0; i < m && i < 5; i++) {
+                [msg appendFormat:@"%d) 0x%llX  (%.1f, %.1f, %.1f)\n", i + 1,
+                 (unsigned long long)out[i].addr,
+                 out[i].v[0], out[i].v[1], out[i].v[2]];
+            }
+            msg = [[msg stringByAppendingString:
+                @"\n这些是「跳起来只动一个轴」的地址，基本就是人物/挂点。\n不放心可以再点④ 转视角：跟着镜头转的那份会被筛掉。"] mutableCopy];
+
+            UIAlertController *ok = [UIAlertController alertControllerWithTitle:@"候选已缩到个位数"
+                                                                       message:msg
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+            [ok addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+            [ok addAction:[UIAlertAction actionWithTitle:@"查看候选（点『链』）" style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *x) { [self2 onList]; }]];
+            [ok addAction:[UIAlertAction actionWithTitle:@"④ 转视角再筛" style:UIAlertActionStyleDefault
                                                 handler:^(UIAlertAction *x) { [self2 coordProbeStill]; }]];
             [self2 presentViewController:ok animated:YES completion:nil];
         });
     });
 }
 
-#pragma mark 坐标结构扫描 · ③ 转视角过滤
+#pragma mark 坐标结构扫描 · ④ 转视角过滤（可选）
 
 - (void)coordProbeStill {
     pid_t pid = [self ensurePid];

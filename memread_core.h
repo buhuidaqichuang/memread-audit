@@ -167,6 +167,13 @@ int memread_coord_probe_diff(pid_t pid, const memread_coord_hit_t *base, int nba
                              float min_len, float max_len,
                              volatile int *cancel, memread_region_cb cb, void *ctx);
 
+// 跳跃过滤：相对基准只留「一个轴明显变化(>=3)、另两轴几乎不动(<=1)」的候选；
+// 竖直位移成立说明这是人物/挂点位置，而不是随手乱动的东西
+int memread_coord_probe_jump(pid_t pid, const memread_coord_hit_t *base, int nbase,
+                             memread_coord_hit_t *out, int cap, int *found,
+                             int *pcommon, int *pmoved, float *pdelta,
+                             volatile int *cancel, memread_region_cb cb, void *ctx);
+
 
 // 两次探测按地址求差：位移长度落在 [min_len, max_len] 的留下，按位移大小排序
 int memread_coord_diff(const memread_coord_hit_t *a, int na,

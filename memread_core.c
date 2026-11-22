@@ -2436,6 +2436,7 @@ typedef struct {
     float maxdelta;
     float minlen, maxlen;
     int tooSmall;
+    int mode;          // 0=三轴位移长度落在 [minlen,maxlen]；1=只认「单轴变化」（跳跃）
 } coord_diff_t;
 
 static int coord_diff_visit(const memread_coord_hit_t *h, void *vctx) {
@@ -2453,7 +2454,18 @@ static int coord_diff_visit(const memread_coord_hit_t *h, void *vctx) {
     float len = sqrtf(dx * dx + dy * dy + dz * dz);
     if (len > 1e-3f) d->moved++;
     if (len > d->maxdelta) d->maxdelta = len;
-    if (len < d->minlen || len > d->maxlen) return 0;
+    if (d->mode == 1) {
+        // 跳跃判据：只有一个轴明显变化（>=3），另外两个轴几乎不动（<=1）——竖直位移，水平不动
+        float dd[3] = {dx, dy, dz};
+        int big = 0, small = 0;
+        for (int i = 0; i < 3; i++) {
+            if (fabsf(dd[i]) >= 3.0f) big++;
+            else if (fabsf(dd[i]) <= 1.0f) small++;
+        }
+        if (!(big == 1 && small == 2)) return 0;
+    } else {
+        if (len < d->minlen || len > d->maxlen) return 0;
+    }
     if (d->n >= d->cap) { d->tooSmall = 1; return 0; }
     d->out[d->n++] = *h;
     return 0;
@@ -2469,11 +2481,11 @@ static int cddelta_cmp(const void *pa, const void *pb) {
 
 #define MEMREAD_COORD_KEEP 300
 
-int memread_coord_probe_diff(pid_t pid, const memread_coord_hit_t *base, int nbase,
-                             memread_coord_hit_t *out, int cap, int *found,
-                             int *pcommon, int *pmoved, float *pmaxdelta,
-                             float min_len, float max_len,
-                             volatile int *cancel, memread_region_cb cb, void *ctx) {
+static int coord_probe_diff_mode(pid_t pid, const memread_coord_hit_t *base, int nbase,
+                                 memread_coord_hit_t *out, int cap, int *found,
+                                 int *pcommon, int *pmoved, float *pmaxdelta,
+                                 float min_len, float max_len, int mode,
+                                 volatile int *cancel, memread_region_cb cb, void *ctx) {
     if (found) *found = 0;
     if (pcommon) *pcommon = 0;
     if (pmoved) *pmoved = 0;
@@ -2490,6 +2502,7 @@ int memread_coord_probe_diff(pid_t pid, const memread_coord_hit_t *base, int nba
     d.base = sorted; d.nbase = nbase;
     d.out = out; d.cap = cap; d.n = 0;
     d.minlen = min_len; d.maxlen = max_len;
+    d.mode = mode;
 
     unsigned long long scanned = 0;
     int rc = coord_scan(pid, coord_diff_visit, &d, &scanned, cancel, cb, ctx);
@@ -2521,9 +2534,27 @@ int memread_coord_probe_diff(pid_t pid, const memread_coord_hit_t *base, int nba
     if (pcommon) *pcommon = d.common;
     if (pmoved) *pmoved = d.moved;
     if (pmaxdelta) *pmaxdelta = d.maxdelta;
-    fprintf(stderr, "坐标对比: 共同 %d，位移非零 %d，命中 %d（最大位移 %.2f）\n",
-            d.common, d.moved, d.n, d.maxdelta);
+    fprintf(stderr, "坐标对比(%s): 共同 %d，位移非零 %d，命中 %d（最大位移 %.2f）\n",
+            mode ? "跳跃" : "走动", d.common, d.moved, d.n, d.maxdelta);
     return 0;
+}
+
+int memread_coord_probe_diff(pid_t pid, const memread_coord_hit_t *base, int nbase,
+                             memread_coord_hit_t *out, int cap, int *found,
+                             int *pcommon, int *pmoved, float *pmaxdelta,
+                             float min_len, float max_len,
+                             volatile int *cancel, memread_region_cb cb, void *ctx) {
+    return coord_probe_diff_mode(pid, base, nbase, out, cap, found, pcommon, pmoved, pmaxdelta,
+                                 min_len, max_len, 0, cancel, cb, ctx);
+}
+
+// 跳跃过滤：只留「一个轴明显变化、另外两个轴几乎不动」的候选（竖直位移，水平不动）
+int memread_coord_probe_jump(pid_t pid, const memread_coord_hit_t *base, int nbase,
+                             memread_coord_hit_t *out, int cap, int *found,
+                             int *pcommon, int *pmoved, float *pdelta,
+                             volatile int *cancel, memread_region_cb cb, void *ctx) {
+    return coord_probe_diff_mode(pid, base, nbase, out, cap, found, pcommon, pmoved, pdelta,
+                                 3.0f, 20000.0f, 1, cancel, cb, ctx);
 }
 
 // 两次探测求差：同一地址的坐标位移落在 [min_len, max_len] 的留下（走动时该变、静止时不该变）
