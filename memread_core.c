@@ -2950,6 +2950,131 @@ int memread_chain_scan(pid_t pid, uint64_t target, int max_depth,
     return results;
 }
 
+#pragma mark - 从锚点（弹夹）推自己坐标（对象图 BFS，不用人工动作）
+
+#define ANCHOR_OBJ_MAX 400
+#define ANCHOR_OBJ_BYTES 0x800
+
+static int anchor_ptr_ok(uint64_t v) {
+    if (v < 0x100000000ULL || v >= 0x8000000000ULL) return 0;
+    return ((v & 7) == 0);
+}
+
+static int anchor_in_module(uint64_t v) {
+    for (int i = 0; i < g_modsegn; i++) {
+        if (v >= g_modsegs[i].seg_start && v < g_modsegs[i].seg_end) return 1;
+    }
+    return 0;
+}
+
+static int anchor_read(task_t task, uint64_t addr, void *buf, size_t n) {
+    mach_vm_size_t got = 0;
+    kern_return_t kr = mach_vm_read_overwrite(task, (mach_vm_address_t)addr, (mach_vm_size_t)n,
+                                              (mach_vm_address_t)buf, &got);
+    return (kr == KERN_SUCCESS && got == n) ? 0 : -1;
+}
+
+static int anchor_scale1(const float *s) {
+    return fabsf(s[0] - 1.0f) < 0.02f && fabsf(s[1] - 1.0f) < 0.02f && fabsf(s[2] - 1.0f) < 0.02f;
+}
+
+int memread_coord_from_anchor(pid_t pid, uint64_t anchor, int max_depth,
+                              memread_anchor_coord_t *out, int cap, int *found,
+                              int *pobjects) {
+    if (found) *found = 0;
+    if (pobjects) *pobjects = 0;
+    if (!out || cap <= 0 || anchor == 0) return -2;
+    if (module_cache_ensure(pid) != 0 || g_modsegn == 0) return 2;
+    if (max_depth < 1) max_depth = 1;
+    if (max_depth > 6) max_depth = 6;
+
+    task_t task = MACH_PORT_NULL;
+    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
+
+    // 1) 找包含锚点的对象基址：向下扫最近处「指向模块（vtable）」的 8 字节
+    uint64_t base = 0;
+    for (uint64_t off = 8; off <= 0x2000; off += 8) {
+        if (anchor < off + 0x100000000ULL) break;
+        uint64_t b = anchor - off, v = 0;
+        if (anchor_read(task, b, &v, 8) != 0) continue;
+        if (anchor_in_module(v)) { base = b; break; }
+    }
+    if (base == 0) {
+        mach_port_deallocate(mach_task_self(), task);
+        return -3;   // 找不到对象基址
+    }
+
+    typedef struct { uint64_t b; int d; } aobj_t;
+    aobj_t *q = (aobj_t *)calloc(ANCHOR_OBJ_MAX, sizeof(aobj_t));
+    unsigned char *buf = (unsigned char *)malloc(ANCHOR_OBJ_BYTES);
+    if (!q || !buf) {
+        free(q); free(buf);
+        mach_port_deallocate(mach_task_self(), task);
+        return -4;
+    }
+
+    int qn = 0, qi = 0, found_n = 0;
+    q[qn].b = base; q[qn].d = 0; qn++;
+
+    while (qi < qn) {
+        uint64_t ob = q[qi].b;
+        int d = q[qi].d;
+        qi++;
+        if (pobjects) (*pobjects)++;
+        if (anchor_read(task, ob, buf, ANCHOR_OBJ_BYTES) != 0) continue;
+
+        for (int off = 0; off + 40 <= ANCHOR_OBJ_BYTES; off += 8) {
+            // 先认 FTransform（四元数 + 位移 + scale≈1）：这是组件世界变换
+            float q4[4], tr[3], sc[3];
+            memcpy(q4, buf + off, 16);
+            memcpy(tr, buf + off + 16, 12);
+            memcpy(sc, buf + off + 28, 12);
+            int triv = 1;
+            if (coord_quat_unit(q4, &triv) && !triv && coord_vec_ok(tr) && anchor_scale1(sc)) {
+                uint64_t ca = ob + (uint64_t)off + 16;
+                int dup = 0;
+                for (int i = 0; i < found_n; i++) if (out[i].coord_addr == ca) { dup = 1; break; }
+                if (!dup && found_n < cap) {
+                    out[found_n].coord_addr = ca;
+                    out[found_n].object = ob;
+                    out[found_n].v[0] = tr[0];
+                    out[found_n].v[1] = tr[1];
+                    out[found_n].v[2] = tr[2];
+                    out[found_n].depth = d;
+                    found_n++;
+                }
+                continue;    // 这一格是变换数据，不当指针
+            }
+            uint64_t v = 0;
+            memcpy(&v, buf + off, 8);
+            if (!anchor_ptr_ok(v) || d >= max_depth || qn >= ANCHOR_OBJ_MAX) continue;
+            uint64_t vt = 0;
+            if (anchor_read(task, v, &vt, 8) != 0) continue;     // 必须能读、且像对象
+            if (!anchor_in_module(vt)) continue;
+            int seen = 0;
+            for (int i = 0; i < qn; i++) if (q[i].b == v) { seen = 1; break; }
+            if (seen) continue;
+            q[qn].b = v; q[qn].d = d + 1; qn++;
+        }
+    }
+
+    // 层次浅的优先
+    for (int i = 1; i < found_n; i++) {
+        memread_anchor_coord_t key = out[i];
+        int j = i - 1;
+        while (j >= 0 && out[j].depth > key.depth) { out[j + 1] = out[j]; j--; }
+        out[j + 1] = key;
+    }
+
+    free(q);
+    free(buf);
+    mach_port_deallocate(mach_task_self(), task);
+    if (found) *found = found_n;
+    fprintf(stderr, "锚点推坐标: 基址=0x%llX 对象=%d 坐标=%d\n",
+            (unsigned long long)base, pobjects ? *pobjects : 0, found_n);
+    return 0;
+}
+
 #pragma mark - 反向链扫描（从目标地址往上找「谁指向它」）
 
 // 正向扫不到时用这个：拿目标地址当起点，反查哪块内存里的指针指向它，

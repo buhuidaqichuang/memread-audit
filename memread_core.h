@@ -163,6 +163,20 @@ typedef struct {
 int memread_coord_probe(pid_t pid, memread_coord_hit_t *out, int cap, int *found,
                         volatile int *cancel, memread_region_cb cb, void *ctx);
 
+// ---- 从已知锚点（如弹夹）推自己坐标：不用任何人工动作 ----
+// anchor = 已定位的弹夹地址；从包含它的对象沿「指针指向的对象」走 BFS（max_depth 层），
+// 在对象里找 FTransform（四元数 + 位移 + scale≈1），输出的就是各组件世界坐标
+typedef struct {
+    uint64_t coord_addr;    // FTransform.translation 地址
+    uint64_t object;        // 所在对象基址
+    float v[3];
+    int depth;              // 相对弹夹所在对象往下几层
+} memread_anchor_coord_t;
+
+int memread_coord_from_anchor(pid_t pid, uint64_t anchor, int max_depth,
+                              memread_anchor_coord_t *out, int cap, int *found,
+                              int *pobjects);
+
 // 一次扫描直接与基准比对（基准按地址查找），顺带给出共同地址数 / 位移非零数
 int memread_coord_probe_diff(pid_t pid, const memread_coord_hit_t *base, int nbase,
                              memread_coord_hit_t *out, int cap, int *found,

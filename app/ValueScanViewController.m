@@ -140,6 +140,7 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
     [self addButton:@"坐标扫描（走动→站定→跳）" width:W y:&y sel:@selector(onCoord)];
     [self addButton:@"坐标结构扫描（不用输坐标值）" width:W y:&y sel:@selector(onCoordProbe)];
     [self addButton:@"⑤ 后台自动捕捉坐标（不用切来切去）" width:W y:&y sel:@selector(onAutoCapture)];
+    [self addButton:@"⑥ 弹夹→自己坐标（不用动）" width:W y:&y sel:@selector(onAnchorCoord)];
     [self addButton:@"释放内存快照（省内存）" width:W y:&y sel:@selector(onFreeSnap)];
     [self addButton:@"查看候选列表（点一行读当前值）" width:W y:&y sel:@selector(onList)];
     [self addButton:@"已保存地址（自定义标签）" width:W y:&y sel:@selector(onSaved)];
@@ -783,6 +784,82 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
             [ok addAction:[UIAlertAction actionWithTitle:@"查看候选" style:UIAlertActionStyleDefault
                                                 handler:^(UIAlertAction *x) { [self2 onList]; }]];
             [self2 presentViewController:ok animated:YES completion:nil];
+        });
+    });
+}
+
+#pragma mark ⑥ 从弹夹锚点推自己坐标（不用人工动作）
+
+- (void)onAnchorCoord {
+    pid_t pid = [self ensurePid];
+    if (pid <= 0) return;
+    SavedAddress *pick = nil;
+    NSArray<SavedAddress *> *items = [[SavedAddressStore shared] allItems];
+    for (SavedAddress *it in items) {
+        NSString *t = [NSString stringWithFormat:@"%@%@", it.label ?: @"", it.group ?: @""];
+        if ([t rangeOfString:@"弹"].location != NSNotFound) { pick = it; break; }
+    }
+    if (!pick) {
+        for (SavedAddress *it in items) if (it.type == MEMREAD_VALTYPE_FLOAT) { pick = it; break; }
+    }
+    if (!pick) {
+        UIAlertController *e = [UIAlertController alertControllerWithTitle:@"没有锚点"
+                                                                  message:@"先在『已保存地址』里存一条弹夹地址（M4A1 那个 45.0 就行），再来点这里。"
+                                                           preferredStyle:UIAlertControllerStyleAlert];
+        [e addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+        [self presentViewController:e animated:YES completion:nil];
+        return;
+    }
+
+    uint64_t anchor = pick.addr;
+    [self.spinner startAnimating];
+    self.statusLabel.text = @"⑥ 从弹夹对象往外走指针…";
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        int cap = 60, found = 0, objs = 0;
+        memread_anchor_coord_t *out = (memread_anchor_coord_t *)malloc(sizeof(memread_anchor_coord_t) * (size_t)cap);
+        int rc = out ? memread_coord_from_anchor(pid, anchor, 4, out, cap, &found, &objs) : -4;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) self2 = ws;
+            if (!self2) { free(out); return; }
+            [self2.spinner stopAnimating];
+            NSString *diag = [NSString stringWithFormat:@"锚点 0x%llX（%@）· 走过 %d 个对象 · 坐标 %d 个",
+                              (unsigned long long)anchor, pick.label.length ? pick.label : @"float",
+                              objs, found];
+            [self2 appendProgressLine:diag];
+            if (rc != 0 || found <= 0) {
+                free(out);
+                NSString *why = (rc == -3) ? @"锚点附近没找到对象基址（这条弹夹地址可能不在对象字段里，或对象头不是 vtable 形态）"
+                    : (rc == 2 ? @"模块还没加载，稍后再试"
+                               : [NSString stringWithFormat:@"⑥ 失败 rc=%d", rc]);
+                self2.statusLabel.text = @"⑥ 没推出来";
+                [self2 appendProgressLine:why];
+                return;
+            }
+
+            uint64_t *addrs = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)found);
+            for (int i = 0; i < found; i++) addrs[i] = out[i].coord_addr;
+            memread_valscan_set(pid, addrs, found, MEMREAD_VALTYPE_FLOAT);
+            free(addrs);
+            self2.coordCandidates = YES;
+            [self2 refreshCount];
+
+            NSMutableString *msg = [NSMutableString stringWithFormat:@"%@\n\n", diag];
+            for (int i = 0; i < found && i < 6; i++) {
+                [msg appendFormat:@"%d) 0x%llX  (%.1f, %.1f, %.1f)  层%d\n", i + 1,
+                 (unsigned long long)out[i].coord_addr, out[i].v[0], out[i].v[1], out[i].v[2], out[i].depth];
+            }
+            [msg appendString:@"\n这些是从弹夹对象沿指针走出来的组件变换，通常第 1~2 条里就有自己根组件。\n点『查看候选』可直接对每条点『链』。"];
+            free(out);
+
+            UIAlertController *ok = [UIAlertController alertControllerWithTitle:@"⑥ 从弹夹推出来的坐标"
+                                                                       message:msg
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+            [ok addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+            [ok addAction:[UIAlertAction actionWithTitle:@"查看候选" style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *x) { [self2 onList]; }]];
+            [self2 presentViewController:ok animated:YES completion:nil];
+            self2.statusLabel.text = [NSString stringWithFormat:@"⑥ 坐标 %d 个（层浅优先）", found];
         });
     });
 }
