@@ -358,6 +358,82 @@ static int cmd_live(int argc, char **argv) {
     return 0;
 }
 
+typedef struct { uint64_t addr; float v[3]; } ent_t;
+typedef struct { float d; float dv[3]; float a[3]; float b[3]; uint64_t addr; } cmp_t;
+
+static int ent_cmp_addr(const void *x, const void *y) {
+    const ent_t *a = (const ent_t *)x, *b = (const ent_t *)y;
+    if (a->addr < b->addr) return -1;
+    if (a->addr > b->addr) return 1;
+    return 0;
+}
+
+static int cmp_cmp_desc(const void *x, const void *y) {
+    const cmp_t *a = (const cmp_t *)x, *b = (const cmp_t *)y;
+    if (a->d < b->d) return 1;
+    if (a->d > b->d) return -1;
+    return 0;
+}
+
+// 两份快照直接比对（纯 CPU，不再扫内存）
+static int cmd_coordcmp(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "用法: coordcmp <fileA> <fileB> [min_delta] [topN]\n"); return 1; }
+    float min_delta = (argc >= 5) ? (float)atof(argv[4]) : 1.0f;
+    int topn = (argc >= 6) ? atoi(argv[5]) : 60;
+
+    ent_t *ea = NULL, *eb = NULL;
+    int na = 0, nb = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        FILE *f = fopen(argv[2 + pass], "rb");
+        if (!f) { fprintf(stderr, "打不开 %s\n", argv[2 + pass]); free(ea); free(eb); return 4; }
+        save_head_t h;
+        if (fread(&h, sizeof(h), 1, f) != 1 || h.magic != SAVE_MAGIC) { fclose(f); free(ea); free(eb); return 4; }
+        int n = (int)h.n;
+        memread_coord_hit_t *tmp = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * (n > 0 ? n : 1));
+        if (!tmp) { fclose(f); free(ea); free(eb); return 3; }
+        if (fread(tmp, sizeof(memread_coord_hit_t), n, f) != (size_t)n) { fclose(f); free(tmp); free(ea); free(eb); return 4; }
+        fclose(f);
+        ent_t *e = (ent_t *)malloc(sizeof(ent_t) * (n > 0 ? n : 1));
+        if (!e) { free(tmp); free(ea); free(eb); return 3; }
+        for (int i = 0; i < n; i++) { e[i].addr = tmp[i].addr; e[i].v[0] = tmp[i].v[0]; e[i].v[1] = tmp[i].v[1]; e[i].v[2] = tmp[i].v[2]; }
+        free(tmp);
+        qsort(e, n, sizeof(ent_t), ent_cmp_addr);
+        if (pass == 0) { e ? (ea = e) : (ea = NULL); na = n; } else { eb = e; nb = n; }
+    }
+
+    int cap = na < nb ? na : nb;
+    cmp_t *out = (cmp_t *)malloc(sizeof(cmp_t) * (cap > 0 ? cap : 1));
+    if (!out) { free(ea); free(eb); return 3; }
+    int i = 0, j = 0, ncommon = 0, nmoved = 0;
+    while (i < na && j < nb) {
+        if (ea[i].addr < eb[j].addr) { i++; continue; }
+        if (ea[i].addr > eb[j].addr) { j++; continue; }
+        ncommon++;
+        float d0 = eb[j].v[0] - ea[i].v[0], d1 = eb[j].v[1] - ea[i].v[1], d2 = eb[j].v[2] - ea[i].v[2];
+        float d = (float)sqrt((double)(d0 * d0 + d1 * d1 + d2 * d2));
+        if (d >= min_delta) {
+            out[nmoved].addr = ea[i].addr;
+            out[nmoved].d = d;
+            out[nmoved].dv[0] = d0; out[nmoved].dv[1] = d1; out[nmoved].dv[2] = d2;
+            out[nmoved].a[0] = ea[i].v[0]; out[nmoved].a[1] = ea[i].v[1]; out[nmoved].a[2] = ea[i].v[2];
+            out[nmoved].b[0] = eb[j].v[0]; out[nmoved].b[1] = eb[j].v[1]; out[nmoved].b[2] = eb[j].v[2];
+            nmoved++;
+        }
+        i++; j++;
+    }
+    qsort(out, nmoved, sizeof(cmp_t), cmp_cmp_desc);
+    printf("A=%d B=%d 共同地址=%d 位移>=%.2f 的有 %d\n", na, nb, ncommon, min_delta, nmoved);
+    int shown = nmoved < topn ? nmoved : topn;
+    for (int k = 0; k < shown; k++) {
+        printf("%3d  0x%-12llx d=%-8.2f dv=(%+.2f,%+.2f,%+.2f)  A=(%.2f,%.2f,%.2f) -> B=(%.2f,%.2f,%.2f)\n",
+               k, (unsigned long long)out[k].addr, out[k].d, out[k].dv[0], out[k].dv[1], out[k].dv[2],
+               out[k].a[0], out[k].a[1], out[k].a[2], out[k].b[0], out[k].b[1], out[k].b[2]);
+    }
+    printf("-- 显示 %d / %d\n", shown, nmoved);
+    free(out); free(ea); free(eb);
+    return 0;
+}
+
 static int cmd_anchor(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "用法: anchor <pid> <anchor_hex> [depth] [cap]\n"); return 1; }
     int pid = atoi(argv[2]);
@@ -463,13 +539,14 @@ static void usage(const char *prog) {
         "  %s coordsave <pid> <file>\n"
         "  %s coorddiff <pid> <file> [0=全量|1=姿态] [显示条数]\n"
         "  %s anchor <pid> <anchor_hex> [depth] [cap]\n"
+        "  %s coordcmp <fileA> <fileB> [min_delta] [topN]\n"
         "  %s live <pid> <seconds> <interval_ms> [min_delta] [topN]\n"
         "  %s watch <pid> <file> <seconds> <interval_ms> [min_delta] [topN]\n"
         "  %s read <pid> <addr_hex> [f|i|l|d]\n"
         "  %s chain <pid> <addr_hex> [depth] [cap]\n"
         "  %s modinfo <pid> <addr_hex>\n"
         "  %s token <pid>\n"
-        "  %s dump <pid> <out.bin> [rw-only]\n", prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+        "  %s dump <pid> <out.bin> [rw-only]\n", prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
@@ -482,6 +559,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "anchor"))    return cmd_anchor(argc, argv);
     if (!strcmp(cmd, "watch"))     return cmd_watch(argc, argv);
     if (!strcmp(cmd, "live"))      return cmd_live(argc, argv);
+    if (!strcmp(cmd, "coordcmp"))  return cmd_coordcmp(argc, argv);
     if (!strcmp(cmd, "read"))      return cmd_read(argc, argv);
     if (!strcmp(cmd, "chain"))     return cmd_chain(argc, argv);
     if (!strcmp(cmd, "modinfo"))   return cmd_modinfo(argc, argv);
