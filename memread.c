@@ -487,6 +487,7 @@ static int cmd_cluster(int argc, char **argv) {
     int pid = pid_arg(argv[2]);
     int minn = (argc >= 4) ? atoi(argv[3]) : 4;
     int topn = (argc >= 5) ? atoi(argv[4]) : 25;
+    float minzspan = (argc >= 6) ? (float)atof(argv[5]) : 0.0f;
     memread_coord_hit_t *hits = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * MEMREAD_COORD_HIT_CAP);
     if (!hits) return 3;
     int found = 0;
@@ -508,9 +509,9 @@ static int cmd_cluster(int argc, char **argv) {
         int j = i + 1;
         while (j < found && cpt_cmp_xy(&pts[i], &pts[j]) == 0) j++;
         int cnt = j - i;
-        if (cnt >= minn) {
-            float lo = pts[i].z, hi = pts[i].z;
-            for (int k = i; k < j; k++) { if (pts[k].z < lo) lo = pts[k].z; if (pts[k].z > hi) hi = pts[k].z; }
+        float lo = pts[i].z, hi = pts[i].z;
+        for (int k = i; k < j; k++) { if (pts[k].z < lo) lo = pts[k].z; if (pts[k].z > hi) hi = pts[k].z; }
+        if (cnt >= minn && (hi - lo) >= minzspan) {
             printf("%2d  xy=(%.2f, %.2f)  n=%-3d z=[%.2f .. %.2f]\n", shown, pts[i].x, pts[i].y, cnt, lo, hi);
             int sl = 0;
             for (int k = i; k < j && sl < 8; k++) {
