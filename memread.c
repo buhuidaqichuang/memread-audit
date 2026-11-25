@@ -470,6 +470,60 @@ static int cmd_chainval(int argc, char **argv) {
     return rc == 0 ? 0 : 4;
 }
 
+// 按「XY 相同、Z 不同」聚类：同一角色的多个挂点会共享 XY
+typedef struct { float x, y, z; uint64_t addr; } cpt_t;
+static int cpt_cmp_xy(const void *a, const void *b) {
+    const cpt_t *p = (const cpt_t *)a, *q = (const cpt_t *)b;
+    long px = lroundf(p->x * 100.0f), py = lroundf(p->y * 100.0f);
+    long qx = lroundf(q->x * 100.0f), qy = lroundf(q->y * 100.0f);
+    if (px != qx) return px < qx ? -1 : 1;
+    if (py != qy) return py < qy ? -1 : 1;
+    return 0;
+}
+
+static int cmd_cluster(int argc, char **argv) {
+    int pid = atoi(argv[2]);
+    int minn = (argc >= 4) ? atoi(argv[3]) : 4;
+    int topn = (argc >= 5) ? atoi(argv[4]) : 25;
+    memread_coord_hit_t *hits = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * MEMREAD_COORD_HIT_CAP);
+    if (!hits) return 3;
+    int found = 0;
+    int rc = memread_coord_probe(pid, hits, MEMREAD_COORD_HIT_CAP, &found, NULL, NULL, NULL);
+    printf("扫描: rc=%d 命中=%d\n", rc, found);
+    if (rc != 0 || found <= 0) { free(hits); return 2; }
+
+    cpt_t *pts = (cpt_t *)malloc(sizeof(cpt_t) * found);
+    if (!pts) { free(hits); return 3; }
+    for (int i = 0; i < found; i++) {
+        pts[i].x = hits[i].v[0]; pts[i].y = hits[i].v[1]; pts[i].z = hits[i].v[2];
+        pts[i].addr = hits[i].addr;
+    }
+    qsort(pts, found, sizeof(cpt_t), cpt_cmp_xy);
+
+    int shown = 0;
+    int i = 0;
+    while (i < found && shown < topn) {
+        int j = i + 1;
+        while (j < found && cpt_cmp_xy(&pts[i], &pts[j]) == 0) j++;
+        int cnt = j - i;
+        if (cnt >= minn) {
+            float lo = pts[i].z, hi = pts[i].z;
+            for (int k = i; k < j; k++) { if (pts[k].z < lo) lo = pts[k].z; if (pts[k].z > hi) hi = pts[k].z; }
+            printf("%2d  xy=(%.2f, %.2f)  n=%-3d z=[%.2f .. %.2f]\n", shown, pts[i].x, pts[i].y, cnt, lo, hi);
+            int sl = 0;
+            for (int k = i; k < j && sl < 8; k++) {
+                printf("      0x%-12llx z=%.2f\n", (unsigned long long)pts[k].addr, pts[k].z);
+                sl++;
+            }
+            shown++;
+        }
+        i = j;
+    }
+    printf("-- 聚类 %d 组（>=%d 个同 XY）\n", shown, minn);
+    free(pts); free(hits);
+    return 0;
+}
+
 static int cmd_anchor(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "用法: anchor <pid> <anchor_hex> [depth] [cap]\n"); return 1; }
     int pid = atoi(argv[2]);
@@ -575,6 +629,7 @@ static void usage(const char *prog) {
         "  %s coordsave <pid> <file>\n"
         "  %s coorddiff <pid> <file> [0=全量|1=姿态] [显示条数]\n"
         "  %s anchor <pid> <anchor_hex> [depth] [cap]\n"
+        "  %s cluster <pid> [minN] [topN]\n"
         "  %s chainval <pid> <static_off_hex> <depth> <off1> [off2] ...\n"
         "  %s coordcmp <fileA> <fileB> [min_delta] [topN]\n"
         "  %s live <pid> <seconds> <interval_ms> [min_delta] [topN]\n"
@@ -583,7 +638,7 @@ static void usage(const char *prog) {
         "  %s chain <pid> <addr_hex> [depth] [cap]\n"
         "  %s modinfo <pid> <addr_hex>\n"
         "  %s token <pid>\n"
-        "  %s dump <pid> <out.bin> [rw-only]\n", prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+        "  %s dump <pid> <out.bin> [rw-only]\n", prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
@@ -598,6 +653,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "live"))      return cmd_live(argc, argv);
     if (!strcmp(cmd, "coordcmp"))  return cmd_coordcmp(argc, argv);
     if (!strcmp(cmd, "chainval"))  return cmd_chainval(argc, argv);
+    if (!strcmp(cmd, "cluster"))   return cmd_cluster(argc, argv);
     if (!strcmp(cmd, "read"))      return cmd_read(argc, argv);
     if (!strcmp(cmd, "chain"))     return cmd_chain(argc, argv);
     if (!strcmp(cmd, "modinfo"))   return cmd_modinfo(argc, argv);
