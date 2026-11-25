@@ -1,25 +1,290 @@
-// memread.c — 命令行形态
-// 用法: memread <pid> <out.bin> [rw-only]
+// memread.c — 命令行形态（SSH / NewTerm 用）
+// 目标：让扫描逻辑可以在设备上直接跑、直接打印结果，用于远程迭代
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <time.h>
 #include "memread_core.h"
+
+#define SAVE_MAGIC 0x4D524344u
+
+typedef struct {
+    unsigned int magic;
+    unsigned int n;
+} save_head_t;
+
+static const char *type_name(int t) {
+    switch (t) {
+        case MEMREAD_VALTYPE_INT32: return "int32";
+        case MEMREAD_VALTYPE_INT64: return "int64";
+        case MEMREAD_VALTYPE_FLOAT: return "float";
+        case MEMREAD_VALTYPE_DOUBLE: return "double";
+        default: return "auto";
+    }
+}
+
+static double now_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+static int parse_type(const char *s) {
+    if (!s) return MEMREAD_VALTYPE_FLOAT;
+    if (!strcmp(s, "i") || !strcmp(s, "int32")) return MEMREAD_VALTYPE_INT32;
+    if (!strcmp(s, "l") || !strcmp(s, "int64")) return MEMREAD_VALTYPE_INT64;
+    if (!strcmp(s, "d") || !strcmp(s, "double")) return MEMREAD_VALTYPE_DOUBLE;
+    return MEMREAD_VALTYPE_FLOAT;
+}
+
+static int find_pid_by_name(const char *needle) {
+    pid_t pids[4096];
+    int n = memread_list_procs(pids, 4096);
+    char path[MEMREAD_PROC_PATH_MAX];
+    for (int i = 0; i < n; i++) {
+        if (memread_proc_path(pids[i], path, sizeof(path)) <= 0) continue;
+        if (strstr(path, needle)) return (int)pids[i];
+    }
+    return -1;
+}
+
+static void print_coord_hits(const memread_coord_hit_t *h, int n, int limit) {
+    if (limit > n) limit = n;
+    for (int i = 0; i < limit; i++) {
+        printf("%3d  addr=0x%llx  v=(%.4f, %.4f, %.4f)  quat=%d\n",
+               i, (unsigned long long)h[i].addr,
+               h[i].v[0], h[i].v[1], h[i].v[2], h[i].quat_off);
+    }
+    if (n > limit) printf("... 共 %d 条，只显示前 %d 条\n", n, limit);
+}
+
+static int cmd_procs(int argc, char **argv) {
+    pid_t pids[4096];
+    int n = memread_list_procs(pids, 4096);
+    char path[MEMREAD_PROC_PATH_MAX];
+    const char *filter = (argc >= 3) ? argv[2] : NULL;
+    int shown = 0;
+    for (int i = 0; i < n; i++) {
+        if (memread_proc_path(pids[i], path, sizeof(path)) <= 0) continue;
+        if (filter && !strstr(path, filter)) continue;
+        printf("%5d  %s\n", (int)pids[i], path);
+        shown++;
+    }
+    printf("-- %d 条\n", shown);
+    return 0;
+}
+
+static int cmd_coordscan(int argc, char **argv) {
+    const char *target = argv[2];
+    int pid = atoi(target);
+    if (pid <= 0 && (pid = find_pid_by_name(target)) < 0) { fprintf(stderr, "找不到进程 %s\n", target); return 2; }
+    int limit = (argc >= 4) ? atoi(argv[3]) : 40;
+
+    memread_coord_hit_t *buf = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * MEMREAD_COORD_HIT_CAP);
+    if (!buf) { fprintf(stderr, "内存不足\n"); return 3; }
+    int found = 0;
+    double t0 = now_s();
+    int rc = memread_coord_probe(pid, buf, MEMREAD_COORD_HIT_CAP, &found, NULL, NULL, NULL);
+    double t1 = now_s();
+    printf("pid=%d  rc=%d  命中=%d  用时=%.2fs\n", pid, rc, found, t1 - t0);
+    if (found > 0) print_coord_hits(buf, found, limit);
+    free(buf);
+    return rc == 0 ? 0 : 2;
+}
+
+static int cmd_coordsave(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "用法: coordsave <pid> <file>\n"); return 1; }
+    int pid = atoi(argv[2]);
+    memread_coord_hit_t *buf = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * MEMREAD_COORD_HIT_CAP);
+    if (!buf) return 3;
+    int found = 0;
+    double t0 = now_s();
+    int rc = memread_coord_probe(pid, buf, MEMREAD_COORD_HIT_CAP, &found, NULL, NULL, NULL);
+    printf("pid=%d rc=%d 命中=%d 用时=%.2fs\n", pid, rc, found, now_s() - t0);
+    if (rc == 0 && found > 0) {
+        FILE *f = fopen(argv[3], "wb");
+        if (!f) { free(buf); return 4; }
+        save_head_t h = { SAVE_MAGIC, (unsigned int)found };
+        fwrite(&h, sizeof(h), 1, f);
+        fwrite(buf, sizeof(memread_coord_hit_t), found, f);
+        fclose(f);
+        printf("已保存 %d 条 -> %s\n", found, argv[3]);
+    }
+    free(buf);
+    return rc == 0 ? 0 : 2;
+}
+
+static int cmd_coorddiff(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "用法: coorddiff <pid> <file> [mode] [limit]\n"); return 1; }
+    int pid = atoi(argv[2]);
+    FILE *f = fopen(argv[3], "rb");
+    if (!f) { fprintf(stderr, "打不开基准文件\n"); return 4; }
+    save_head_t h;
+    if (fread(&h, sizeof(h), 1, f) != 1 || h.magic != SAVE_MAGIC) { fclose(f); fprintf(stderr, "基准文件格式不对\n"); return 4; }
+    int nbase = (int)h.n;
+    memread_coord_hit_t *base = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * nbase);
+    if (!base) { fclose(f); return 3; }
+    if (fread(base, sizeof(memread_coord_hit_t), nbase, f) != (size_t)nbase) { fclose(f); free(base); return 4; }
+    fclose(f);
+
+    memread_coord_hit_t *cur = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * MEMREAD_COORD_HIT_CAP);
+    if (!cur) { free(base); return 3; }
+
+    int ncur = 0, found = 0, common = 0, moved = 0;
+    float maxdelta = 0, pdelta = 0;
+    double t0 = now_s();
+    ncur = memread_coord_probe(pid, cur, MEMREAD_COORD_HIT_CAP, &found, NULL, NULL, NULL);
+    if (ncur != 0) { printf("重扫失败 rc=%d\n", ncur); }
+    printf("基准=%d 本轮命中=%d 用时=%.2fs\n", nbase, found, now_s() - t0);
+
+    memread_coord_hit_t *out = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * MEMREAD_COORD_HIT_CAP);
+    if (!out) { free(base); free(cur); return 3; }
+
+    const char *mode = (argc >= 5) ? argv[4] : "0";
+    int ndiff = 0;
+    if (mode[0] == '1') {
+        ndiff = memread_coord_probe_jump(pid, base, nbase, out, MEMREAD_COORD_HIT_CAP, &found, &common, &moved, &pdelta, NULL, NULL, NULL);
+        printf("姿态过滤: rc=%d 保留=%d 共同地址=%d 已变动=%d 最大位移=%.2f\n", ndiff, found, common, moved, pdelta);
+    } else {
+        ndiff = memread_coord_probe_diff(pid, base, nbase, out, MEMREAD_COORD_HIT_CAP, &found, &common, &moved, &maxdelta, 0.001f, 1e9f, NULL, NULL, NULL);
+        printf("全量比对: rc=%d 保留=%d 共同地址=%d 已变动=%d 最大位移=%.2f\n", ndiff, found, common, moved, maxdelta);
+    }
+    (void)ndiff;
+    int limit = (argc >= 6) ? atoi(argv[5]) : 40;
+    print_coord_hits(out, found, limit);
+
+    free(out); free(base); free(cur);
+    return 0;
+}
+
+static int cmd_anchor(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "用法: anchor <pid> <anchor_hex> [depth] [cap]\n"); return 1; }
+    int pid = atoi(argv[2]);
+    unsigned long long anchor = strtoull(argv[3], NULL, 0);
+    int depth = (argc >= 5) ? atoi(argv[4]) : 4;
+    int cap = (argc >= 6) ? atoi(argv[5]) : 200;
+    memread_anchor_coord_t *out = (memread_anchor_coord_t *)malloc(sizeof(memread_anchor_coord_t) * cap);
+    if (!out) return 3;
+    int found = 0, objects = 0;
+    double t0 = now_s();
+    int rc = memread_coord_from_anchor(pid, anchor, depth, out, cap, &found, &objects);
+    printf("rc=%d 对象数=%d 坐标命中=%d 用时=%.2fs\n", rc, objects, found, now_s() - t0);
+    for (int i = 0; i < found && i < cap; i++) {
+        printf("%3d  coord=0x%llx  object=0x%llx  depth=%d  v=(%.3f, %.3f, %.3f)\n",
+               i, (unsigned long long)out[i].coord_addr, (unsigned long long)out[i].object,
+               out[i].depth, out[i].v[0], out[i].v[1], out[i].v[2]);
+    }
+    free(out);
+    return 0;
+}
+
+static int cmd_read(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "用法: read <pid> <addr_hex> [f|i|l|d]\n"); return 1; }
+    int pid = atoi(argv[2]);
+    unsigned long long addr = strtoull(argv[3], NULL, 0);
+    int t = parse_type(argc >= 5 ? argv[4] : "f");
+    double val = 0;
+    int rc = memread_read_scalar(pid, addr, t, &val);
+    printf("rc=%d addr=0x%llx type=%s value=%.6f\n", rc, addr, type_name(t), val);
+    if (t == MEMREAD_VALTYPE_FLOAT) {
+        float v3[3] = {0};
+        if (memread_read_vec3(pid, addr, v3) == 0) printf("vec3=(%.4f, %.4f, %.4f)\n", v3[0], v3[1], v3[2]);
+    }
+    return rc == 0 ? 0 : 2;
+}
+
+static int cmd_chain(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "用法: chain <pid> <addr_hex> [depth] [cap]\n"); return 1; }
+    int pid = atoi(argv[2]);
+    unsigned long long addr = strtoull(argv[3], NULL, 0);
+    int depth = (argc >= 5) ? atoi(argv[4]) : 4;
+    int cap = (argc >= 6) ? atoi(argv[5]) : 50;
+    memread_chain_t *out = (memread_chain_t *)malloc(sizeof(memread_chain_t) * cap);
+    if (!out) return 3;
+    int found = 0;
+    int rc = memread_chain_scan(pid, addr, depth, out, cap, &found, NULL);
+    printf("正向: rc=%d 链数=%d\n", rc, found);
+    for (int i = 0; i < found && i < cap; i++) {
+        printf("  [%d] %s+0x%llx depth=%d valid=%d flags=0x%x offs=", i, out[i].name,
+               (unsigned long long)out[i].static_off, out[i].depth, out[i].valid_hops, out[i].flags);
+        for (int k = 0; k < out[i].depth; k++) printf("%s%lld", k ? "," : "", (long long)out[i].offs[k]);
+        printf("\n");
+    }
+    if (found == 0) {
+        int r2 = memread_chain_scan_reverse(pid, addr, depth, out, cap);
+        printf("反向: rc=%d 链数=%d\n", r2, r2 > 0 ? r2 : 0);
+        for (int i = 0; i < r2 && i < cap; i++) {
+            printf("  [%d] %s+0x%llx depth=%d valid=%d offs=", i, out[i].name,
+                   (unsigned long long)out[i].static_off, out[i].depth, out[i].valid_hops);
+            for (int k = 0; k < out[i].depth; k++) printf("%s%lld", k ? "," : "", (long long)out[i].offs[k]);
+            printf("\n");
+        }
+    }
+    free(out);
+    return 0;
+}
+
+static int cmd_modinfo(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "用法: modinfo <pid> <addr_hex>\n"); return 1; }
+    int pid = atoi(argv[2]);
+    unsigned long long addr = strtoull(argv[3], NULL, 0);
+    char uuid[64] = {0}, name[128] = {0};
+    unsigned long long base = 0, off = 0;
+    int rc = memread_addr_module_info(pid, addr, uuid, sizeof(uuid), name, sizeof(name), &base, &off);
+    printf("rc=%d uuid=%s name=%s base=0x%llx off=0x%llx\n", rc, uuid, name, base, off);
+    return 0;
+}
+
+static int cmd_token(int argc, char **argv) {
+    if (argc < 3) return 1;
+    int pid = atoi(argv[2]);
+    char uuid[64] = {0};
+    unsigned long long base = 0;
+    int rc = memread_proc_token(pid, uuid, sizeof(uuid), &base);
+    printf("rc=%d uuid=%s mainbase=0x%llx\n", rc, uuid, base);
+    return 0;
+}
+
+static int cmd_dump(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "用法: dump <pid> <out.bin> [rw-only]\n"); return 1; }
+    int pid = atoi(argv[2]);
+    int rw_only = (argc >= 5 && strcmp(argv[4], "rw-only") == 0);
+    int rc = memread_dump(pid, argv[3], rw_only, NULL, NULL);
+    printf("rc=%d -> %s\n", rc, argv[3]);
+    return rc == 0 ? 0 : 2;
+}
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "用法: %s <pid> <out.bin> [rw-only]\n"
-        "  pid      目标进程 pid\n"
-        "  out.bin  输出文件\n"
-        "  rw-only  只 dump 可写数据区（堆/栈/__DATA）\n", prog);
+        "用法:\n"
+        "  %s procs [过滤串]\n"
+        "  %s coordscan <pid|进程名> [显示条数]\n"
+        "  %s coordsave <pid> <file>\n"
+        "  %s coorddiff <pid> <file> [0=全量|1=姿态] [显示条数]\n"
+        "  %s anchor <pid> <anchor_hex> [depth] [cap]\n"
+        "  %s read <pid> <addr_hex> [f|i|l|d]\n"
+        "  %s chain <pid> <addr_hex> [depth] [cap]\n"
+        "  %s modinfo <pid> <addr_hex>\n"
+        "  %s token <pid>\n"
+        "  %s dump <pid> <out.bin> [rw-only]\n", prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
-    if (argc < 3) { usage(argv[0]); return 1; }
-    pid_t pid = (pid_t)atoi(argv[1]);
-    if (pid <= 0) { fprintf(stderr, "非法 pid\n"); return 1; }
-    int rw_only = (argc >= 4 && strcmp(argv[3], "rw-only") == 0);
-    int rc = memread_dump(pid, argv[2], rw_only, NULL, NULL);
-    fprintf(stderr, "本次读取未使用 ptrace / 未注入镜像, 目标进程不可感知\n");
-    return rc == 0 ? 0 : 2;
+    if (argc < 2) { usage(argv[0]); return 1; }
+    const char *cmd = argv[1];
+    if (!strcmp(cmd, "procs"))     return cmd_procs(argc, argv);
+    if (!strcmp(cmd, "coordscan")) return cmd_coordscan(argc, argv);
+    if (!strcmp(cmd, "coordsave")) return cmd_coordsave(argc, argv);
+    if (!strcmp(cmd, "coorddiff")) return cmd_coorddiff(argc, argv);
+    if (!strcmp(cmd, "anchor"))    return cmd_anchor(argc, argv);
+    if (!strcmp(cmd, "read"))      return cmd_read(argc, argv);
+    if (!strcmp(cmd, "chain"))     return cmd_chain(argc, argv);
+    if (!strcmp(cmd, "modinfo"))   return cmd_modinfo(argc, argv);
+    if (!strcmp(cmd, "token"))     return cmd_token(argc, argv);
+    if (!strcmp(cmd, "dump"))      return cmd_dump(argc, argv);
+    usage(argv[0]);
+    return 1;
 }
