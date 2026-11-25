@@ -7,6 +7,10 @@
 #include <dlfcn.h>
 #include <unistd.h>
 #include <sys/sysctl.h>
+#include <mach/mach.h>
+#include <mach/task.h>
+
+extern kern_return_t task_for_pid(mach_port_t target_tport, int pid, mach_port_t *t);
 #include <string.h>
 #include <stdlib.h>
 #include <QuartzCore/QuartzCore.h>
