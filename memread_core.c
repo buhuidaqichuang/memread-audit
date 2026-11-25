@@ -2487,7 +2487,8 @@ int memread_coord_probe(pid_t pid, memread_coord_hit_t *out, int cap, int *found
     c.qcap[2] = cap;
     c.qcap[3] = 0;
     unsigned long long scanned = 0;
-    coord_strict_mode = 1;
+    const char *loose_env = getenv("MEMREAD_LOOSE");
+    coord_strict_mode = (loose_env && loose_env[0] != '0') ? 0 : 1;
     int rc = coord_scan(pid, coord_collect_visit, &c, &scanned, cancel, cb, ctx);
     if (rc == 0 && c.n == 0) {
         // 严格模式一个都没命中（可能不是 UE 的 FTransform 排布）→ 退回宽松模式重扫

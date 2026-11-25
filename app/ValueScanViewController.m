@@ -15,6 +15,18 @@ extern kern_return_t task_for_pid(mach_port_t target_tport, int pid, mach_port_t
 #include <stdlib.h>
 #include <QuartzCore/QuartzCore.h>
 
+// ⑧ 一键读自己坐标：按 XY 聚类用的比较器
+static int MemCmpCoordXY(const void *a, const void *b) {
+    const memread_coord_hit_t *p = (const memread_coord_hit_t *)a;
+    const memread_coord_hit_t *q = (const memread_coord_hit_t *)b;
+    long px = lroundf(p->v[0] * 100.0f), py = lroundf(p->v[1] * 100.0f);
+    long qx = lroundf(q->v[0] * 100.0f), qy = lroundf(q->v[1] * 100.0f);
+    if (px != qx) return px < qx ? -1 : 1;
+    if (py != qy) return py < qy ? -1 : 1;
+    return 0;
+}
+
+
 @interface ValueScanViewController ()
 @property (nonatomic, strong) UIScrollView *scroll;
 @property (nonatomic, strong) UILabel *infoLabel;
@@ -872,8 +884,82 @@ static NSString *probe_tfp(pid_t pid) {
 
 #pragma mark ⑥ 从弹夹锚点推自己坐标（不用人工动作）
 
-- (void)onAnchorCoord {
+#pragma mark ⑧ 一键读自己坐标（扫一次，自动挑出本角色）
+- (void)onSelfCoord {
     pid_t pid = [self ensurePid];
+    if (pid <= 0) return;
+    [self.spinner startAnimating];
+    self.statusLabel.text = @"⑧ 扫描中（10~15 秒），这期间别切出游戏太多…";
+    [self appendProgressLine:@"⑧ 开始扫一次，按『多副本 + Z 跨到头顶』挑自己那一簇"];
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        memread_coord_hit_t *hits = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * MEMREAD_COORD_HIT_CAP);
+        int found = 0;
+        int rc = hits ? memread_coord_probe(pid, hits, MEMREAD_COORD_HIT_CAP, &found, NULL, NULL, NULL) : -4;
+
+        int bestCnt = 0; float bx = 0, by = 0, blo = 0, bhi = 0;
+        uint64_t feetAddr = 0, camAddr = 0;
+        if (rc == 0 && found > 0) {
+            qsort(hits, (size_t)found, sizeof(memread_coord_hit_t), MemCmpCoordXY);
+            int i = 0;
+            while (i < found) {
+                int j = i + 1;
+                while (j < found && MemCmpCoordXY(&hits[i], &hits[j]) == 0) j++;
+                int cnt = j - i;
+                float lo = hits[i].v[2], hi = hits[i].v[2];
+                int loK = i, hiK = i;
+                for (int k = i; k < j; k++) {
+                    if (hits[k].v[2] < lo) { lo = hits[k].v[2]; loK = k; }
+                    if (hits[k].v[2] > hi) { hi = hits[k].v[2]; hiK = k; }
+                }
+                float ax = fabsf(hits[i].v[0]), ay = fabsf(hits[i].v[1]);
+                if (cnt >= 8 && (hi - lo) >= 60.0f && hi > 120.0f &&
+                    (ax > 50.0f || ay > 50.0f) && cnt > bestCnt) {
+                    bestCnt = cnt; bx = hits[i].v[0]; by = hits[i].v[1]; blo = lo; bhi = hi;
+                    feetAddr = hits[loK].addr; camAddr = hits[hiK].addr;
+                }
+                i = j;
+            }
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) self2 = ws;
+            if (!self2) { free(hits); return; }
+            [self2.spinner stopAnimating];
+            if (!hits) return;
+            if (rc != 0 || found <= 0 || bestCnt == 0) {
+                self2.statusLabel.text = [NSString stringWithFormat:@"⑧ 没找到（命中 %d）", found];
+                [self2 appendProgressLine:(rc != 0
+                    ? [NSString stringWithFormat:@"⑧ 扫描失败 rc=%d（游戏可能在加载/lobby，命中 %d）", rc, found]
+                    : [NSString stringWithFormat:@"⑧ 命中 %d 条，但没有符合『多副本+Z跨到头顶』的簇：世界可能还没加载", found])];
+                free(hits);
+                return;
+            }
+
+            uint64_t addrs[3] = { feetAddr, camAddr, 0 };
+            memread_valscan_set(pid, addrs, 2, MEMREAD_VALTYPE_FLOAT);
+            self2.coordCandidates = YES;
+            self2.countLabel.text = @"候选: 2（脚底 / 相机）";
+            self2.statusLabel.text = [NSString stringWithFormat:@"⑧ 自己坐标 feet=(%.2f, %.2f, %.2f)", bx, by, blo];
+
+            NSString *msg = [NSString stringWithFormat:
+                @"脚底  (%.4f, %.4f, %.4f)   addr=0x%llX\n相机  (%.4f, %.4f, %.4f)   addr=0x%llX\n\n副本 %d 份，Z 跨度 %.1f（脚底→头顶）。\n判据：副本数≥8 且 Z 跨到 120 以上、XY 不贴原点。\n\n这两个地址此后只读 12 字节，安全，不会闪退。",
+                bx, by, blo, (unsigned long long)feetAddr,
+                bx, by, bhi, (unsigned long long)camAddr,
+                bestCnt, bhi - blo];
+            [self2 appendProgressLine:[NSString stringWithFormat:@"⑧ 脚底 0x%llX / 相机 0x%llX（副本 %d）",
+                                       (unsigned long long)feetAddr, (unsigned long long)camAddr, bestCnt]];
+            UIAlertController *ok = [UIAlertController alertControllerWithTitle:@"⑧ 你自己角色的世界坐标"
+                                                                       message:msg
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+            [ok addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+            [self2 presentViewController:ok animated:YES completion:nil];
+            free(hits);
+        });
+    });
+}
+
+- (void)onAnchorCoord {    pid_t pid = [self ensurePid];
     if (pid <= 0) return;
     SavedAddress *pick = nil;
     NSArray<SavedAddress *> *items = [[SavedAddressStore shared] allItems];
