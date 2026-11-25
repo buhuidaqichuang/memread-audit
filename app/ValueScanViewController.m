@@ -4,7 +4,6 @@
 #import "SavedAddressStore.h"
 #import "memread_core.h"
 #import "FloatPanelController.h"
-#include <libproc.h>
 #include <dlfcn.h>
 #include <unistd.h>
 #include <sys/sysctl.h>
@@ -796,20 +795,18 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
 #pragma mark ⑦ 能力探测（task_for_pid / 内核原语 / 越狱路径）
 
 static pid_t probe_pid_by_name(const char *name) {
-    int cap = 4096;
-    pid_t *pids = (pid_t *)malloc(sizeof(pid_t) * (size_t)cap);
-    if (!pids) return 0;
-    int n = proc_listpids(PROC_ALL_PIDS, 0, pids, (int)(sizeof(pid_t) * (size_t)cap));
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t sz = 0;
+    if (sysctl(mib, 4, NULL, &sz, NULL, 0) != 0 || sz == 0) return 0;
+    struct kinfo_proc *kp = (struct kinfo_proc *)malloc(sz);
+    if (!kp) return 0;
+    if (sysctl(mib, 4, kp, &sz, NULL, 0) != 0) { free(kp); return 0; }
     pid_t found = 0;
-    for (int i = 0; i < n / (int)sizeof(pid_t); i++) {
-        if (pids[i] <= 0) continue;
-        char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
-        if (proc_pidpath(pids[i], path, sizeof(path)) <= 0) continue;
-        const char *base = strrchr(path, '/');
-        base = base ? base + 1 : path;
-        if (strcmp(base, name) == 0) { found = pids[i]; break; }
+    int cnt = (int)(sz / sizeof(struct kinfo_proc));
+    for (int i = 0; i < cnt; i++) {
+        if (strcmp(kp[i].kp_proc.p_comm, name) == 0) { found = kp[i].kp_proc.p_pid; break; }
     }
-    free(pids);
+    free(kp);
     return found;
 }
 
