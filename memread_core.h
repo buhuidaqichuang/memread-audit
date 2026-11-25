@@ -223,6 +223,17 @@ void memread_snapshot_free(void);
 int memread_writable_bytes(pid_t pid, int rw_only,
                            unsigned long long *out_bytes, unsigned long long *out_regions);
 
+typedef struct {
+    int      index;
+    uint64_t addr;
+    uint64_t size;
+    int      prot;
+    int      in_module;
+} memread_region_info_t;
+
+// 枚举进程内存区域（只调用 mach_vm_region，不读内容）；返回写入条数
+int memread_regions_list(pid_t pid, memread_region_info_t *out, int cap);
+
 // 原始位 -> 数值（供 UI 把上一轮原始位显示成可读数字）
 double memread_valscan_raw2double(uint64_t raw, int type);
 

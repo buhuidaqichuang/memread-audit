@@ -1115,6 +1115,44 @@ int memread_read_vec3_batch(pid_t pid, const uint64_t *addrs, int n, float *out)
 }
 
 // 预统计与首扫完全相同的区域过滤条件，得到总量用于进度百分比（只枚举，不读内存）
+int memread_regions_list(pid_t pid, memread_region_info_t *out, int cap) {
+    if (!out || cap <= 0) return 0;
+    task_t task = MACH_PORT_NULL;
+    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
+    module_cache_ensure(pid);
+    int n = 0, idx = 0;
+    mach_vm_address_t addr = 0;
+    for (;;) {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        kern_return_t kr = mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
+                                         (vm_region_info_t)&info, &cnt, &obj);
+        if (kr != KERN_SUCCESS || size == 0) break;
+        int in_module = 0;
+        for (int i = 0; i < g_modsegn; i++) {
+            uint64_t s = g_modsegs[i].seg_start, e = g_modsegs[i].seg_end;
+            if (((uint64_t)addr >= s && (uint64_t)addr < e) ||
+                ((uint64_t)addr + size > s && (uint64_t)addr < e)) { in_module = 1; break; }
+        }
+        if ((info.protection & VM_PROT_READ) && (info.protection & VM_PROT_WRITE) && !info.shared) {
+            if (n < cap) {
+                out[n].index = idx;
+                out[n].addr = (uint64_t)addr;
+                out[n].size = (uint64_t)size;
+                out[n].prot = (int)info.protection;
+                out[n].in_module = in_module;
+                n++;
+            }
+            idx++;
+        }
+        addr += size;
+    }
+    mach_port_deallocate(mach_task_self(), task);
+    return n;
+}
+
 int memread_writable_bytes(pid_t pid, int rw_only,
                            unsigned long long *out_bytes, unsigned long long *out_regions) {
     if (out_bytes) *out_bytes = 0;
@@ -2336,6 +2374,12 @@ static int coord_scan(pid_t pid, int (*visit)(const memread_coord_hit_t *, void 
         mach_port_deallocate(mach_task_self(), task);
         return -4;
     }
+    uint64_t rlo = 0, rhi = ~0ULL;
+    {
+        const char *s = getenv("MEMREAD_RANGE_LO"); if (s) rlo = strtoull(s, NULL, 0);
+        s = getenv("MEMREAD_RANGE_HI"); if (s) rhi = strtoull(s, NULL, 0);
+    }
+    uint64_t budget = (uint64_t)mre_env_int("MEMREAD_BUDGET_MB", 0) << 20;
     unsigned long long scanned = 0;
     mach_vm_address_t addr = 0;
     int stop = 0;
@@ -2354,7 +2398,8 @@ static int coord_scan(pid_t pid, int (*visit)(const memread_coord_hit_t *, void 
             if (((uint64_t)addr >= s && (uint64_t)addr < e) ||
                 ((uint64_t)addr + size > s && (uint64_t)addr < e)) { in_module = 1; break; }
         }
-        if (!in_module && snap_region_ok(&info, size)) {
+        if (!in_module && snap_region_ok(&info, size) &&
+            !((uint64_t)addr + size <= rlo) && !((uint64_t)addr >= rhi)) {
             uint64_t off = 0;
             while (off + 32 <= (uint64_t)size) {
                 if (cancel && *cancel) { stop = 1; break; }
@@ -2387,6 +2432,7 @@ static int coord_scan(pid_t pid, int (*visit)(const memread_coord_hit_t *, void 
                     }
                     if (stop) break;
                     scanned += cur;
+                    if (budget && scanned >= budget) { stop = 1; break; }
                     mre_pace();
                 }
                 off += cur;

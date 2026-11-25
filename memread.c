@@ -64,6 +64,52 @@ static void print_coord_hits(const memread_coord_hit_t *h, int n, int limit) {
     if (n > limit) printf("... 共 %d 条，只显示前 %d 条\n", n, limit);
 }
 
+static int cmd_regionlist(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "用法: regionlist <pid|进程名> [最小MB]\n"); return 1; }
+    int pid = pid_arg(argv[2]);
+    if (pid <= 0) { fprintf(stderr, "找不到进程\n"); return 2; }
+    int minmb = (argc >= 4) ? atoi(argv[3]) : 4;
+    static memread_region_info_t info[4096];
+    int n = memread_regions_list(pid, info, 4096);
+    printf("可写区域 %d 个（只显示 >= %d MB 的，且非模块映像的标 *）\n", n, minmb);
+    for (int i = 0; i < n; i++) {
+        if ((int)(info[i].size >> 20) < minmb || info[i].in_module) continue;
+        printf("%3d  0x%010llx  %5llu MB\n", info[i].index,
+               (unsigned long long)info[i].addr, (unsigned long long)(info[i].size >> 20));
+    }
+    return 0;
+}
+
+static int cmd_regionscan(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "用法: regionscan <pid|进程名> <区域序号> [显示条数]\n"); return 1; }
+    int pid = pid_arg(argv[2]);
+    if (pid <= 0) { fprintf(stderr, "找不到进程\n"); return 2; }
+    int want = atoi(argv[3]);
+    int limit = (argc >= 5) ? atoi(argv[4]) : 40;
+    static memread_region_info_t info[4096];
+    int n = memread_regions_list(pid, info, 4096);
+    memread_region_info_t *r = NULL;
+    for (int i = 0; i < n; i++) if (info[i].index == want) { r = &info[i]; break; }
+    if (!r) { fprintf(stderr, "没有这个区域序号\n"); return 2; }
+    char lo[32], hi[32];
+    snprintf(lo, sizeof(lo), "0x%llx", (unsigned long long)r->addr);
+    snprintf(hi, sizeof(hi), "0x%llx", (unsigned long long)(r->addr + r->size));
+    setenv("MEMREAD_RANGE_LO", lo, 1);
+    setenv("MEMREAD_RANGE_HI", hi, 1);
+    printf("区域 %d: 0x%llx..0x%llx (%llu MB)\n", want,
+           (unsigned long long)r->addr, (unsigned long long)(r->addr + r->size),
+           (unsigned long long)(r->size >> 20));
+    memread_coord_hit_t *buf = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * MEMREAD_COORD_HIT_CAP);
+    if (!buf) return 3;
+    int found = 0;
+    double t0 = now_s();
+    int rc = memread_coord_probe(pid, buf, MEMREAD_COORD_HIT_CAP, &found, NULL, NULL, NULL);
+    printf("rc=%d 命中=%d 用时=%.2fs\n", rc, found, now_s() - t0);
+    print_coord_hits(buf, found, limit);
+    free(buf);
+    return 0;
+}
+
 static int cmd_procs(int argc, char **argv) {
     pid_t pids[4096];
     int n = memread_list_procs(pids, 4096);
@@ -653,6 +699,8 @@ static void usage(const char *prog) {
 int main(int argc, char **argv) {
     if (argc < 2) { usage(argv[0]); return 1; }
     const char *cmd = argv[1];
+    if (!strcmp(cmd, "regionlist")) return cmd_regionlist(argc, argv);
+    if (!strcmp(cmd, "regionscan")) return cmd_regionscan(argc, argv);
     if (!strcmp(cmd, "procs"))     return cmd_procs(argc, argv);
     if (!strcmp(cmd, "coordscan")) return cmd_coordscan(argc, argv);
     if (!strcmp(cmd, "coordsave")) return cmd_coordsave(argc, argv);
