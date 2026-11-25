@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
+#include <math.h>
 #include "memread_core.h"
 
 #define SAVE_MAGIC 0x4D524344u
@@ -160,12 +161,31 @@ static int cmd_coorddiff(int argc, char **argv) {
     return 0;
 }
 
-// 时间序列采样：把 base 文件里的地址连续采样，输出 CSV（t_ms,addr,x,y,z,ok）
+typedef struct {
+    float total;
+    float first[3];
+    float last[3];
+    float lo[3];
+    float hi[3];
+    uint64_t addr;
+    int ok;
+    int i;
+} watch_stat_t;
+
+static int watch_cmp(const void *a, const void *b) {
+    const watch_stat_t *x = (const watch_stat_t *)a;
+    const watch_stat_t *y = (const watch_stat_t *)b;
+    if (x->total < y->total) return 1;
+    if (x->total > y->total) return -1;
+    return 0;
+}
+
+// 时间序列采样：连续读一批地址，跟踪首末值与各轴极值，直接打印「确实动过的地址」
 static int cmd_watch(int argc, char **argv) {
-    if (argc < 6) { fprintf(stderr, "用法: watch <pid> <file> <seconds> <interval_ms> [out.csv]\n"); return 1; }
+    if (argc < 5) { fprintf(stderr, "用法: watch <pid> <file> <seconds> <interval_ms> [min_delta] [topN]\n"); return 1; }
     int pid = atoi(argv[2]);
     FILE *f = fopen(argv[3], "rb");
-    if (!f) { fprintf(stderr, "打不开基准文件\n"); return 4; }
+    if (!f) { fprintf(stderr, "打不开基准文件 %s\n", argv[3]); return 4; }
     save_head_t h;
     if (fread(&h, sizeof(h), 1, f) != 1 || h.magic != SAVE_MAGIC) { fclose(f); return 4; }
     int n = (int)h.n;
@@ -176,37 +196,81 @@ static int cmd_watch(int argc, char **argv) {
 
     double secs = atof(argv[4]);
     int interval_ms = atoi(argv[5]);
-    const char *outpath = (argc >= 7) ? argv[6] : "/var/tmp/watch.csv";
+    float min_delta = (argc >= 6) ? (float)atof(argv[6]) : 2.0f;
+    int topn = (argc >= 7) ? atoi(argv[7]) : 60;
 
     uint64_t *addrs = (uint64_t *)malloc(sizeof(uint64_t) * n);
     float *buf = (float *)malloc(sizeof(float) * 3 * n);
-    if (!addrs || !buf) { free(base); return 3; }
-    for (int i = 0; i < n; i++) addrs[i] = base[i].addr;
-
-    FILE *out = fopen(outpath, "w");
-    if (!out) { fprintf(stderr, "写不了 %s\n", outpath); free(base); free(addrs); free(buf); return 4; }
-    fprintf(out, "t_ms,addr,x,y,z,ok\n");
+    watch_stat_t *st = (watch_stat_t *)calloc(n, sizeof(watch_stat_t));
+    if (!addrs || !buf || !st) { free(base); free(addrs); free(buf); free(st); return 3; }
+    for (int i = 0; i < n; i++) { addrs[i] = base[i].addr; st[i].i = i; st[i].addr = base[i].addr; }
 
     double t0 = now_s();
-    int samples = 0;
+    int samples = 0, reads = 0;
     while (1) {
         double el = now_s() - t0;
         if (el > secs) break;
         int ok = memread_read_vec3_batch(pid, addrs, n, buf);
         if (ok < 0) { printf("采样失败 rc=%d\n", ok); break; }
-        long long t_ms = (long long)(el * 1000.0);
+        reads += ok;
         for (int i = 0; i < n; i++) {
-            if (i < ok) fprintf(out, "%lld,0x%llx,%.3f,%.3f,%.3f,1\n", t_ms, (unsigned long long)addrs[i],
-                                buf[i * 3], buf[i * 3 + 1], buf[i * 3 + 2]);
-            else fprintf(out, "%lld,0x%llx,0,0,0,0\n", t_ms, (unsigned long long)addrs[i]);
+            if (i >= ok) continue;
+            float *v = &buf[i * 3];
+            if (st[i].ok == 0) {
+                for (int k = 0; k < 3; k++) { st[i].first[k] = v[k]; st[i].lo[k] = v[k]; st[i].hi[k] = v[k]; }
+            } else {
+                for (int k = 0; k < 3; k++) {
+                    if (v[k] < st[i].lo[k]) st[i].lo[k] = v[k];
+                    if (v[k] > st[i].hi[k]) st[i].hi[k] = v[k];
+                }
+            }
+            for (int k = 0; k < 3; k++) st[i].last[k] = v[k];
+            st[i].ok++;
         }
-        fflush(out);
         samples++;
         usleep(interval_ms * 1000);
     }
-    fclose(out);
-    free(base); free(addrs); free(buf);
-    printf("采样完成: %d 帧 -> %s\n", samples, outpath);
+
+    double span = 0;
+    for (int i = 0; i < n; i++) {
+        float d = 0;
+        for (int k = 0; k < 3; k++) {
+            float dv = st[i].last[k] - st[i].first[k];
+            d += dv * dv;
+        }
+        st[i].total = (float)d;
+        if (st[i].total > span) span = st[i].total;
+    }
+    span = 0;
+    for (int i = 0; i < n; i++) {
+        if (st[i].total > span) span = st[i].total;
+    }
+    float maxdist = (float)sqrt((double)span);
+
+    watch_stat_t *sorted = (watch_stat_t *)malloc(sizeof(watch_stat_t) * n);
+    if (!sorted) { free(base); free(addrs); free(buf); free(st); return 3; }
+    memcpy(sorted, st, sizeof(watch_stat_t) * n);
+    qsort(sorted, n, sizeof(watch_stat_t), watch_cmp);
+
+    int moved = 0;
+    for (int i = 0; i < n; i++) if (sqrt((double)sorted[i].total) >= min_delta) moved++;
+    printf("采样: %d 帧 / %d 次读，地址 %d 个，位移>=%.2f 的有 %d 个，最大位移 %.2f\n",
+           samples, reads, n, min_delta, moved, maxdist);
+    int shown = 0;
+    for (int i = 0; i < n && shown < topn; i++) {
+        float dist = (float)sqrt((double)sorted[i].total);
+        if (dist < min_delta) break;
+        printf("%3d  0x%-12llx d=%-9.2f  start=(%.2f,%.2f,%.2f)  end=(%.2f,%.2f,%.2f)  range=[%.2f..%.2f / %.2f..%.2f / %.2f..%.2f] n=%d\n",
+               shown, (unsigned long long)sorted[i].addr, dist,
+               sorted[i].first[0], sorted[i].first[1], sorted[i].first[2],
+               sorted[i].last[0], sorted[i].last[1], sorted[i].last[2],
+               sorted[i].lo[0], sorted[i].hi[0], sorted[i].lo[1], sorted[i].hi[1],
+               sorted[i].lo[2], sorted[i].hi[2], sorted[i].ok);
+        shown++;
+    }
+    printf("-- 显示 %d / %d\n", shown, moved);
+
+    free(sorted); free(base); free(addrs); free(buf); free(st);
     return 0;
 }
 
@@ -315,7 +379,7 @@ static void usage(const char *prog) {
         "  %s coordsave <pid> <file>\n"
         "  %s coorddiff <pid> <file> [0=全量|1=姿态] [显示条数]\n"
         "  %s anchor <pid> <anchor_hex> [depth] [cap]\n"
-        "  %s watch <pid> <file> <seconds> <interval_ms> [out.csv]\n"
+        "  %s watch <pid> <file> <seconds> <interval_ms> [min_delta] [topN]\n"
         "  %s read <pid> <addr_hex> [f|i|l|d]\n"
         "  %s chain <pid> <addr_hex> [depth] [cap]\n"
         "  %s modinfo <pid> <addr_hex>\n"
