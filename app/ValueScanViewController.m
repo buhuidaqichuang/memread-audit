@@ -962,15 +962,29 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
     int n = self.autoN;
     if (n <= 0) return;
 
-    // 判据：走动时变过 且 蹲下时只动竖直轴
-    int *pick = (int *)malloc(sizeof(int) * (size_t)n);
-    int m = 0;
+    // 第一步：先排除「一直在变」的——采样里变动帧数占比 >= 70% 的直接判死
+    // （坐标只在走动/蹲下那几个帧变，一直变的必然是计时器/粒子/相机抖动）
+    int ticks = self.autoTicks > 0 ? self.autoTicks : 1;
+    int *stable = (int *)malloc(sizeof(int) * (size_t)n);
+    int ns = 0, dropped = 0;
     for (int i = 0; i < n; i++) {
+        if (self.autoMoved[i] * 10 >= ticks * 7) { dropped++; continue; }   // 一直变 → 无效
+        stable[ns++] = i;
+    }
+
+    // 第二步：留下的里面取「走动时变过 且 蹲下时只动竖直轴」
+    int *pick = (int *)malloc(sizeof(int) * (size_t)ns + 1);
+    int m = 0;
+    for (int k = 0; k < ns; k++) {
+        int i = stable[k];
         if (self.autoMoved[i] > 0 && self.autoVert[i] > 0) pick[m++] = i;
     }
     if (m == 0) {
         // 没捕捉到蹲下（可能没蹲/挂起）：退回「走动时变过」里位移最大的前 50
-        for (int i = 0; i < n; i++) if (self.autoMoved[i] > 0) pick[m++] = i;
+        for (int k = 0; k < ns; k++) {
+            int i = stable[k];
+            if (self.autoMoved[i] > 0) pick[m++] = i;
+        }
         for (int i = 1; i < m; i++) {
             int key = pick[i], j = i - 1;
             while (j >= 0 && self.autoMax[pick[j]] < self.autoMax[key]) { pick[j + 1] = pick[j]; j--; }
@@ -978,6 +992,7 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
         }
         if (m > 50) m = 50;
     }
+    free(stable);
 
     if (m == 0) {
         free(pick);
@@ -994,7 +1009,7 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
     [self refreshCount];
 
     NSMutableString *msg = [NSMutableString stringWithFormat:
-        @"采样 %d 帧，候选 %d → %d 条。\n\n", self.autoTicks, n, m];
+        @"采样 %d 帧，候选 %d → %d 条（先剔掉「一直在变」%d 条）。\n\n", self.autoTicks, n, m, dropped];
     float *vals = (float *)malloc(sizeof(float) * (size_t)m * 3);
     if (vals) {
         uint64_t *tmp = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)m);
@@ -1022,7 +1037,7 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
     [ok addAction:[UIAlertAction actionWithTitle:@"查看候选" style:UIAlertActionStyleDefault
                                         handler:^(UIAlertAction *x) { [ws onList]; }]];
     [self presentViewController:ok animated:YES completion:nil];
-    [self appendProgressLine:[NSString stringWithFormat:@"⑤ 完成：%d 条（走动变过 + 蹲下只动竖直轴）", m]];
+    [self appendProgressLine:[NSString stringWithFormat:@"⑤ 完成：%d 条（先剔除一直变的 %d 条；走动变过 + 蹲下只动竖直轴）", m, dropped]];
     self.statusLabel.text = [NSString stringWithFormat:@"⑤ 完成：%d 条候选", m];
 
     if (self.autoAddrs) { free(self.autoAddrs); self.autoAddrs = NULL; }
