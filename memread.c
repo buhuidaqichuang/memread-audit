@@ -434,6 +434,42 @@ static int cmd_coordcmp(int argc, char **argv) {
     return 0;
 }
 
+// 按「模块基址+静态偏移+逐跳偏移」直接解析并读三元组（跨重启复原用）
+static int cmd_chainval(int argc, char **argv) {
+    if (argc < 5) { fprintf(stderr, "用法: chainval <pid> <static_off_hex> <depth> <off1> [off2] [off3]...\n"); return 1; }
+    int pid = atoi(argv[2]);
+    uint64_t off = strtoull(argv[3], NULL, 0);
+    int depth = atoi(argv[4]);
+    if (depth < 1 || depth > MEMREAD_CHAIN_MAX_DEPTH) { fprintf(stderr, "depth 1..%d\n", MEMREAD_CHAIN_MAX_DEPTH); return 1; }
+    if (argc < 5 + depth) { fprintf(stderr, "偏移个数要等于 depth\n"); return 1; }
+    int64_t offs[MEMREAD_CHAIN_MAX_DEPTH] = {0};
+    for (int i = 0; i < depth; i++) offs[i] = (int64_t)strtoll(argv[5 + i], NULL, 0);
+
+    char uuid[64] = {0};
+    uint64_t base = 0;
+    int trc = memread_proc_token(pid, uuid, sizeof(uuid), &base);
+    printf("进程 uuid=%s 主模块基址=0x%llx (rc=%d)\n", uuid, (unsigned long long)base, trc);
+    if (trc != 0 || base == 0) return 2;
+
+    uint64_t a = base + off;
+    printf("起跳: 0x%llx (base+0x%llx)\n", (unsigned long long)a, (unsigned long long)off);
+    for (int i = 0; i < depth; i++) {
+        double pv = 0;
+        int rc = memread_read_scalar(pid, a, MEMREAD_VALTYPE_INT64, &pv);
+        if (rc != 0) { printf("第 %d 跳读失败 rc=%d @0x%llx\n", i + 1, rc, (unsigned long long)a); return 3; }
+        uint64_t v = (uint64_t)pv;
+        printf("第 %d 跳: 槽 0x%llx -> 0x%llx  (+0x%llx)\n", i + 1,
+               (unsigned long long)a, (unsigned long long)v, (unsigned long long)offs[i]);
+        if (v < 0x100000000ULL) { printf("槽值异常，链断\n"); return 3; }
+        a = (uint64_t)((int64_t)v + offs[i]);
+    }
+    float v3[3] = {0};
+    int rc = memread_read_vec3(pid, a, v3);
+    printf("坐标地址 0x%llx rc=%d  v=(%.4f, %.4f, %.4f)\n",
+           (unsigned long long)a, rc, v3[0], v3[1], v3[2]);
+    return rc == 0 ? 0 : 4;
+}
+
 static int cmd_anchor(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "用法: anchor <pid> <anchor_hex> [depth] [cap]\n"); return 1; }
     int pid = atoi(argv[2]);
@@ -539,6 +575,7 @@ static void usage(const char *prog) {
         "  %s coordsave <pid> <file>\n"
         "  %s coorddiff <pid> <file> [0=全量|1=姿态] [显示条数]\n"
         "  %s anchor <pid> <anchor_hex> [depth] [cap]\n"
+        "  %s chainval <pid> <static_off_hex> <depth> <off1> [off2] ...\n"
         "  %s coordcmp <fileA> <fileB> [min_delta] [topN]\n"
         "  %s live <pid> <seconds> <interval_ms> [min_delta] [topN]\n"
         "  %s watch <pid> <file> <seconds> <interval_ms> [min_delta] [topN]\n"
@@ -546,7 +583,7 @@ static void usage(const char *prog) {
         "  %s chain <pid> <addr_hex> [depth] [cap]\n"
         "  %s modinfo <pid> <addr_hex>\n"
         "  %s token <pid>\n"
-        "  %s dump <pid> <out.bin> [rw-only]\n", prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+        "  %s dump <pid> <out.bin> [rw-only]\n", prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
@@ -560,6 +597,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "watch"))     return cmd_watch(argc, argv);
     if (!strcmp(cmd, "live"))      return cmd_live(argc, argv);
     if (!strcmp(cmd, "coordcmp"))  return cmd_coordcmp(argc, argv);
+    if (!strcmp(cmd, "chainval"))  return cmd_chainval(argc, argv);
     if (!strcmp(cmd, "read"))      return cmd_read(argc, argv);
     if (!strcmp(cmd, "chain"))     return cmd_chain(argc, argv);
     if (!strcmp(cmd, "modinfo"))   return cmd_modinfo(argc, argv);
