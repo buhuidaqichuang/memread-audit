@@ -17,6 +17,21 @@
 #include <mach/vm_region.h>
 #include <mach/vm_prot.h>
 
+// 读取节流：控制每次读的块大小与块间停顿，避免一次把对手进程整片内存读进物理内存
+static int mre_env_int(const char *k, int dflt) {
+    const char *s = getenv(k);
+    if (!s) return dflt;
+    int v = atoi(s);
+    return v > 0 ? v : dflt;
+}
+static mach_vm_size_t mre_chunk_bytes(void) {
+    return (mach_vm_size_t)mre_env_int("MEMREAD_CHUNK_KB", 4096) * 1024ULL;
+}
+static void mre_pace(void) {
+    int ms = mre_env_int("MEMREAD_PACE_MS", 0);
+    if (ms > 0) usleep((useconds_t)ms * 1000);
+}
+
 // libproc 是 iOS 私有头，但符号在 libSystem 里，手动声明即可
 extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 extern int proc_name(int pid, void *buffer, uint32_t buffersize);
@@ -2315,15 +2330,15 @@ static int coord_scan(pid_t pid, int (*visit)(const memread_coord_hit_t *, void 
     if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
     module_cache_ensure(pid);   // coord_heap_ptr 要用模块段范围，region 也要据此跳过模块映像
 
-    const mach_vm_size_t CHUNK = 4ULL * 1024 * 1024;
+    const mach_vm_size_t CHUNK = mre_chunk_bytes();
     unsigned char *buf = (unsigned char *)malloc((size_t)CHUNK);
     if (!buf) {
         mach_port_deallocate(mach_task_self(), task);
         return -4;
     }
-    int stop = 0;
     unsigned long long scanned = 0;
     mach_vm_address_t addr = 0;
+    int stop = 0;
     for (;;) {
         mach_vm_size_t size = 0;
         vm_region_basic_info_data_64_t info;
@@ -2372,6 +2387,7 @@ static int coord_scan(pid_t pid, int (*visit)(const memread_coord_hit_t *, void 
                     }
                     if (stop) break;
                     scanned += cur;
+                    mre_pace();
                 }
                 off += cur;
             }
