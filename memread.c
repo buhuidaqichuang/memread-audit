@@ -573,6 +573,62 @@ static int cmd_cluster(int argc, char **argv) {
     return 0;
 }
 
+// self: 扫一次，自动挑出「自己角色」那一簇（多副本 + Z 跨到头顶 + 非原点模板）
+static int cmd_self(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "用法: self <pid|进程名>\n"); return 1; }
+    int pid = pid_arg(argv[2]);
+    if (pid <= 0) { fprintf(stderr, "找不到进程\n"); return 2; }
+    memread_coord_hit_t *hits = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * MEMREAD_COORD_HIT_CAP);
+    if (!hits) return 3;
+    int found = 0;
+    double t0 = now_s();
+    int rc = memread_coord_probe(pid, hits, MEMREAD_COORD_HIT_CAP, &found, NULL, NULL, NULL);
+    printf("扫描 rc=%d 命中=%d 用时=%.2fs\n", rc, found, now_s() - t0);
+    if (rc != 0 || found <= 0) { free(hits); return 2; }
+
+    cpt_t *pts = (cpt_t *)malloc(sizeof(cpt_t) * found);
+    if (!pts) { free(hits); return 3; }
+    for (int i = 0; i < found; i++) {
+        pts[i].x = hits[i].v[0]; pts[i].y = hits[i].v[1]; pts[i].z = hits[i].v[2];
+        pts[i].addr = hits[i].addr;
+    }
+    qsort(pts, found, sizeof(cpt_t), cpt_cmp_xy);
+
+    int bestcnt = 0, best_lo_i = -1, best_hi_i = -1;
+    float bx = 0, by = 0, blo = 0, bhi = 0;
+    int i = 0;
+    while (i < found) {
+        int j = i + 1;
+        while (j < found && cpt_cmp_xy(&pts[i], &pts[j]) == 0) j++;
+        int cnt = j - i;
+        float lo = pts[i].z, lo_i = i, hi = pts[i].z, hi_i = i;
+        int lo_k = i, hi_k = i;
+        for (int k = i; k < j; k++) {
+            if (pts[k].z < lo) { lo = pts[k].z; lo_k = k; }
+            if (pts[k].z > hi) { hi = pts[k].z; hi_k = k; }
+        }
+        // 角色判据：副本数 >= 8、Z 跨度 >= 60（脚底到头顶）、最高点 > 120、XY 不贴原点
+        float ax = fabsf(pts[i].x), ay = fabsf(pts[i].y);
+        if (cnt >= 8 && (hi - lo) >= 60.0f && hi > 120.0f && (ax > 50.0f || ay > 50.0f) && cnt > bestcnt) {
+            bestcnt = cnt; bx = pts[i].x; by = pts[i].y; blo = lo; bhi = hi;
+            best_lo_i = lo_k; best_hi_i = hi_k;
+        }
+        i = j;
+    }
+    if (bestcnt == 0) {
+        printf("没找到符合条件的角色簇（命中 %d 条，可能世界未加载）\n", found);
+        free(pts); free(hits);
+        return 2;
+    }
+    printf("自己坐标: feet=(%.4f, %.4f, %.4f)  camera=(%.4f, %.4f, %.4f)\n",
+           bx, by, blo, bx, by, bhi);
+    printf("feet_addr=0x%llx  camera_addr=0x%llx  副本=%d  Z跨度=%.2f\n",
+           (unsigned long long)pts[best_lo_i].addr, (unsigned long long)pts[best_hi_i].addr,
+           bestcnt, bhi - blo);
+    free(pts); free(hits);
+    return 0;
+}
+
 static int cmd_anchor(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "用法: anchor <pid> <anchor_hex> [depth] [cap]\n"); return 1; }
     int pid = pid_arg(argv[2]);
@@ -699,6 +755,7 @@ static void usage(const char *prog) {
 int main(int argc, char **argv) {
     if (argc < 2) { usage(argv[0]); return 1; }
     const char *cmd = argv[1];
+    if (!strcmp(cmd, "self"))        return cmd_self(argc, argv);
     if (!strcmp(cmd, "regionlist")) return cmd_regionlist(argc, argv);
     if (!strcmp(cmd, "regionscan")) return cmd_regionscan(argc, argv);
     if (!strcmp(cmd, "procs"))     return cmd_procs(argc, argv);
