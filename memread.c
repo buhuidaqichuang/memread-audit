@@ -650,6 +650,56 @@ static int cmd_anchor(int argc, char **argv) {
     return 0;
 }
 
+// clusterq: 只列出「以给定 XY 为圆心、半径 r 内」的簇（找身边的假人/载具/物体）
+static int cmd_clusterq(int argc, char **argv) {
+    if (argc < 6) { fprintf(stderr, "用法: clusterq <pid|进程名> <x> <y> <r> [minN] [topN]\n"); return 1; }
+    int pid = pid_arg(argv[2]);
+    if (pid <= 0) { fprintf(stderr, "找不到进程\n"); return 2; }
+    float cx = (float)atof(argv[3]), cy = (float)atof(argv[4]), r = (float)atof(argv[5]);
+    int minn = (argc >= 7) ? atoi(argv[6]) : 1;
+    int topn = (argc >= 8) ? atoi(argv[7]) : 40;
+    memread_coord_hit_t *hits = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * MEMREAD_COORD_HIT_CAP);
+    if (!hits) return 3;
+    int found = 0;
+    double t0 = now_s();
+    int rc = memread_coord_probe(pid, hits, MEMREAD_COORD_HIT_CAP, &found, NULL, NULL, NULL);
+    printf("扫描 rc=%d 命中=%d 用时=%.2fs\n", rc, found, now_s() - t0);
+    if (rc != 0 || found <= 0) { free(hits); return 2; }
+    cpt_t *pts = (cpt_t *)malloc(sizeof(cpt_t) * found);
+    if (!pts) { free(hits); return 3; }
+    for (int i = 0; i < found; i++) {
+        pts[i].x = hits[i].v[0]; pts[i].y = hits[i].v[1]; pts[i].z = hits[i].v[2];
+        pts[i].addr = hits[i].addr;
+    }
+    qsort(pts, found, sizeof(cpt_t), cpt_cmp_xy);
+    int shown = 0, i = 0;
+    while (i < found && shown < topn) {
+        int j = i + 1;
+        while (j < found && cpt_cmp_xy(&pts[i], &pts[j]) == 0) j++;
+        int cnt = j - i;
+        float lo = pts[i].z, hi = pts[i].z;
+        int lo_k = i, hi_k = i;
+        for (int k = i; k < j; k++) {
+            if (pts[k].z < lo) { lo = pts[k].z; lo_k = k; }
+            if (pts[k].z > hi) { hi = pts[k].z; hi_k = k; }
+        }
+        float dx = pts[i].x - cx, dy = pts[i].y - cy;
+        float d = sqrtf(dx * dx + dy * dy);
+        if (d <= r && cnt >= minn) {
+            printf("%2d  d=%7.2f  xy=(%.2f, %.2f)  n=%-3d  z=[%.2f .. %.2f]\n",
+                   shown, d, pts[i].x, pts[i].y, cnt, lo, hi);
+            printf("     feet: 0x%-12llx z=%.2f   head: 0x%-12llx z=%.2f\n",
+                   (unsigned long long)pts[lo_k].addr, pts[lo_k].z,
+                   (unsigned long long)pts[hi_k].addr, pts[hi_k].z);
+            shown++;
+        }
+        i = j;
+    }
+    printf("-- 半径 %.0f 内 %d 组\n", r, shown);
+    free(pts); free(hits);
+    return 0;
+}
+
 static int cmd_read(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "用法: read <pid> <addr_hex> [f|i|l|d]\n"); return 1; }
     int pid = pid_arg(argv[2]);
@@ -755,6 +805,7 @@ static void usage(const char *prog) {
 int main(int argc, char **argv) {
     if (argc < 2) { usage(argv[0]); return 1; }
     const char *cmd = argv[1];
+    if (!strcmp(cmd, "clusterq"))  return cmd_clusterq(argc, argv);
     if (!strcmp(cmd, "self"))        return cmd_self(argc, argv);
     if (!strcmp(cmd, "regionlist")) return cmd_regionlist(argc, argv);
     if (!strcmp(cmd, "regionscan")) return cmd_regionscan(argc, argv);
