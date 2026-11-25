@@ -161,6 +161,7 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
     [self addButton:@"⑤ 后台自动捕捉坐标（不用切来切去）" width:W y:&y sel:@selector(onAutoCapture)];
     [self addButton:@"⑥ 弹夹→自己坐标（不用动）" width:W y:&y sel:@selector(onAnchorCoord)];
     [self addButton:@"⑦ 能力探测（tfp / 内核原语）" width:W y:&y sel:@selector(onCapProbe)];
+    [self addButton:@"⑨ 靶位 3D 上屏（画中画）" width:W y:&y sel:@selector(onTargetsToPiP)];
     [self addButton:@"释放内存快照（省内存）" width:W y:&y sel:@selector(onFreeSnap)];
     [self addButton:@"查看候选列表（点一行读当前值）" width:W y:&y sel:@selector(onList)];
     [self addButton:@"已保存地址（自定义标签）" width:W y:&y sel:@selector(onSaved)];
@@ -959,7 +960,138 @@ static NSString *probe_tfp(pid_t pid) {
     });
 }
 
-- (void)onAnchorCoord {    pid_t pid = [self ensurePid];
+#pragma mark ⑨ 靶位坐标上屏（画中画）
+
+- (void)onTargetsToPiP {
+    pid_t pid = [self ensurePid];
+    if (pid <= 0) return;
+    [self.spinner startAnimating];
+    self.statusLabel.text = @"⑨ 宽松扫描一次（10~15 秒）…";
+    [self appendProgressLine:@"⑨ 判据：副本 n≤3 + 相对脚底 95~140 + 不贴原点，取身边最近的 9 条"];
+
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        memread_coord_hit_t *hits = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * MEMREAD_COORD_HIT_CAP);
+        int found = 0;
+        setenv("MEMREAD_LOOSE", "1", 1);
+        int rc = hits ? memread_coord_probe(pid, hits, MEMREAD_COORD_HIT_CAP, &found, NULL, NULL, NULL) : -4;
+
+        float selfX = 0, selfY = 0, feetZ = 0;
+        int haveSelf = 0, bestCnt = 0, hitCap = 0;
+
+        if (rc == 0 && found > 0) {
+            qsort(hits, (size_t)found, sizeof(memread_coord_hit_t), MemCmpCoordXY);
+
+            // 第一遍：找自己那一簇（副本≥8 且 Z 跨度≥60）→ 当 XY 基准与脚底 Z 基准
+            int i = 0;
+            while (i < found) {
+                int j = i + 1;
+                while (j < found && MemCmpCoordXY(&hits[i], &hits[j]) == 0) j++;
+                int cnt = j - i;
+                float lo = hits[i].v[2], hi = hits[i].v[2];
+                for (int k = i; k < j; k++) {
+                    if (hits[k].v[2] < lo) lo = hits[k].v[2];
+                    if (hits[k].v[2] > hi) hi = hits[k].v[2];
+                }
+                float ax = fabsf(hits[i].v[0]), ay = fabsf(hits[i].v[1]);
+                if (cnt >= 8 && (hi - lo) >= 60.0f && (ax > 50.0f || ay > 50.0f) && cnt > bestCnt) {
+                    bestCnt = cnt;
+                    selfX = hits[i].v[0];
+                    selfY = hits[i].v[1];
+                    feetZ = lo;
+                    haveSelf = 1;
+                }
+                i = j;
+            }
+            if (!haveSelf) feetZ = 0;   // 找不到自己：退回绝对高度窗口（95~140）
+
+            // 第二遍：按「少副本 + 躯干高度 + 非原点」挑候选
+            NSMutableArray<NSDictionary *> *cands = [NSMutableArray array];
+            int i2 = 0;
+            while (i2 < found) {
+                int j2 = i2 + 1;
+                while (j2 < found && MemCmpCoordXY(&hits[i2], &hits[j2]) == 0) j2++;
+                int cnt = j2 - i2;
+                if (cnt <= 3) {
+                    float x = hits[i2].v[0], y = hits[i2].v[1], z = hits[i2].v[2];
+                    float rel = z - feetZ;
+                    BOOL origin = (fabsf(x) < 50.0f && fabsf(y) < 50.0f);
+                    BOOL selfLayer = (fabsf(rel - 86.0f) < 1.5f);
+                    if (!origin && !selfLayer && rel >= 95.0f && rel <= 140.0f) {
+                        float dx = x - selfX, dy = y - selfY;
+                        float d = sqrtf(dx * dx + dy * dy);
+                        [cands addObject:@{@"d": @(d), @"x": @(x), @"y": @(y),
+                                           @"z": @(z), @"rel": @(rel),
+                                           @"addr": @((unsigned long long)hits[i2].addr)}];
+                    }
+                }
+                i2 = j2;
+            }
+            [cands sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+                double da = [a[@"d"] doubleValue], db = [b[@"d"] doubleValue];
+                if (da < db) return NSOrderedAscending;
+                if (da > db) return NSOrderedDescending;
+                return NSOrderedSame;
+            }];
+            hitCap = (int)cands.count;
+            NSMutableArray<NSString *> *labels = [NSMutableArray array];
+            NSMutableArray<NSNumber *> *addrs = [NSMutableArray array];
+            NSMutableString *lines = [NSMutableString string];
+            for (NSUInteger k = 0; k < cands.count && k < 9; k++) {
+                NSDictionary *c = cands[k];
+                NSString *name = [NSString stringWithFormat:@"T%lu", (unsigned long)(k + 1)];
+                [labels addObject:name];
+                [addrs addObject:c[@"addr"]];
+                [lines appendFormat:@"%@  %.2fm  (%.2f, %.2f)  Z %.2f  0x%llX\n",
+                    name, [c[@"d"] doubleValue] / 100.0, [c[@"x"] doubleValue],
+                    [c[@"y"] doubleValue], [c[@"z"] doubleValue],
+                    [c[@"addr"] unsignedLongLongValue]];
+            }
+
+            dispatch_async(dispatch_get_main_queue(), ^{
+                __strong typeof(ws) self2 = ws;
+                if (!self2) { free(hits); return; }
+                [self2.spinner stopAnimating];
+                if (labels.count == 0) {
+                    self2.statusLabel.text = [NSString stringWithFormat:@"⑨ 没挑到靶位（命中 %d）", found];
+                    [self2 appendProgressLine:[NSString stringWithFormat:
+                        @"⑨ 命中 %d 条但没通过判据：可能世界未加载，或周围没有靶子", found]];
+                    free(hits);
+                    return;
+                }
+                [[FloatPanelController shared] setCoordOriginX:selfX y:selfY z:feetZ];
+                BOOL ok = [[FloatPanelController shared] startWatchCoordsWithPid:pid
+                                                                      labels:labels
+                                                                       addrs:addrs
+                                                                    interval:1.0];
+                if (ok) {
+                    self2.statusLabel.text = [NSString stringWithFormat:@"⑨ 已上屏 %lu 条，直接切游戏",
+                                               (unsigned long)labels.count];
+                    [self2 appendProgressLine:[NSString stringWithFormat:@"⑨ 候选 %d 条，上屏前 %lu 条（基准 %@，脚底Z %.2f）：\n%@",
+                        hitCap, (unsigned long)labels.count,
+                        haveSelf ? @"自己" : @"原点", feetZ, lines]];
+                } else {
+                    self2.statusLabel.text = @"⑨ 上屏失败：画中画不可用或预览层未就绪";
+                    [self2 appendProgressLine:@"⑨ 画中画启动失败（先确认底部预览框是黑的且设备支持 PiP）"];
+                }
+                free(hits);
+            });
+            return;
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) self2 = ws;
+            if (!self2) { free(hits); return; }
+            [self2.spinner stopAnimating];
+            self2.statusLabel.text = [NSString stringWithFormat:@"⑨ 扫描失败 rc=%d 命中=%d", rc, found];
+            [self2 appendProgressLine:[NSString stringWithFormat:
+                @"⑨ 扫描失败 rc=%d（游戏在 lobby/加载时命中很少，等进战场再点）", rc]];
+            free(hits);
+        });
+    });
+}
+
+
     if (pid <= 0) return;
     SavedAddress *pick = nil;
     NSArray<SavedAddress *> *items = [[SavedAddressStore shared] allItems];

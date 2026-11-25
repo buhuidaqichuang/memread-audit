@@ -23,6 +23,18 @@
 // 只看候选数与数值，不做自动收敛（要收敛回 App 手动点）
 - (BOOL)startMonitorWithPid:(pid_t)pid type:(int)type interval:(double)interval;
 
+// 坐标列表：每行一个「标签 + 指向 FVector 的地址」，秒刷实时 xyz，最多 9 行
+- (BOOL)startWatchCoordsWithPid:(pid_t)pid
+                          labels:(NSArray<NSString *> *)labels
+                           addrs:(NSArray<NSNumber *> *)addrs
+                        interval:(double)interval;
+
+// 运行中整体替换坐标列表（不重启 PiP）
+- (void)updateCoordsLabels:(NSArray<NSString *> *)labels addrs:(NSArray<NSNumber *> *)addrs;
+
+// 3D 视图的原点（通常是玩家脚底世界坐标），必须在 startWatchCoords 之前设
+- (void)setCoordOriginX:(double)x y:(double)y z:(double)z;
+
 - (void)stop;
 
 @end

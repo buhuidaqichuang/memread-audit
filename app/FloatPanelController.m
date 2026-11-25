@@ -135,6 +135,11 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
 @property (nonatomic, assign) double interval;
 @property (nonatomic, assign) BOOL paused;
 @property (nonatomic, assign) BOOL watchSaved;   // YES：监控已保存地址；NO：收敛候选
+@property (nonatomic, assign) BOOL coordMode;    // YES：坐标列表模式（靶位 xyz）
+@property (nonatomic, copy) NSArray<NSString *> *coordLabels;
+@property (nonatomic, copy) NSArray<NSNumber *> *coordAddrs;
+@property (nonatomic, assign) double coordOX, coordOY, coordOZ;
+@property (nonatomic, assign) BOOL coordHasOrigin;
 @property (nonatomic, assign) BOOL autoRefine;   // NO：只显示，不自动收敛
 @property (nonatomic, assign) BOOL refineOnPause; // YES：点 PiP 暂停键时收敛一次
 @property (nonatomic, assign) BOOL zeroStop;     // YES：上次收敛会变 0，已停止继续收敛
@@ -294,12 +299,82 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
     return YES;
 }
 
+- (BOOL)startWatchCoordsWithPid:(pid_t)pid
+                          labels:(NSArray<NSString *> *)labels
+                           addrs:(NSArray<NSNumber *> *)addrs
+                        interval:(double)interval {
+    if (labels.count == 0 || addrs.count == 0) return NO;
+    if (![self beginWithPid:pid interval:interval]) return NO;
+    self.coordMode = YES;
+    self.watchSaved = NO;
+    self.autoRefine = NO;
+    self.refineOnPause = NO;
+    self.coordLabels = labels;
+    self.coordAddrs = addrs;
+    [self renderCoords:[self coordRowsWithPid:pid]];
+    [self.pip startPictureInPicture];
+    [self logMsg:@"已请求 startPictureInPicture（坐标列表 %lu 条）active=%d possible=%d",
+             (unsigned long)labels.count,
+             (int)self.pip.isPictureInPictureActive, (int)self.pip.isPictureInPicturePossible];
+    [self startTimer];
+    return YES;
+}
+
+- (void)setCoordOriginX:(double)x y:(double)y z:(double)z {
+    self.coordOX = x;
+    self.coordOY = y;
+    self.coordOZ = z;
+    self.coordHasOrigin = YES;
+}
+
+- (void)updateCoordsLabels:(NSArray<NSString *> *)labels addrs:(NSArray<NSNumber *> *)addrs {
+    self.coordLabels = labels;
+    self.coordAddrs = addrs;
+    if (self.coordMode) [self renderCoords:[self coordRowsWithPid:self.pid]];
+}
+
+// 批量读 12 字节：一次 task_for_pid，9 条也只花几十微秒
+- (NSArray<NSDictionary *> *)coordRowsWithPid:(pid_t)pid {
+    NSArray<NSNumber *> *addrs = self.coordAddrs;
+    NSArray<NSString *> *labels = self.coordLabels;
+    NSUInteger n = MIN(addrs.count, (NSUInteger)9);
+    if (n == 0) return @[];
+    uint64_t a[9] = {0};
+    float v[27] = {0};
+    for (NSUInteger i = 0; i < n; i++) a[i] = [addrs[i] unsignedLongLongValue];
+    int got = memread_read_vec3_batch(pid, a, (int)n, v);
+    NSMutableArray *rows = [NSMutableArray array];
+    for (NSUInteger i = 0; i < n; i++) {
+        NSString *name = (i < labels.count) ? labels[i] : [NSString stringWithFormat:@"T%lu", (unsigned long)(i + 1)];
+        NSString *val;
+        if (got < 0) {
+            val = @"读取失败";
+        } else if (a[i] == 0 || (v[i * 3] == 0.0f && v[i * 3 + 1] == 0.0f && v[i * 3 + 2] == 0.0f)) {
+            val = @"已清零";
+        } else {
+            val = [NSString stringWithFormat:@"%.1f, %.1f  Z %.1f", v[i * 3], v[i * 3 + 1], v[i * 3 + 2]];
+        }
+        [rows addObject:@{@"label": name, @"v": val,
+                          @"x": @(v[i * 3]), @"y": @(v[i * 3 + 1]), @"z": @(v[i * 3 + 2]),
+                          @"ok": @(got >= 0 && !(a[i] == 0 || (v[i * 3] == 0.0f && v[i * 3 + 1] == 0.0f && v[i * 3 + 2] == 0.0f)))}];
+    }
+    return rows;
+}
+
+- (void)renderCoords:(NSArray<NSDictionary *> *)rows {
+    if (!self.sbLayer) return;
+    [self enqueueImage:[self imageCoords:rows]];
+}
+
 - (BOOL)beginWithPid:(pid_t)pid interval:(double)interval {
     [self logMsg:@"开始: pid=%d layer=%@ host=%@ supported=%d possible=%d window=%@",
              (int)pid, self.sbLayer ? @"Y" : @"N", self.host ? @"Y" : @"N",
              (int)[AVPictureInPictureController isPictureInPictureSupported],
              (int)self.pip.isPictureInPicturePossible,
              self.host.window ? @"有" : @"无"];
+    self.coordMode = NO;
+    self.coordLabels = nil;
+    self.coordAddrs = nil;
     if (pid <= 0) return NO;
     if (!self.sbLayer || !self.host) return NO;
     if (![AVPictureInPictureController isPictureInPictureSupported]) return NO;
@@ -349,6 +424,7 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
 
 - (void)stop {
     _running = NO;
+    self.coordMode = NO;
     [self stopTimer];
     if (self.pip.isPictureInPictureActive) [self.pip stopPictureInPicture];
     [self.player stop];
@@ -383,6 +459,14 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
 - (void)tick {
     if (!_running) return;
     pid_t pid = self.pid;
+
+    if (self.coordMode) {
+        NSArray<NSDictionary *> *rows = [self coordRowsWithPid:pid];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self renderCoords:rows];
+        });
+        return;
+    }
 
     if (self.watchSaved) {
         NSArray<NSDictionary *> *savedRows = [self savedRowsWithPid:pid];
@@ -441,7 +525,7 @@ static void MemDrawTextRight(NSString *s, CGRect r, UIFont *font, UIColor *color
 
 // 点 PiP 暂停键 = 按当前条件收敛一次（不用切 App，也不会按秒乱筛）
 - (void)refineOnce {
-    if (self.watchSaved) return;
+    if (self.coordMode || self.watchSaved) return;
     if (self.zeroStop) {
         [self logMsg:@"收敛已停止（上次会变成 0），本次跳过"];
         return;
@@ -767,11 +851,148 @@ static void MemSigLockInit(void) {
     }];
 }
 
+#pragma mark - 坐标列表渲染
+
+- (UIImage *)imageCoords:(NSArray<NSDictionary *> *)rows {
+    UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat defaultFormat];
+    f.scale = 1;
+    f.opaque = YES;
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(640, 360)
+                                                                       format:f];
+    return [r imageWithActions:^(UIGraphicsImageRendererContext *c) {
+        CGContextRef ctx = c.CGContext;
+        [[UIColor colorWithRed:0.055 green:0.07 blue:0.09 alpha:1] setFill];
+        CGContextFillRect(ctx, CGRectMake(0, 0, 640, 360));
+
+        MemDrawText(@"MEMREAD  靶位 3D", CGRectMake(22, 12, 400, 26),
+                    [UIFont systemFontOfSize:18 weight:UIFontWeightSemibold],
+                    [UIColor colorWithWhite:0.58 alpha:1]);
+
+        MemDrawTextRight([self stampText], CGRectMake(452, 16, 166, 20),
+                         [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular],
+                         [UIColor colorWithWhite:0.45 alpha:1]);
+
+        MemDrawText([NSString stringWithFormat:@"%lu 个点   原点=你   每 %.1f 秒", (unsigned long)rows.count, self.interval],
+                    CGRectMake(22, 36, 560, 18),
+                    [UIFont systemFontOfSize:13],
+                    [UIColor colorWithWhite:0.55 alpha:1]);
+
+        [[UIColor colorWithWhite:1 alpha:0.10] setFill];
+        CGContextFillRect(ctx, CGRectMake(20, 56, 600, 1));
+
+        // ---- 等轴投影参数：屏幕中心在绘图区偏下，抬头方向代表 Y/Z ----
+        CGFloat cx = 232.0, cy = 268.0;
+        double maxD = 300.0, maxZ = 50.0;
+        for (NSDictionary *row in rows) {
+            double x = [row[@"x"] doubleValue], y = [row[@"y"] doubleValue], z = [row[@"z"] doubleValue];
+            double dx = self.coordHasOrigin ? (x - self.coordOX) : x;
+            double dy = self.coordHasOrigin ? (y - self.coordOY) : y;
+            double dz = self.coordHasOrigin ? (z - self.coordOZ) : 0.0;
+            double d = sqrt(dx * dx + dy * dy);
+            if (d > maxD) maxD = d;
+            if (fabs(dz) > maxZ) maxZ = fabs(dz);
+        }
+        double kH = 186.0 / (1.24 * maxD);
+        double kV = 208.0 / (maxD + 2.0 * maxZ + 1.0);
+        double k = (kH < kV) ? kH : kV;
+        if (!(k > 0.0) || k > 10.0) k = (k > 10.0) ? 10.0 : 1.0;
+
+        // ---- 地面环（等轴圆：1/4、1/2、3/4、1 倍最大距离）----
+        for (int ring = 1; ring <= 4; ring++) {
+            double rr = maxD * ring / 4.0;
+            [[UIColor colorWithWhite:1 alpha:(ring == 4 ? 0.16 : 0.08)] setStroke];
+            CGContextSetLineWidth(ctx, 1.0);
+            BOOL first = YES;
+            for (int a = 0; a <= 48; a++) {
+                double t = a * 3.14159265358979323846 / 24.0;
+                double gx = rr * cos(t), gy = rr * sin(t);
+                CGFloat sx = cx + (CGFloat)(0.866 * (gx - gy) * k);
+                CGFloat sy = cy - (CGFloat)(0.5 * (gx + gy) * k);
+                if (first) { CGContextMoveToPoint(ctx, sx, sy); first = NO; }
+                else { CGContextAddLineToPoint(ctx, sx, sy); }
+            }
+            CGContextStrokePath(ctx);
+        }
+
+        // ---- 玩家标记（原点）----
+        [[UIColor colorWithRed:0.25 green:0.85 blue:1.0 alpha:1] setFill];
+        CGContextFillEllipseInRect(ctx, CGRectMake(cx - 4, cy - 4, 8, 8));
+
+        // ---- 每个候选：竖杆 + 顶端点 + 编号 ----
+        NSUInteger n = MIN(rows.count, (NSUInteger)9);
+        for (NSUInteger i = 0; i < n; i++) {
+            NSDictionary *row = rows[i];
+            double x = [row[@"x"] doubleValue], y = [row[@"y"] doubleValue], z = [row[@"z"] doubleValue];
+            double dx = self.coordHasOrigin ? (x - self.coordOX) : x;
+            double dy = self.coordHasOrigin ? (y - self.coordOY) : y;
+            double dz = self.coordHasOrigin ? (z - self.coordOZ) : 0.0;
+            double d = sqrt(dx * dx + dy * dy);
+
+            CGFloat sx = cx + (CGFloat)(0.866 * (dx - dy) * k);
+            CGFloat gyy = cy - (CGFloat)(0.5 * (dx + dy) * k);
+            CGFloat topY = gyy - (CGFloat)(dz * k * 2.0);   // 高度 2 倍放大，便于分辨楼层
+
+            BOOL readable = [row[@"ok"] boolValue];
+            double ratio = (maxD > 0) ? d / maxD : 0.0;
+            UIColor *col = readable
+                ? [UIColor colorWithRed:(0.25 + 0.7 * ratio)
+                                  green:(0.85 - 0.55 * ratio)
+                                   blue:(0.35 + 0.1 * ratio) alpha:1]
+                : [UIColor colorWithWhite:0.42 alpha:1];
+
+            // 竖杆
+            UIColor *stalk = [col colorWithAlphaComponent:0.45];
+            [stalk setStroke];
+            CGContextSetLineWidth(ctx, 1.2);
+            CGContextMoveToPoint(ctx, sx, gyy);
+            CGContextAddLineToPoint(ctx, sx, topY);
+            CGContextStrokePath(ctx);
+
+            // 地面投影点（小十字，说明水平位置）
+            [[UIColor colorWithWhite:1 alpha:0.22] setStroke];
+            CGContextSetLineWidth(ctx, 1.0);
+            CGContextMoveToPoint(ctx, sx - 2.5, gyy);
+            CGContextAddLineToPoint(ctx, sx + 2.5, gyy);
+            CGContextStrokePath(ctx);
+
+            // 顶端点
+            [col setFill];
+            CGContextFillEllipseInRect(ctx, CGRectMake(sx - 4, topY - 4, 8, 8));
+
+            // 编号
+            MemDrawText(row[@"label"], CGRectMake(sx + 6, topY - 16, 34, 15),
+                        [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightBold],
+                        col);
+        }
+
+        // ---- 右侧数值列 ----
+        for (NSUInteger i = 0; i < n; i++) {
+            NSDictionary *row = rows[i];
+            CGFloat ly = 62 + i * 26;
+            MemDrawText(row[@"label"], CGRectMake(438, ly, 34, 20),
+                        [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightBold],
+                        [UIColor colorWithWhite:0.8 alpha:1]);
+            MemDrawText(row[@"v"], CGRectMake(472, ly, 150, 20),
+                        [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular],
+                        [[UIColor whiteColor] colorWithAlphaComponent:0.92]);
+        }
+
+        MemDrawText(@"竖杆=高度(2×放大)   环=1/4~1 倍最大距离   灰点=已清零",
+                    CGRectMake(20, 338, 600, 16),
+                    [UIFont systemFontOfSize:11],
+                    [UIColor colorWithWhite:0.45 alpha:1]);
+    }];
+}
+
 #pragma mark - PiP 代理
 
 - (void)pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)c {
     [self logMsg:@"PiP 已启动 active=%d", (int)c.isPictureInPictureActive];
-    [self renderLeft:memread_valscan_count() changed:0 rows:@[]];
+    if (self.coordMode) {
+        [self renderCoords:[self coordRowsWithPid:self.pid]];
+    } else {
+        [self renderLeft:memread_valscan_count() changed:0 rows:@[]];
+    }
 }
 
 - (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)c {
