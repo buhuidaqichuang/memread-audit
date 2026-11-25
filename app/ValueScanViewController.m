@@ -4,6 +4,10 @@
 #import "SavedAddressStore.h"
 #import "memread_core.h"
 #import "FloatPanelController.h"
+#include <libproc.h>
+#include <dlfcn.h>
+#include <unistd.h>
+#include <sys/sysctl.h>
 #include <string.h>
 #include <stdlib.h>
 #include <QuartzCore/QuartzCore.h>
@@ -141,6 +145,7 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
     [self addButton:@"坐标结构扫描（不用输坐标值）" width:W y:&y sel:@selector(onCoordProbe)];
     [self addButton:@"⑤ 后台自动捕捉坐标（不用切来切去）" width:W y:&y sel:@selector(onAutoCapture)];
     [self addButton:@"⑥ 弹夹→自己坐标（不用动）" width:W y:&y sel:@selector(onAnchorCoord)];
+    [self addButton:@"⑦ 能力探测（tfp / 内核原语）" width:W y:&y sel:@selector(onCapProbe)];
     [self addButton:@"释放内存快照（省内存）" width:W y:&y sel:@selector(onFreeSnap)];
     [self addButton:@"查看候选列表（点一行读当前值）" width:W y:&y sel:@selector(onList)];
     [self addButton:@"已保存地址（自定义标签）" width:W y:&y sel:@selector(onSaved)];
@@ -786,6 +791,82 @@ static void RefineProgCb(unsigned long long idx, unsigned long long total,
             [self2 presentViewController:ok animated:YES completion:nil];
         });
     });
+}
+
+#pragma mark ⑦ 能力探测（task_for_pid / 内核原语 / 越狱路径）
+
+static pid_t probe_pid_by_name(const char *name) {
+    int cap = 4096;
+    pid_t *pids = (pid_t *)malloc(sizeof(pid_t) * (size_t)cap);
+    if (!pids) return 0;
+    int n = proc_listpids(PROC_ALL_PIDS, 0, pids, (int)(sizeof(pid_t) * (size_t)cap));
+    pid_t found = 0;
+    for (int i = 0; i < n / (int)sizeof(pid_t); i++) {
+        if (pids[i] <= 0) continue;
+        char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+        if (proc_pidpath(pids[i], path, sizeof(path)) <= 0) continue;
+        const char *base = strrchr(path, '/');
+        base = base ? base + 1 : path;
+        if (strcmp(base, name) == 0) { found = pids[i]; break; }
+    }
+    free(pids);
+    return found;
+}
+
+static NSString *probe_tfp(pid_t pid) {
+    if (pid <= 0) return @"进程没找到";
+    task_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr == KERN_SUCCESS) {
+        mach_port_deallocate(mach_task_self(), task);
+        return [NSString stringWithFormat:@"允许 (pid %d)", pid];
+    }
+    return [NSString stringWithFormat:@"被拒 kr=%d (pid %d)", kr, pid];
+}
+
+- (void)onCapProbe {
+    NSMutableString *r = [NSMutableString string];
+    [r appendFormat:@"自身 pid=%d  euid=%d\n", getpid(), geteuid()];
+    [r appendFormat:@"游戏进程 tfp：%@\n", probe_tfp([self ensurePid])];
+    [r appendFormat:@"SpringBoard tfp：%@\n", probe_tfp(probe_pid_by_name("SpringBoard"))];
+    [r appendFormat:@"launchd tfp：%@\n", probe_tfp(probe_pid_by_name("launchd"))];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *paths[] = { @"/var/jb", @"/var/jb/usr/lib/libjailbreak.dylib",
+                          @"/var/jb/usr/lib/libkfd.dylib", @"/usr/lib/libjailbreak.dylib",
+                          @"/var/jb/usr/bin/ldid", @"/var/jb/usr/lib/libsubstrate.dylib" };
+    [r appendString:@"\n路径：\n"];
+    for (int i = 0; i < 6; i++) {
+        [r appendFormat:@"  %@  %@\n", paths[i], [fm fileExistsAtPath:paths[i]] ? @"有" : @"无"];
+    }
+
+    [r appendString:@"\n内核原语符号：\n"];
+    void *h = dlopen("/var/jb/usr/lib/libjailbreak.dylib", RTLD_NOW);
+    [r appendFormat:@"  libjailbreak dlopen：%@\n", h ? @"成功" : @"失败"];
+    void *kfd = dlopen("/var/jb/usr/lib/libkfd.dylib", RTLD_NOW);
+    [r appendFormat:@"  libkfd dlopen：%@\n", kfd ? @"成功" : @"失败"];
+
+    const char *syms[] = { "kread64", "kwrite64", "kread", "kwrite", "physrw_read",
+                           "physread", "kfd_open", "jbclient_query_primitive" };
+    for (int i = 0; i < 8; i++) {
+        void *p = dlsym(RTLD_DEFAULT, syms[i]);
+        if (!p && h) p = dlsym(h, syms[i]);
+        if (!p && kfd) p = dlsym(kfd, syms[i]);
+        [r appendFormat:@"  %-24s %@\n", syms[i], p ? @"有" : @"无"];
+    }
+    if (h) dlclose(h);
+    if (kfd) dlclose(kfd);
+
+    [r appendString:@"\n判读：SpringBoard/launchd 都「允许」= 有内核协助或 entitlements 全开；\n"
+                    @"只有游戏进程「允许」= 用户态越狱 + App 未加固；\n"
+                    @"kread/kwrite/physrw 任一「有」= 真有内核读写原语。"];
+
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"⑦ 能力探测"
+                                                               message:r
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+    [self appendProgressLine:r];
 }
 
 #pragma mark ⑥ 从弹夹锚点推自己坐标（不用人工动作）
