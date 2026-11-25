@@ -274,6 +274,90 @@ static int cmd_watch(int argc, char **argv) {
     return 0;
 }
 
+// live：自己扫一遍拿地址，然后连续采样并打印「动过」的地址（不落文件）
+static int cmd_live(int argc, char **argv) {
+    if (argc < 5) { fprintf(stderr, "用法: live <pid> <seconds> <interval_ms> [min_delta] [topN]\n"); return 1; }
+    int pid = atoi(argv[2]);
+    double secs = atof(argv[3]);
+    int interval_ms = atoi(argv[4]);
+    float min_delta = (argc >= 6) ? (float)atof(argv[5]) : 2.0f;
+    int topn = (argc >= 7) ? atoi(argv[6]) : 60;
+
+    memread_coord_hit_t *hits = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * MEMREAD_COORD_HIT_CAP);
+    if (!hits) return 3;
+    int found = 0;
+    double ts = now_s();
+    int rc = memread_coord_probe(pid, hits, MEMREAD_COORD_HIT_CAP, &found, NULL, NULL, NULL);
+    printf("扫描: rc=%d 候选=%d 用时=%.2fs\n", rc, found, now_s() - ts);
+    if (rc != 0 || found <= 0) { free(hits); return 2; }
+
+    int n = found;
+    uint64_t *addrs = (uint64_t *)malloc(sizeof(uint64_t) * n);
+    float *buf = (float *)malloc(sizeof(float) * 3 * n);
+    watch_stat_t *st = (watch_stat_t *)calloc(n, sizeof(watch_stat_t));
+    if (!addrs || !buf || !st) { free(hits); free(addrs); free(buf); free(st); return 3; }
+    for (int i = 0; i < n; i++) { addrs[i] = hits[i].addr; st[i].addr = hits[i].addr; st[i].i = i; }
+    free(hits);
+
+    double t0 = now_s();
+    int samples = 0, reads = 0;
+    while (1) {
+        double el = now_s() - t0;
+        if (el > secs) break;
+        int ok = memread_read_vec3_batch(pid, addrs, n, buf);
+        if (ok < 0) { printf("采样失败 rc=%d\n", ok); break; }
+        reads += ok;
+        for (int i = 0; i < ok; i++) {
+            float *v = &buf[i * 3];
+            if (st[i].ok == 0) {
+                for (int k = 0; k < 3; k++) { st[i].first[k] = v[k]; st[i].lo[k] = v[k]; st[i].hi[k] = v[k]; }
+            } else {
+                for (int k = 0; k < 3; k++) {
+                    if (v[k] < st[i].lo[k]) st[i].lo[k] = v[k];
+                    if (v[k] > st[i].hi[k]) st[i].hi[k] = v[k];
+                }
+            }
+            for (int k = 0; k < 3; k++) st[i].last[k] = v[k];
+            st[i].ok++;
+        }
+        samples++;
+        usleep(interval_ms * 1000);
+    }
+
+    float maxsq = 0;
+    for (int i = 0; i < n; i++) {
+        float d = 0;
+        for (int k = 0; k < 3; k++) { float dv = st[i].last[k] - st[i].first[k]; d += dv * dv; }
+        st[i].total = d;
+        if (d > maxsq) maxsq = d;
+    }
+
+    watch_stat_t *sorted = (watch_stat_t *)malloc(sizeof(watch_stat_t) * n);
+    if (!sorted) { free(addrs); free(buf); free(st); return 3; }
+    memcpy(sorted, st, sizeof(watch_stat_t) * n);
+    qsort(sorted, n, sizeof(watch_stat_t), watch_cmp);
+
+    int moved = 0;
+    for (int i = 0; i < n; i++) if (sqrt((double)sorted[i].total) >= min_delta) moved++;
+    printf("采样: %d 帧 / %d 次读，地址 %d 个，位移>=%.2f 的有 %d 个，最大位移 %.2f\n",
+           samples, reads, n, min_delta, moved, sqrt((double)maxsq));
+    int shown = 0;
+    for (int i = 0; i < n && shown < topn; i++) {
+        float dist = (float)sqrt((double)sorted[i].total);
+        if (dist < min_delta) break;
+        printf("%3d  0x%-12llx d=%-8.2f  start=(%.2f,%.2f,%.2f)  end=(%.2f,%.2f,%.2f)  range=[%.1f..%.1f / %.1f..%.1f / %.1f..%.1f] n=%d\n",
+               shown, (unsigned long long)sorted[i].addr, dist,
+               sorted[i].first[0], sorted[i].first[1], sorted[i].first[2],
+               sorted[i].last[0], sorted[i].last[1], sorted[i].last[2],
+               sorted[i].lo[0], sorted[i].hi[0], sorted[i].lo[1], sorted[i].hi[1],
+               sorted[i].lo[2], sorted[i].hi[2], sorted[i].ok);
+        shown++;
+    }
+    printf("-- 显示 %d / %d\n", shown, moved);
+    free(sorted); free(addrs); free(buf); free(st);
+    return 0;
+}
+
 static int cmd_anchor(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "用法: anchor <pid> <anchor_hex> [depth] [cap]\n"); return 1; }
     int pid = atoi(argv[2]);
@@ -379,12 +463,13 @@ static void usage(const char *prog) {
         "  %s coordsave <pid> <file>\n"
         "  %s coorddiff <pid> <file> [0=全量|1=姿态] [显示条数]\n"
         "  %s anchor <pid> <anchor_hex> [depth] [cap]\n"
+        "  %s live <pid> <seconds> <interval_ms> [min_delta] [topN]\n"
         "  %s watch <pid> <file> <seconds> <interval_ms> [min_delta] [topN]\n"
         "  %s read <pid> <addr_hex> [f|i|l|d]\n"
         "  %s chain <pid> <addr_hex> [depth] [cap]\n"
         "  %s modinfo <pid> <addr_hex>\n"
         "  %s token <pid>\n"
-        "  %s dump <pid> <out.bin> [rw-only]\n", prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+        "  %s dump <pid> <out.bin> [rw-only]\n", prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
@@ -396,6 +481,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "coorddiff")) return cmd_coorddiff(argc, argv);
     if (!strcmp(cmd, "anchor"))    return cmd_anchor(argc, argv);
     if (!strcmp(cmd, "watch"))     return cmd_watch(argc, argv);
+    if (!strcmp(cmd, "live"))      return cmd_live(argc, argv);
     if (!strcmp(cmd, "read"))      return cmd_read(argc, argv);
     if (!strcmp(cmd, "chain"))     return cmd_chain(argc, argv);
     if (!strcmp(cmd, "modinfo"))   return cmd_modinfo(argc, argv);
