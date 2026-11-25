@@ -160,6 +160,56 @@ static int cmd_coorddiff(int argc, char **argv) {
     return 0;
 }
 
+// 时间序列采样：把 base 文件里的地址连续采样，输出 CSV（t_ms,addr,x,y,z,ok）
+static int cmd_watch(int argc, char **argv) {
+    if (argc < 6) { fprintf(stderr, "用法: watch <pid> <file> <seconds> <interval_ms> [out.csv]\n"); return 1; }
+    int pid = atoi(argv[2]);
+    FILE *f = fopen(argv[3], "rb");
+    if (!f) { fprintf(stderr, "打不开基准文件\n"); return 4; }
+    save_head_t h;
+    if (fread(&h, sizeof(h), 1, f) != 1 || h.magic != SAVE_MAGIC) { fclose(f); return 4; }
+    int n = (int)h.n;
+    memread_coord_hit_t *base = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * n);
+    if (!base) { fclose(f); return 3; }
+    if (fread(base, sizeof(memread_coord_hit_t), n, f) != (size_t)n) { fclose(f); free(base); return 4; }
+    fclose(f);
+
+    double secs = atof(argv[4]);
+    int interval_ms = atoi(argv[5]);
+    const char *outpath = (argc >= 7) ? argv[6] : "/var/tmp/watch.csv";
+
+    uint64_t *addrs = (uint64_t *)malloc(sizeof(uint64_t) * n);
+    float *buf = (float *)malloc(sizeof(float) * 3 * n);
+    if (!addrs || !buf) { free(base); return 3; }
+    for (int i = 0; i < n; i++) addrs[i] = base[i].addr;
+
+    FILE *out = fopen(outpath, "w");
+    if (!out) { fprintf(stderr, "写不了 %s\n", outpath); free(base); free(addrs); free(buf); return 4; }
+    fprintf(out, "t_ms,addr,x,y,z,ok\n");
+
+    double t0 = now_s();
+    int samples = 0;
+    while (1) {
+        double el = now_s() - t0;
+        if (el > secs) break;
+        int ok = memread_read_vec3_batch(pid, addrs, n, buf);
+        if (ok < 0) { printf("采样失败 rc=%d\n", ok); break; }
+        long long t_ms = (long long)(el * 1000.0);
+        for (int i = 0; i < n; i++) {
+            if (i < ok) fprintf(out, "%lld,0x%llx,%.3f,%.3f,%.3f,1\n", t_ms, (unsigned long long)addrs[i],
+                                buf[i * 3], buf[i * 3 + 1], buf[i * 3 + 2]);
+            else fprintf(out, "%lld,0x%llx,0,0,0,0\n", t_ms, (unsigned long long)addrs[i]);
+        }
+        fflush(out);
+        samples++;
+        usleep(interval_ms * 1000);
+    }
+    fclose(out);
+    free(base); free(addrs); free(buf);
+    printf("采样完成: %d 帧 -> %s\n", samples, outpath);
+    return 0;
+}
+
 static int cmd_anchor(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "用法: anchor <pid> <anchor_hex> [depth] [cap]\n"); return 1; }
     int pid = atoi(argv[2]);
@@ -265,11 +315,12 @@ static void usage(const char *prog) {
         "  %s coordsave <pid> <file>\n"
         "  %s coorddiff <pid> <file> [0=全量|1=姿态] [显示条数]\n"
         "  %s anchor <pid> <anchor_hex> [depth] [cap]\n"
+        "  %s watch <pid> <file> <seconds> <interval_ms> [out.csv]\n"
         "  %s read <pid> <addr_hex> [f|i|l|d]\n"
         "  %s chain <pid> <addr_hex> [depth] [cap]\n"
         "  %s modinfo <pid> <addr_hex>\n"
         "  %s token <pid>\n"
-        "  %s dump <pid> <out.bin> [rw-only]\n", prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+        "  %s dump <pid> <out.bin> [rw-only]\n", prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
@@ -280,6 +331,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "coordsave")) return cmd_coordsave(argc, argv);
     if (!strcmp(cmd, "coorddiff")) return cmd_coorddiff(argc, argv);
     if (!strcmp(cmd, "anchor"))    return cmd_anchor(argc, argv);
+    if (!strcmp(cmd, "watch"))     return cmd_watch(argc, argv);
     if (!strcmp(cmd, "read"))      return cmd_read(argc, argv);
     if (!strcmp(cmd, "chain"))     return cmd_chain(argc, argv);
     if (!strcmp(cmd, "modinfo"))   return cmd_modinfo(argc, argv);
