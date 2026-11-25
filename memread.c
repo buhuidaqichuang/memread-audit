@@ -10,6 +10,8 @@
 #include <math.h>
 #include "memread_core.h"
 
+static int pid_arg(const char *s);
+
 #define SAVE_MAGIC 0x4D524344u
 
 typedef struct {
@@ -98,7 +100,7 @@ static int cmd_coordscan(int argc, char **argv) {
 
 static int cmd_coordsave(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "用法: coordsave <pid> <file>\n"); return 1; }
-    int pid = atoi(argv[2]);
+    int pid = pid_arg(argv[2]);
     memread_coord_hit_t *buf = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * MEMREAD_COORD_HIT_CAP);
     if (!buf) return 3;
     int found = 0;
@@ -120,7 +122,7 @@ static int cmd_coordsave(int argc, char **argv) {
 
 static int cmd_coorddiff(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "用法: coorddiff <pid> <file> [mode] [limit]\n"); return 1; }
-    int pid = atoi(argv[2]);
+    int pid = pid_arg(argv[2]);
     FILE *f = fopen(argv[3], "rb");
     if (!f) { fprintf(stderr, "打不开基准文件\n"); return 4; }
     save_head_t h;
@@ -183,7 +185,7 @@ static int watch_cmp(const void *a, const void *b) {
 // 时间序列采样：连续读一批地址，跟踪首末值与各轴极值，直接打印「确实动过的地址」
 static int cmd_watch(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "用法: watch <pid> <file> <seconds> <interval_ms> [min_delta] [topN]\n"); return 1; }
-    int pid = atoi(argv[2]);
+    int pid = pid_arg(argv[2]);
     FILE *f = fopen(argv[3], "rb");
     if (!f) { fprintf(stderr, "打不开基准文件 %s\n", argv[3]); return 4; }
     save_head_t h;
@@ -277,7 +279,7 @@ static int cmd_watch(int argc, char **argv) {
 // live：自己扫一遍拿地址，然后连续采样并打印「动过」的地址（不落文件）
 static int cmd_live(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "用法: live <pid> <seconds> <interval_ms> [min_delta] [topN]\n"); return 1; }
-    int pid = atoi(argv[2]);
+    int pid = pid_arg(argv[2]);
     double secs = atof(argv[3]);
     int interval_ms = atoi(argv[4]);
     float min_delta = (argc >= 6) ? (float)atof(argv[5]) : 2.0f;
@@ -437,7 +439,7 @@ static int cmd_coordcmp(int argc, char **argv) {
 // 按「模块基址+静态偏移+逐跳偏移」直接解析并读三元组（跨重启复原用）
 static int cmd_chainval(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "用法: chainval <pid> <static_off_hex> <depth> <off1> [off2] [off3]...\n"); return 1; }
-    int pid = atoi(argv[2]);
+    int pid = pid_arg(argv[2]);
     uint64_t off = strtoull(argv[3], NULL, 0);
     int depth = atoi(argv[4]);
     if (depth < 1 || depth > MEMREAD_CHAIN_MAX_DEPTH) { fprintf(stderr, "depth 1..%d\n", MEMREAD_CHAIN_MAX_DEPTH); return 1; }
@@ -482,7 +484,7 @@ static int cpt_cmp_xy(const void *a, const void *b) {
 }
 
 static int cmd_cluster(int argc, char **argv) {
-    int pid = atoi(argv[2]);
+    int pid = pid_arg(argv[2]);
     int minn = (argc >= 4) ? atoi(argv[3]) : 4;
     int topn = (argc >= 5) ? atoi(argv[4]) : 25;
     memread_coord_hit_t *hits = (memread_coord_hit_t *)malloc(sizeof(memread_coord_hit_t) * MEMREAD_COORD_HIT_CAP);
@@ -526,7 +528,7 @@ static int cmd_cluster(int argc, char **argv) {
 
 static int cmd_anchor(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "用法: anchor <pid> <anchor_hex> [depth] [cap]\n"); return 1; }
-    int pid = atoi(argv[2]);
+    int pid = pid_arg(argv[2]);
     unsigned long long anchor = strtoull(argv[3], NULL, 0);
     int depth = (argc >= 5) ? atoi(argv[4]) : 4;
     int cap = (argc >= 6) ? atoi(argv[5]) : 200;
@@ -547,7 +549,7 @@ static int cmd_anchor(int argc, char **argv) {
 
 static int cmd_read(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "用法: read <pid> <addr_hex> [f|i|l|d]\n"); return 1; }
-    int pid = atoi(argv[2]);
+    int pid = pid_arg(argv[2]);
     unsigned long long addr = strtoull(argv[3], NULL, 0);
     int t = parse_type(argc >= 5 ? argv[4] : "f");
     double val = 0;
@@ -562,7 +564,7 @@ static int cmd_read(int argc, char **argv) {
 
 static int cmd_chain(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "用法: chain <pid> <addr_hex> [depth] [cap]\n"); return 1; }
-    int pid = atoi(argv[2]);
+    int pid = pid_arg(argv[2]);
     unsigned long long addr = strtoull(argv[3], NULL, 0);
     int depth = (argc >= 5) ? atoi(argv[4]) : 4;
     int cap = (argc >= 6) ? atoi(argv[5]) : 50;
@@ -593,7 +595,7 @@ static int cmd_chain(int argc, char **argv) {
 
 static int cmd_modinfo(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "用法: modinfo <pid> <addr_hex>\n"); return 1; }
-    int pid = atoi(argv[2]);
+    int pid = pid_arg(argv[2]);
     unsigned long long addr = strtoull(argv[3], NULL, 0);
     char uuid[64] = {0}, name[128] = {0};
     unsigned long long base = 0, off = 0;
@@ -604,7 +606,7 @@ static int cmd_modinfo(int argc, char **argv) {
 
 static int cmd_token(int argc, char **argv) {
     if (argc < 3) return 1;
-    int pid = atoi(argv[2]);
+    int pid = pid_arg(argv[2]);
     char uuid[64] = {0};
     unsigned long long base = 0;
     int rc = memread_proc_token(pid, uuid, sizeof(uuid), &base);
@@ -614,11 +616,17 @@ static int cmd_token(int argc, char **argv) {
 
 static int cmd_dump(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "用法: dump <pid> <out.bin> [rw-only]\n"); return 1; }
-    int pid = atoi(argv[2]);
+    int pid = pid_arg(argv[2]);
     int rw_only = (argc >= 5 && strcmp(argv[4], "rw-only") == 0);
     int rc = memread_dump(pid, argv[3], rw_only, NULL, NULL);
     printf("rc=%d -> %s\n", rc, argv[3]);
     return rc == 0 ? 0 : 2;
+}
+
+static int pid_arg(const char *s) {
+    int pid = atoi(s);
+    if (pid > 0) return pid;
+    return find_pid_by_name(s);
 }
 
 static void usage(const char *prog) {
