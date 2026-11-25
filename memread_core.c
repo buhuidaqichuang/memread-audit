@@ -1115,44 +1115,6 @@ int memread_read_vec3_batch(pid_t pid, const uint64_t *addrs, int n, float *out)
 }
 
 // 预统计与首扫完全相同的区域过滤条件，得到总量用于进度百分比（只枚举，不读内存）
-int memread_regions_list(pid_t pid, memread_region_info_t *out, int cap) {
-    if (!out || cap <= 0) return 0;
-    task_t task = MACH_PORT_NULL;
-    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
-    module_cache_ensure(pid);
-    int n = 0, idx = 0;
-    mach_vm_address_t addr = 0;
-    for (;;) {
-        mach_vm_size_t size = 0;
-        vm_region_basic_info_data_64_t info;
-        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
-        mach_port_t obj = MACH_PORT_NULL;
-        kern_return_t kr = mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
-                                         (vm_region_info_t)&info, &cnt, &obj);
-        if (kr != KERN_SUCCESS || size == 0) break;
-        int in_module = 0;
-        for (int i = 0; i < g_modsegn; i++) {
-            uint64_t s = g_modsegs[i].seg_start, e = g_modsegs[i].seg_end;
-            if (((uint64_t)addr >= s && (uint64_t)addr < e) ||
-                ((uint64_t)addr + size > s && (uint64_t)addr < e)) { in_module = 1; break; }
-        }
-        if ((info.protection & VM_PROT_READ) && (info.protection & VM_PROT_WRITE) && !info.shared) {
-            if (n < cap) {
-                out[n].index = idx;
-                out[n].addr = (uint64_t)addr;
-                out[n].size = (uint64_t)size;
-                out[n].prot = (int)info.protection;
-                out[n].in_module = in_module;
-                n++;
-            }
-            idx++;
-        }
-        addr += size;
-    }
-    mach_port_deallocate(mach_task_self(), task);
-    return n;
-}
-
 int memread_writable_bytes(pid_t pid, int rw_only,
                            unsigned long long *out_bytes, unsigned long long *out_regions) {
     if (out_bytes) *out_bytes = 0;
@@ -1727,6 +1689,45 @@ static int module_cache_ensure(pid_t pid) {
     }
     return 0;
 }
+
+int memread_regions_list(pid_t pid, memread_region_info_t *out, int cap) {
+    if (!out || cap <= 0) return 0;
+    task_t task = MACH_PORT_NULL;
+    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
+    module_cache_ensure(pid);
+    int n = 0, idx = 0;
+    mach_vm_address_t addr = 0;
+    for (;;) {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        kern_return_t kr = mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
+                                         (vm_region_info_t)&info, &cnt, &obj);
+        if (kr != KERN_SUCCESS || size == 0) break;
+        int in_module = 0;
+        for (int i = 0; i < g_modsegn; i++) {
+            uint64_t s = g_modsegs[i].seg_start, e = g_modsegs[i].seg_end;
+            if (((uint64_t)addr >= s && (uint64_t)addr < e) ||
+                ((uint64_t)addr + size > s && (uint64_t)addr < e)) { in_module = 1; break; }
+        }
+        if ((info.protection & VM_PROT_READ) && (info.protection & VM_PROT_WRITE) && !info.shared) {
+            if (n < cap) {
+                out[n].index = idx;
+                out[n].addr = (uint64_t)addr;
+                out[n].size = (uint64_t)size;
+                out[n].prot = (int)info.protection;
+                out[n].in_module = in_module;
+                n++;
+            }
+            idx++;
+        }
+        addr += size;
+    }
+    mach_port_deallocate(mach_task_self(), task);
+    return n;
+}
+
 
 int memread_addr_module_info(pid_t pid, uint64_t addr,
                              char *out_uuid, size_t uuid_cap,
