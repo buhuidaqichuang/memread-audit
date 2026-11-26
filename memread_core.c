@@ -2644,7 +2644,7 @@ static int int_diff_cmp(const void *pa, const void *pb) {
     return (da > db) ? -1 : 1;
 }
 
-int memread_int_globaldiff(pid_t pid, int seconds, int min_delta, int maxv,
+int memread_int_globaldiff(pid_t pid, int seconds, int min_delta, int max_delta, int maxv,
                            memread_int_hit_t *out, int cap, int *found,
                            volatile int *cancel) {
     if (found) *found = 0;
@@ -2739,6 +2739,8 @@ int memread_int_globaldiff(pid_t pid, int seconds, int min_delta, int maxv,
                 int dv = (int)a2 - (int)a1;
                 if (dv < 0) dv = -dv;
                 if (dv < min_delta) continue;
+                if (max_delta > 0 && dv > max_delta) continue;
+                if (a1 == 0 || a2 == 0) continue;
                 if (maxv > 0 && (a1 > maxv || a1 < -maxv || a2 > maxv || a2 < -maxv)) continue;
                 memcpy(&n1, bufA + o + 4, 4);
                 memcpy(&n2, bufB + o + 4, 4);

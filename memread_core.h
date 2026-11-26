@@ -183,7 +183,7 @@ int memread_int_probe(pid_t pid, memread_int_hit_t *out, int cap, int *found,
 // 全局两帧差分：先把所有可写区整数快照进内存，隔 seconds 再扫一遍逐 4 字节比对，
 // 只留「本身变了 >= min_delta、值在 ±maxv 内、且相邻 4 字节基本没动」的位置。
 // 这是 2D 游戏找角色坐标的主手段（不需要知道坐标值，也不受候选上限影响）。
-int memread_int_globaldiff(pid_t pid, int seconds, int min_delta, int maxv,
+int memread_int_globaldiff(pid_t pid, int seconds, int min_delta, int max_delta, int maxv,
                            memread_int_hit_t *out, int cap, int *found,
                            volatile int *cancel);
 

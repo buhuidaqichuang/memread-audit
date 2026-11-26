@@ -731,19 +731,20 @@ static int cmd_intscan(int argc, char **argv) {
 // 只留「自身变化 >= min_delta、值在 maxv 内、相邻 4 字节几乎没动」的整数位置。
 // 这 N 秒里人一直走，位置会持续单轴变化，计数器/动画/摇杆会被判据排掉。
 static int cmd_intlive(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "用法: intlive <pid|进程名> <秒> [min_delta] [topN] [值上限]\n"); return 1; }
+    if (argc < 4) { fprintf(stderr, "用法: intlive <pid|进程名> <秒> [min_delta] [max_delta] [topN] [值上限]\n"); return 1; }
     int pid = pid_arg(argv[2]);
     if (pid <= 0) { fprintf(stderr, "找不到进程\n"); return 2; }
     int secs = atoi(argv[3]);
-    int min_delta = (argc >= 5) ? atoi(argv[4]) : 3;
-    int topn = (argc >= 6) ? atoi(argv[5]) : 40;
-    int maxv = (argc >= 7) ? atoi(argv[6]) : 2000;
+    int min_delta = (argc >= 5) ? atoi(argv[4]) : 2;
+    int max_delta = (argc >= 6) ? atoi(argv[5]) : 500;
+    int topn = (argc >= 7) ? atoi(argv[6]) : 40;
+    int maxv = (argc >= 8) ? atoi(argv[7]) : 2000;
 
     memread_int_hit_t *hits = (memread_int_hit_t *)malloc(sizeof(memread_int_hit_t) * MEMREAD_INT_HIT_CAP);
     if (!hits) return 3;
     int found = 0;
     double t0 = now_s();
-    int rc = memread_int_globaldiff(pid, secs, min_delta, maxv, hits, MEMREAD_INT_HIT_CAP, &found, NULL);
+    int rc = memread_int_globaldiff(pid, secs, min_delta, max_delta, maxv, hits, MEMREAD_INT_HIT_CAP, &found, NULL);
     printf("两帧差分: rc=%d 命中=%d 用时=%.2fs\n", rc, found, now_s() - t0);
     if (rc != 0 || found <= 0) { free(hits); return 2; }
 
@@ -855,7 +856,7 @@ static void usage(const char *prog) {
         "  %s anchor <pid> <anchor_hex> [depth] [cap]\n"
         "  %s cluster <pid> [minN] [topN]\n"
         "  %s intscan <pid|进程名> [显示条数] [值上限]\n"
-        "  %s intlive <pid|进程名> <秒> [min_delta] [topN] [值上限]\n"
+        "  %s intlive <pid|进程名> <秒> [min_delta] [max_delta] [topN] [值上限]\n"
         "  %s chainval <pid> <static_off_hex> <depth> <off1> [off2] ...\n"
         "  %s coordcmp <fileA> <fileB> [min_delta] [topN]\n"
         "  %s live <pid> <seconds> <interval_ms> [min_delta] [topN]\n"
