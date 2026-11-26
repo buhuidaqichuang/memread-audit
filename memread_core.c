@@ -4348,6 +4348,93 @@ int memread_pointgroups(pid_t pid, float minv, float maxv,
 // ================= int16 点位组扫描（tile / 定点编码） =================
 // BS 是 2D tile 游戏：逻辑坐标很可能是 int16（tile 索引，或 tile*1000 的定点），
 // 布局为每 4 字节一个 (x,y) 两个 int16。判据：值域 + 页内连续段 + 段内间距合理。
+
+// ================= int16 点位组扫描（tile / 定点编码，块读版） =================
+#define PG16_MAXP 1024
+#define PG16_PAGE 4096
+
+// 分析一页；命中并打印返回 1
+static int pg16_analyze_page(uint64_t pa, unsigned char *pg, int minv, int maxv,
+                             int mindist, int maxdist, int minrun) {
+    int as[PG16_MAXP], bs[PG16_MAXP];
+    uint64_t ads[PG16_MAXP];
+    int n = 0;
+    size_t lim = PG16_PAGE - 4;
+    for (size_t i = 0; i <= lim && n < PG16_MAXP; i += 4) {
+        int16_t a, b;
+        memcpy(&a, pg + i, 2);
+        memcpy(&b, pg + i + 2, 2);
+        int ai = (int)a, bi = (int)b;
+        if (ai < minv || ai > maxv) continue;
+        if (bi < minv || bi > maxv) continue;
+        if (ai == 0 || bi == 0) continue;
+        as[n] = ai; bs[n] = bi; ads[n] = pa + i; n++;
+    }
+    if (n < minrun) return 0;
+
+    int best = -1, bestlen = 0, bestgood = 0, bestpairs = 0;
+    int k = 0;
+    while (k < n) {
+        int st = k, e = k, good = 0, pairs = 0;
+        while (e + 1 < n && ads[e + 1] - ads[e] == 4) {
+            int dx = as[e + 1] - as[e];
+            int dy = bs[e + 1] - bs[e];
+            if (dx < 0) dx = -dx;
+            if (dy < 0) dy = -dy;
+            int dd = dx + dy;
+            pairs++;
+            if (dd >= mindist && dd <= maxdist) good++;
+            e++;
+        }
+        int len = e - st + 1;
+        if (len >= minrun && pairs > 0 && good * 10 >= pairs * 7 && len > bestlen) {
+            best = st; bestlen = len; bestgood = good; bestpairs = pairs;
+        }
+        k = e + 1;
+    }
+    if (best < 0) return 0;
+    if (bestlen > 26) return 0;   // 太长：多半是表
+
+    int pairs2 = bestlen - 1, maxrep = 0;
+    if (pairs2 > 1) {
+        int lim3 = bestlen < 26 ? bestlen : 26;
+        for (int q = 0; q + 1 < lim3; q++) {
+            int dxq = as[best + q + 1] - as[best + q];
+            int dyq = bs[best + q + 1] - bs[best + q];
+            int cc = 1;
+            for (int r = 0; r + 1 < lim3; r++) {
+                if (r == q) continue;
+                if (as[best + r + 1] - as[best + r] == dxq &&
+                    bs[best + r + 1] - bs[best + r] == dyq) cc++;
+            }
+            if (cc > maxrep) maxrep = cc;
+        }
+    }
+    if (maxrep * 5 >= pairs2 * 3) return 0;   // 等差序列：拒
+
+    int uniq = 0;
+    int lim2 = bestlen < 64 ? bestlen : 64;
+    for (int q = 0; q < lim2; q++) {
+        int dup = 0;
+        for (int r = 0; r < q; r++)
+            if (as[best + r] == as[best + q] && bs[best + r] == bs[best + q]) { dup = 1; break; }
+        if (!dup) uniq++;
+    }
+    if (uniq < 3) return 0;
+
+    printf("PAGE 0x%016llX  seg=%d  uniq=%d  spaced=%d/%d\n",
+           (unsigned long long)pa, bestlen, uniq, bestgood, bestpairs);
+    int show = bestlen < 16 ? bestlen : 16;
+    for (int q = 0; q < show; q++) {
+        int id = best + q;
+        printf("   +0x%03llX  0x%016llX  (%d, %d)\n",
+               (unsigned long long)(ads[id] - pa),
+               (unsigned long long)ads[id], as[id], bs[id]);
+    }
+    fflush(stdout);
+    return 1;
+}
+
 int memread_pointgroups16(pid_t pid, int minv, int maxv,
                           int mindist, int maxdist, int minrun, int topn) {
     task_t task = MACH_PORT_NULL;
@@ -4359,13 +4446,9 @@ int memread_pointgroups16(pid_t pid, int minv, int maxv,
     if (module_cache_ensure(pid) != 0)
         fprintf(stderr, "warn: 模块段表不可用，将不跳过模块映像\n");
 
-    const size_t PAGE = 4096;
-    unsigned char *buf = (unsigned char *)malloc(PAGE + 16);
+    const size_t BLK = 262144;   // 一次读 256KB，内部再按 4KB 页分析
+    unsigned char *buf = (unsigned char *)malloc(BLK + 16);
     if (!buf) { mach_port_deallocate(mach_task_self(), task); return -4; }
-
-    enum { MAXP = 1024 };
-    static int as[MAXP], bs[MAXP];
-    static uint64_t ads[MAXP];
 
     int shown = 0, regions = 0, pages = 0, kept = 0;
     unsigned long long bytes = 0;
@@ -4394,88 +4477,16 @@ int memread_pointgroups16(pid_t pid, int minv, int maxv,
         mach_vm_address_t off = 0;
         while (off < size && shown < topn) {
             uint64_t pa = (uint64_t)addr + off;
-            mach_vm_size_t want = PAGE;
-            if (off + PAGE > size) want = size - off;
+            size_t want = BLK;
+            if (off + BLK > size) want = (size_t)(size - off);
             mach_vm_size_t got = 0;
             kr = mach_vm_read_overwrite(task, addr + off, want, (mach_vm_address_t)buf, &got);
             if (kr == KERN_SUCCESS && got >= want) {
                 bytes += got;
-                pages++;
-                int n = 0;
-                size_t lim = (size_t)want - 4;
-                for (size_t i = 0; i <= lim && n < MAXP; i += 4) {
-                    int16_t a, b;
-                    memcpy(&a, buf + i, 2);
-                    memcpy(&b, buf + i + 2, 2);
-                    int ai = (int)a, bi = (int)b;
-                    if (ai < minv || ai > maxv) continue;
-                    if (bi < minv || bi > maxv) continue;
-                    if (ai == 0 || bi == 0) continue;
-                    as[n] = ai; bs[n] = bi; ads[n] = pa + i;
-                    n++;
-                }
-                if (n >= minrun) {
-                    int best = -1, bestlen = 0, bestgood = 0, bestpairs = 0;
-                    int k = 0;
-                    while (k < n) {
-                        int st = k, e = k, good = 0, pairs = 0;
-                        while (e + 1 < n && ads[e + 1] - ads[e] == 4) {
-                            int dx = as[e + 1] - as[e];
-                            int dy = bs[e + 1] - bs[e];
-                            if (dx < 0) dx = -dx;
-                            if (dy < 0) dy = -dy;
-                            int dd = dx + dy;
-                            pairs++;
-                            if (dd >= mindist && dd <= maxdist) good++;
-                            e++;
-                        }
-                        int len = e - st + 1;
-                        if (len >= minrun && pairs > 0 && good * 10 >= pairs * 7 && len > bestlen) {
-                            best = st; bestlen = len; bestgood = good; bestpairs = pairs;
-                        }
-                        k = e + 1;
-                    }
-                    if (best >= 0) {
-                        if (bestlen > 26) { k = n; continue; }
-                        int pairs2 = bestlen - 1;
-                        int maxrep = 0;
-                        if (pairs2 > 1) {
-                            int lim3 = bestlen < 26 ? bestlen : 26;
-                            for (int q = 0; q + 1 < lim3; q++) {
-                                int dxq = as[best + q + 1] - as[best + q];
-                                int dyq = bs[best + q + 1] - bs[best + q];
-                                int cc = 1;
-                                for (int r = 0; r + 1 < lim3; r++) {
-                                    if (r == q) continue;
-                                    if (as[best + r + 1] - as[best + r] == dxq &&
-                                        bs[best + r + 1] - bs[best + r] == dyq) cc++;
-                                }
-                                if (cc > maxrep) maxrep = cc;
-                            }
-                        }
-                        if (maxrep * 5 >= pairs2 * 3) { k = n; continue; }
-                        int uniq = 0;
-                        int lim2 = bestlen < 64 ? bestlen : 64;
-                        for (int q = 0; q < lim2; q++) {
-                            int dup = 0;
-                            for (int r = 0; r < q; r++) {
-                                if (as[best + r] == as[best + q] && bs[best + r] == bs[best + q]) { dup = 1; break; }
-                            }
-                            if (!dup) uniq++;
-                        }
-                        if (uniq < 3) { k = n; continue; }
-                        kept++;
-                        printf("PAGE 0x%016llX  seg=%d  uniq=%d  spaced=%d/%d\n",
-                               (unsigned long long)pa, bestlen, uniq, bestgood, bestpairs);
-                        int show = bestlen < 16 ? bestlen : 16;
-                        for (int q = 0; q < show; q++) {
-                            int idx = best + q;
-                            printf("   +0x%03llX  0x%016llX  (%d, %d)\n",
-                                   (unsigned long long)(ads[idx] - pa),
-                                   (unsigned long long)ads[idx], as[idx], bs[idx]);
-                        }
-                        fflush(stdout);
-                        shown++;
+                for (size_t p = 0; p + PG16_PAGE <= want && shown < topn; p += PG16_PAGE) {
+                    pages++;
+                    if (pg16_analyze_page(pa + p, buf + p, minv, maxv, mindist, maxdist, minrun)) {
+                        kept++; shown++;
                     }
                 }
             }
