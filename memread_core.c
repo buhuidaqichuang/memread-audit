@@ -4410,7 +4410,7 @@ int memread_pointgroups16(pid_t pid, int minv, int maxv,
                     int ai = (int)a, bi = (int)b;
                     if (ai < minv || ai > maxv) continue;
                     if (bi < minv || bi > maxv) continue;
-                    if (ai == 0 && bi == 0) continue;
+                    if (ai == 0 || bi == 0) continue;
                     as[n] = ai; bs[n] = bi; ads[n] = pa + i;
                     n++;
                 }
@@ -4436,9 +4436,19 @@ int memread_pointgroups16(pid_t pid, int minv, int maxv,
                         k = e + 1;
                     }
                     if (best >= 0) {
+                        int uniq = 0;
+                        int lim2 = bestlen < 64 ? bestlen : 64;
+                        for (int q = 0; q < lim2; q++) {
+                            int dup = 0;
+                            for (int r = 0; r < q; r++) {
+                                if (as[best + r] == as[best + q] && bs[best + r] == bs[best + q]) { dup = 1; break; }
+                            }
+                            if (!dup) uniq++;
+                        }
+                        if (uniq < 3) { k = n; continue; }
                         kept++;
-                        printf("PAGE 0x%016llX  seg=%d  spaced=%d/%d\n",
-                               (unsigned long long)pa, bestlen, bestgood, bestpairs);
+                        printf("PAGE 0x%016llX  seg=%d  uniq=%d  spaced=%d/%d\n",
+                               (unsigned long long)pa, bestlen, uniq, bestgood, bestpairs);
                         int show = bestlen < 16 ? bestlen : 16;
                         for (int q = 0; q < show; q++) {
                             int idx = best + q;
