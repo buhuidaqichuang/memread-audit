@@ -2629,6 +2629,12 @@ int memread_read_i32x2_batch(pid_t pid, const uint64_t *addrs, int n, int32_t *o
     return ok;
 }
 
+static double mre_now_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
 static int int_diff_cmp(const void *pa, const void *pb) {
     const memread_int_hit_t *a = (const memread_int_hit_t *)pa;
     const memread_int_hit_t *b = (const memread_int_hit_t *)pb;
@@ -2679,7 +2685,7 @@ int memread_int_globaldiff(pid_t pid, int seconds, int min_delta, int maxv,
     if (fd < 0) { free(bufA); free(bufB); mach_port_deallocate(mach_task_self(), task); return -4; }
 
     // 第一帧：整块写进基线文件（读失败的 chunk 写 0，保证偏移对齐）
-    double t0 = now_s();
+    double t0 = mre_now_s();
     for (int i = 0; i < nreg; i++) {
         if (!((regs[i].prot & VM_PROT_WRITE) != 0)) continue;
         if (regs[i].in_module) continue;
@@ -2704,7 +2710,7 @@ int memread_int_globaldiff(pid_t pid, int seconds, int min_delta, int maxv,
     }
     lseek(fd, 0, SEEK_SET);
     fprintf(stderr, "基线已落盘 %.1f MB（%.1fs），现在等 %d 秒\n",
-            total / 1048576.0, now_s() - t0, seconds);
+            total / 1048576.0, mre_now_s() - t0, seconds);
 
     if (seconds > 0) sleep((unsigned)seconds);
 
