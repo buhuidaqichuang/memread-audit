@@ -749,7 +749,7 @@ static int cmd_intlive(int argc, char **argv) {
     if (rc != 0 || found <= 0) { free(hits); return 2; }
 
     int shown = 0;
-    for (int i = 0; i < found && shown < topn; i++) {
+    for (int i = 0; i < found && (topn <= 0 || shown < topn); i++) {
         int dv = (int)hits[i].v[0] - (int)hits[i].prev[0];
         if (dv < 0) dv = -dv;
         printf("%3d  0x%-12llx  %d -> %d (d=%d)   neigh %d -> %d\n",
