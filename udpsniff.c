@@ -160,7 +160,7 @@ int main(int argc, char **argv) {
 
     FILE *out = NULL;
     int s1 = -1;
-    if (strcmp(outpath, "-") != 0) {
+    if (strcmp(outpath, "-") != 0 && strcmp(outpath, "RAW") != 0) {
         out = fopen(outpath, "w");
         if (!out) { fprintf(stderr, "打不开 %s: %s\n", outpath, strerror(errno)); return 4; }
         s1 = dup(1);
