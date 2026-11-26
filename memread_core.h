@@ -356,3 +356,4 @@ void memread_sig_progress(int *phase, unsigned long long *done, unsigned long lo
                           int *hits);
 
 #endif
+int memread_pointgroups16(pid_t pid, int minv, int maxv, int mindist, int maxdist, int minrun, int topn);
