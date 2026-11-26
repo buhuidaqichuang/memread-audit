@@ -97,6 +97,8 @@ int main(int argc, char **argv) {
     const char *ifname = argc > 1 ? argv[1] : "en0";
     int secs = argc > 2 ? atoi(argv[2]) : 30;
     const char *outpath = argc > 3 ? argv[3] : "/var/tmp/udp.txt";
+#define STEP(fmt, ...) do { fprintf(stderr, "[STEP] " fmt "\n", ##__VA_ARGS__); fflush(stderr); } while (0)
+    STEP("start uid=%d euid=%d", getuid(), geteuid());
 
     int fd = -1, idx = -1;
     for (int i = 0; i < 4; i++) {
@@ -106,12 +108,14 @@ int main(int argc, char **argv) {
         if (fd >= 0) { idx = i; break; }
     }
     if (fd < 0) { fprintf(stderr, "打不开 /dev/bpf*: %s\n", strerror(errno)); return 1; }
+    STEP("opened bpf%d fd=%d", idx, fd);
 
-    u_int blen = 1 << 18;
+    u_int blen = 1 << 16;
     if (ioctl(fd, BIOCSBLEN, &blen) < 0)
         fprintf(stderr, "warn BIOCSBLEN: %s\n", strerror(errno));
     u_int real = 0;
     if (ioctl(fd, BIOCGBLEN, &real) == 0) blen = real;
+    STEP("blen=%u", blen);
 
     struct ifreq ifr;
     memset(&ifr, 0, sizeof ifr);
@@ -120,6 +124,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "BIOCSETIF %s 失败: %s\n", ifname, strerror(errno));
         return 2;
     }
+    STEP("BIOCSETIF %s ok", ifname);
 
     struct ud_bpf_insn insns[] = {
         STMT(I_LD + I_H + I_ABS, 12),
@@ -137,11 +142,16 @@ int main(int argc, char **argv) {
     prog.bf_insns = insns;
     if (ioctl(fd, BIOCSETF, &prog) < 0)
         fprintf(stderr, "warn BIOCSETF: %s\n", strerror(errno));
+    STEP("BIOCSETF ok");
 
     struct timeval tv = { 1, 0 };
-    ioctl(fd, BIOCSRTIMEOUT, &tv);
+    if (ioctl(fd, BIOCSRTIMEOUT, &tv) < 0)
+        fprintf(stderr, "warn BIOCSRTIMEOUT: %s\n", strerror(errno));
+    STEP("timeout ok");
     u_int seesent = 1;
-    ioctl(fd, BIOCSSEESENT, &seesent);
+    if (ioctl(fd, BIOCSSEESENT, &seesent) < 0)
+        fprintf(stderr, "warn BIOCSSEESENT: %s\n", strerror(errno));
+    STEP("seesent ok");
 
     unsigned char *buf = malloc(blen);
     if (!buf) return 3;
