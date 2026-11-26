@@ -2660,22 +2660,26 @@ int memread_int_globaldiff(pid_t pid, int seconds, int min_delta, int maxv,
         total += regs[i].size;
         nok++;
     }
-    fprintf(stderr, "两帧差分: %d 个可写区, 共 %.1f MB\n", nok, total / 1048576.0);
+    fprintf(stderr, "两帧差分: %d 个可写区, 共 %.1f MB（基线落盘，不占内存）\n",
+            nok, total / 1048576.0);
     if (total == 0) { mach_port_deallocate(mach_task_self(), task); return -2; }
 
-    unsigned char *base = (unsigned char *)malloc((size_t)total);
-    if (!base) {
-        fprintf(stderr, "内存不足，需要 %.0f MB（可以用 MEMREAD_RANGE_LO/HI 缩小范围）\n", total / 1048576.0);
+    const mach_vm_size_t CHUNK = mre_chunk_bytes();
+    unsigned char *bufA = (unsigned char *)malloc((size_t)CHUNK);
+    unsigned char *bufB = (unsigned char *)malloc((size_t)CHUNK);
+    if (!bufA || !bufB) {
+        free(bufA); free(bufB);
         mach_port_deallocate(mach_task_self(), task);
         return -4;
     }
-    const mach_vm_size_t CHUNK = mre_chunk_bytes();
-    unsigned char *tmp = (unsigned char *)malloc((size_t)CHUNK);
-    if (!tmp) { free(base); mach_port_deallocate(mach_task_self(), task); return -4; }
 
-    // 第一帧：整块快照进内存（读失败的 chunk 填 0）
-    memset(base, 0, (size_t)total);
-    uint64_t goff = 0;
+    const char *bp = "/var/tmp/int_base.bin";
+    unlink(bp);
+    int fd = open(bp, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { free(bufA); free(bufB); mach_port_deallocate(mach_task_self(), task); return -4; }
+
+    // 第一帧：整块写进基线文件（读失败的 chunk 写 0，保证偏移对齐）
+    double t0 = now_s();
     for (int i = 0; i < nreg; i++) {
         if (!((regs[i].prot & VM_PROT_WRITE) != 0)) continue;
         if (regs[i].in_module) continue;
@@ -2688,20 +2692,24 @@ int memread_int_globaldiff(pid_t pid, int seconds, int min_delta, int maxv,
             if (cur == 0) break;
             mach_vm_size_t got = 0;
             kern_return_t kr = mach_vm_read_overwrite(task, regs[i].addr + co, cur,
-                                                      (mach_vm_address_t)(base + goff + co), &got);
-            if (kr != KERN_SUCCESS || got != cur) {
-                memset(base + goff + co, 0, (size_t)cur);
+                                                      (mach_vm_address_t)bufA, &got);
+            if (kr != KERN_SUCCESS || got != cur) memset(bufA, 0, (size_t)cur);
+            if (write_all(fd, bufA, (size_t)cur) != 0) {
+                close(fd); unlink(bp); free(bufA); free(bufB);
+                mach_port_deallocate(mach_task_self(), task);
+                return -4;
             }
             co += cur;
         }
-        goff += regs[i].size;
     }
+    lseek(fd, 0, SEEK_SET);
+    fprintf(stderr, "基线已落盘 %.1f MB（%.1fs），现在等 %d 秒\n",
+            total / 1048576.0, now_s() - t0, seconds);
 
     if (seconds > 0) sleep((unsigned)seconds);
 
-    // 第二帧：逐 4 字节比对
+    // 第二帧：从基线文件读回、与当前内存逐 4 字节比对
     int n = 0;
-    goff = 0;
     for (int i = 0; i < nreg && n < cap; i++) {
         if (!((regs[i].prot & VM_PROT_WRITE) != 0)) continue;
         if (regs[i].in_module) continue;
@@ -2712,20 +2720,22 @@ int memread_int_globaldiff(pid_t pid, int seconds, int min_delta, int maxv,
             mach_vm_size_t cur = (mach_vm_size_t)((regs[i].size - co > CHUNK) ? CHUNK : (regs[i].size - co));
             cur -= (cur % 8);
             if (cur < 8) break;
+            ssize_t rn = read(fd, bufA, (size_t)cur);
+            if (rn != (ssize_t)cur) break;
             mach_vm_size_t got = 0;
             kern_return_t kr = mach_vm_read_overwrite(task, regs[i].addr + co, cur,
-                                                      (mach_vm_address_t)tmp, &got);
+                                                      (mach_vm_address_t)bufB, &got);
             if (kr != KERN_SUCCESS || got != cur) { co += cur; continue; }
             for (mach_vm_size_t o = 0; o + 8 <= cur && n < cap; o += 4) {
                 int32_t a1 = 0, a2 = 0, n1 = 0, n2 = 0;
-                memcpy(&a1, base + goff + co + o, 4);
-                memcpy(&a2, tmp + o, 4);
+                memcpy(&a1, bufA + o, 4);
+                memcpy(&a2, bufB + o, 4);
                 int dv = (int)a2 - (int)a1;
                 if (dv < 0) dv = -dv;
                 if (dv < min_delta) continue;
                 if (maxv > 0 && (a1 > maxv || a1 < -maxv || a2 > maxv || a2 < -maxv)) continue;
-                memcpy(&n1, base + goff + co + o + 4, 4);
-                memcpy(&n2, tmp + o + 4, 4);
+                memcpy(&n1, bufA + o + 4, 4);
+                memcpy(&n2, bufB + o + 4, 4);
                 int dn = (int)n2 - (int)n1;
                 if (dn < 0) dn = -dn;
                 if (dn > 1) continue;
@@ -2736,11 +2746,12 @@ int memread_int_globaldiff(pid_t pid, int seconds, int min_delta, int maxv,
             }
             co += cur;
         }
-        goff += regs[i].size;
     }
 
-    free(tmp);
-    free(base);
+    close(fd);
+    unlink(bp);
+    free(bufA);
+    free(bufB);
     mach_port_deallocate(mach_task_self(), task);
     qsort(out, (size_t)n, sizeof(memread_int_hit_t), int_diff_cmp);
     if (found) *found = n;
