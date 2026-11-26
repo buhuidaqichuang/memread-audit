@@ -172,6 +172,7 @@ int main(int argc, char **argv) {
     time_t t0 = time(NULL);
     fprintf(stderr, "udpsniff: if=%s secs=%d out=%s dev=bpf%d blen=%u\n", ifname, secs, outpath, idx, blen);
     long nread = 0, nhit = 0, nbytes = 0;
+    int rawmode = !strcmp(outpath, "RAW");
     time_t last = t0;
     while (!g_stop && (time(NULL) - t0) < secs) {
         int n = read(fd, buf, blen);
@@ -183,6 +184,13 @@ int main(int argc, char **argv) {
             last = time(NULL);
         }
         if (n <= 0) continue;
+        if (rawmode) {
+            printf("--- READ n=%d\n", n);
+            fflush(stdout);
+            hexdump(buf, n < 256 ? n : 256, 256);
+            fflush(stdout);
+            continue;
+        }
         unsigned char *p = buf;
         while (p + sizeof(struct ud_bpf_hdr) <= buf + n) {
             struct ud_bpf_hdr *h = (struct ud_bpf_hdr *)p;
