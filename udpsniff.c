@@ -191,14 +191,18 @@ int main(int argc, char **argv) {
             fflush(stdout);
             continue;
         }
-        unsigned char *p = buf;
-        while (p + sizeof(struct ud_bpf_hdr) <= buf + n) {
-            struct ud_bpf_hdr *h = (struct ud_bpf_hdr *)p;
-            if (h->bh_caplen > 0 && h->bh_hdrlen + h->bh_caplen <= (u_int32_t)(buf + n - p))
-                dump_pkt(p + h->bh_hdrlen, (int)h->bh_caplen);
-            int next = WORDALIGN(h->bh_hdrlen + h->bh_caplen);
-            if (next <= 0) break;
-            p += next;
+        /* 不依赖 bpf_hdr 布局：直接在缓冲区里扫 IPv4 + UDP 帧 */
+        for (int i = 0; i + 34 < n; i++) {
+            if (buf[i + 12] == 0x08 && buf[i + 13] == 0x00 && buf[i + 23] == 17) {
+                int ihl = (buf[i + 14] & 0xf) * 4;
+                if (ihl < 20) continue;
+                int tot = (buf[i + 16] << 8) | buf[i + 17];
+                int udplen = (buf[i + 14 + ihl + 4] << 8) | buf[i + 14 + ihl + 5];
+                if (tot >= ihl + 8 && i + 14 + tot <= n && udplen <= tot - ihl) {
+                    dump_pkt(buf + i, 14 + tot);
+                    i += 14 + tot - 1;
+                }
+            }
         }
         fflush(stdout);
     }
