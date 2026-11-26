@@ -703,31 +703,23 @@ static int cmd_clusterq(int argc, char **argv) {
 // ============ 整数/定点坐标（2D 手游）============
 static int ivabs(int32_t v) { return (int)(v < 0 ? -(long long)v : (long long)v); }
 
-static int int_hits_by_value(memread_int_hit_t *hits, int found, int maxv) {
-    int m = 0;
-    for (int i = 0; i < found; i++) {
-        if (ivabs(hits[i].v[0]) > maxv || ivabs(hits[i].v[1]) > maxv) continue;
-        hits[m++] = hits[i];
-    }
-    return m;
-}
-
 static int cmd_intscan(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "用法: intscan <pid|进程名> [显示条数] [值上限]\n"); return 1; }
+    if (argc < 3) { fprintf(stderr, "用法: intscan <pid|进程名> [显示条数(0=全打)] [值上限] [两轴都非零0/1]\n"); return 1; }
     int pid = pid_arg(argv[2]);
     if (pid <= 0) { fprintf(stderr, "找不到进程\n"); return 2; }
     int limit = (argc >= 4) ? atoi(argv[3]) : 40;
     int maxv = (argc >= 5) ? atoi(argv[4]) : 2000;
+    int both = (argc >= 6) ? atoi(argv[5]) : 1;
     memread_int_hit_t *hits = (memread_int_hit_t *)malloc(sizeof(memread_int_hit_t) * MEMREAD_INT_HIT_CAP);
     if (!hits) return 3;
     int found = 0;
     double t0 = now_s();
-    int rc = memread_int_probe(pid, hits, MEMREAD_INT_HIT_CAP, &found, NULL, NULL, NULL);
+    int rc = memread_int_probe(pid, hits, MEMREAD_INT_HIT_CAP, &found, maxv, both, NULL, NULL, NULL);
     printf("rc=%d 候选=%d 用时=%.2fs\n", rc, found, now_s() - t0);
-    int n = int_hits_by_value(hits, found, maxv);
-    printf("值域过滤 |v|<=%d: %d -> %d\n", maxv, found, n);
+    int n = found;
     int shown = 0;
-    for (int i = 0; i < n && shown < limit; i++) {
+    for (int i = 0; i < n; i++) {
+        if (limit > 0 && shown >= limit) break;
         printf("%3d  0x%-12llx  (%d, %d)\n", shown, (unsigned long long)hits[i].addr,
                (int)hits[i].v[0], (int)hits[i].v[1]);
         shown++;
@@ -756,7 +748,7 @@ static int istat_cmp(const void *pa, const void *pb) {
 // intlive: 扫一遍整数对候选，持续采样，只打印「一个轴动得多、另一个轴几乎不动」的地址
 // 2D 游戏里人物移动 = 一个轴变、另一个轴恒定，摇杆/计数器会被这条判据直接排掉
 static int cmd_intlive(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "用法: intlive <pid|进程名> <秒> <间隔ms> [min_delta] [topN] [值上限]\n"); return 1; }
+    if (argc < 5) { fprintf(stderr, "用法: intlive <pid|进程名> <秒> <间隔ms> [min_delta] [topN] [值上限] [两轴都非零0/1]\n"); return 1; }
     int pid = pid_arg(argv[2]);
     if (pid <= 0) { fprintf(stderr, "找不到进程\n"); return 2; }
     double secs = atof(argv[3]);
@@ -764,17 +756,16 @@ static int cmd_intlive(int argc, char **argv) {
     int min_delta = (argc >= 6) ? atoi(argv[5]) : 3;
     int topn = (argc >= 7) ? atoi(argv[6]) : 40;
     int maxv = (argc >= 8) ? atoi(argv[7]) : 2000;
+    int both = (argc >= 9) ? atoi(argv[8]) : 1;
 
     memread_int_hit_t *hits = (memread_int_hit_t *)malloc(sizeof(memread_int_hit_t) * MEMREAD_INT_HIT_CAP);
     if (!hits) return 3;
     int found = 0;
     double t0 = now_s();
-    int rc = memread_int_probe(pid, hits, MEMREAD_INT_HIT_CAP, &found, NULL, NULL, NULL);
+    int rc = memread_int_probe(pid, hits, MEMREAD_INT_HIT_CAP, &found, maxv, both, NULL, NULL, NULL);
     printf("扫描: rc=%d 候选=%d 用时=%.2fs\n", rc, found, now_s() - t0);
     if (rc != 0 || found <= 0) { free(hits); return 2; }
-    int n = int_hits_by_value(hits, found, maxv);
-    printf("值域过滤 |v|<=%d: %d -> %d\n", maxv, found, n);
-    if (n <= 0) { free(hits); return 2; }
+    int n = found;
     const int MAXSAMPLE = 200000;
     if (n > MAXSAMPLE) { printf("候选太多，只采样前 %d 个\n", MAXSAMPLE); n = MAXSAMPLE; }
 

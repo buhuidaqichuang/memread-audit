@@ -166,7 +166,7 @@ int memread_coord_probe(pid_t pid, memread_coord_hit_t *out, int cap, int *found
 // ---- 定点/整数坐标扫描（2D 手游常见：位置就是两个 int32）----
 // 判据宽松：8 字节对齐的两个 int32，都在 ±MEMREAD_INT_VAL_LIMIT 内、非全零、
 // 至少一个分量 >= 2。靠「走动前后同一个轴变、另一个轴不动」来筛，而不是靠值本身。
-#define MEMREAD_INT_HIT_CAP   600000
+#define MEMREAD_INT_HIT_CAP   2000000
 #define MEMREAD_INT_VAL_LIMIT 100000
 
 typedef struct {
@@ -174,7 +174,9 @@ typedef struct {
     int32_t  v[2];
 } memread_int_hit_t;
 
+// maxv>0 时扫描阶段就按 |值|<=maxv 过滤；need_both=1 要求两个分量都非零
 int memread_int_probe(pid_t pid, memread_int_hit_t *out, int cap, int *found,
+                      int maxv, int need_both,
                       volatile int *cancel, memread_region_cb cb, void *ctx);
 
 // 批量读 n 组 (int32,int32)；返回成功条数，负数=错误

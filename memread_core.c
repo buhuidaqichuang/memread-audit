@@ -2520,12 +2520,15 @@ static int int_hit_addr_cmp(const void *pa, const void *pb) {
     return (a->addr < b->addr) ? -1 : 1;
 }
 
-static int int_pair_ok(const unsigned char *p, int32_t *a, int32_t *b) {
+static int int_pair_ok(const unsigned char *p, int maxv, int need_both,
+                        int32_t *a, int32_t *b) {
     memcpy(a, p, 4);
     memcpy(b, p + 4, 4);
-    if (*a > MEMREAD_INT_VAL_LIMIT || *a < -MEMREAD_INT_VAL_LIMIT) return 0;
-    if (*b > MEMREAD_INT_VAL_LIMIT || *b < -MEMREAD_INT_VAL_LIMIT) return 0;
+    int lim = maxv > 0 ? maxv : MEMREAD_INT_VAL_LIMIT;
+    if (*a > lim || *a < -lim) return 0;
+    if (*b > lim || *b < -lim) return 0;
     if (*a == 0 && *b == 0) return 0;
+    if (need_both && (*a == 0 || *b == 0)) return 0;
     int aa = *a < 0 ? -*a : *a;
     int bb = *b < 0 ? -*b : *b;
     if (aa < 2 && bb < 2) return 0;
@@ -2533,6 +2536,7 @@ static int int_pair_ok(const unsigned char *p, int32_t *a, int32_t *b) {
 }
 
 int memread_int_probe(pid_t pid, memread_int_hit_t *out, int cap, int *found,
+                      int maxv, int need_both,
                       volatile int *cancel, memread_region_cb cb, void *ctx) {
     (void)cb; (void)ctx;
     if (found) *found = 0;
@@ -2582,7 +2586,7 @@ int memread_int_probe(pid_t pid, memread_int_hit_t *out, int cap, int *found,
                 if (kr == KERN_SUCCESS && got == cur) {
                     for (mach_vm_size_t o = 0; o + 8 <= cur; o += 8) {
                         int32_t a, b;
-                        if (!int_pair_ok(buf + o, &a, &b)) continue;
+                        if (!int_pair_ok(buf + o, maxv, need_both, &a, &b)) continue;
                         if (n >= cap) { stop = 1; break; }
                         out[n].addr = (uint64_t)addr + off + o;
                         out[n].v[0] = a;
@@ -2604,7 +2608,8 @@ int memread_int_probe(pid_t pid, memread_int_hit_t *out, int cap, int *found,
     mach_port_deallocate(mach_task_self(), task);
     qsort(out, (size_t)n, sizeof(memread_int_hit_t), int_hit_addr_cmp);
     if (found) *found = n;
-    fprintf(stderr, "整数对扫描: %d 个候选（已扫 %.1f MB）\n", n, scanned / 1048576.0);
+    fprintf(stderr, "整数对扫描: %d 个候选（maxv=%d both=%d，已扫 %.1f MB）\n",
+            n, maxv, need_both, scanned / 1048576.0);
     return 0;
 }
 
