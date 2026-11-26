@@ -163,6 +163,23 @@ typedef struct {
 int memread_coord_probe(pid_t pid, memread_coord_hit_t *out, int cap, int *found,
                         volatile int *cancel, memread_region_cb cb, void *ctx);
 
+// ---- 定点/整数坐标扫描（2D 手游常见：位置就是两个 int32）----
+// 判据宽松：8 字节对齐的两个 int32，都在 ±MEMREAD_INT_VAL_LIMIT 内、非全零、
+// 至少一个分量 >= 2。靠「走动前后同一个轴变、另一个轴不动」来筛，而不是靠值本身。
+#define MEMREAD_INT_HIT_CAP   600000
+#define MEMREAD_INT_VAL_LIMIT 100000
+
+typedef struct {
+    uint64_t addr;
+    int32_t  v[2];
+} memread_int_hit_t;
+
+int memread_int_probe(pid_t pid, memread_int_hit_t *out, int cap, int *found,
+                      volatile int *cancel, memread_region_cb cb, void *ctx);
+
+// 批量读 n 组 (int32,int32)；返回成功条数，负数=错误
+int memread_read_i32x2_batch(pid_t pid, const uint64_t *addrs, int n, int32_t *out);
+
 // ---- 从已知锚点（如弹夹）推自己坐标：不用任何人工动作 ----
 // anchor = 已定位的弹夹地址；从包含它的对象沿「指针指向的对象」走 BFS（max_depth 层），
 // 在对象里找 FTransform（四元数 + 位移 + scale≈1），输出的就是各组件世界坐标

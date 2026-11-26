@@ -700,6 +700,151 @@ static int cmd_clusterq(int argc, char **argv) {
     return 0;
 }
 
+// ============ 整数/定点坐标（2D 手游）============
+static int ivabs(int32_t v) { return (int)(v < 0 ? -(long long)v : (long long)v); }
+
+static int int_hits_by_value(memread_int_hit_t *hits, int found, int maxv) {
+    int m = 0;
+    for (int i = 0; i < found; i++) {
+        if (ivabs(hits[i].v[0]) > maxv || ivabs(hits[i].v[1]) > maxv) continue;
+        hits[m++] = hits[i];
+    }
+    return m;
+}
+
+static int cmd_intscan(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "用法: intscan <pid|进程名> [显示条数] [值上限]\n"); return 1; }
+    int pid = pid_arg(argv[2]);
+    if (pid <= 0) { fprintf(stderr, "找不到进程\n"); return 2; }
+    int limit = (argc >= 4) ? atoi(argv[3]) : 40;
+    int maxv = (argc >= 5) ? atoi(argv[4]) : 2000;
+    memread_int_hit_t *hits = (memread_int_hit_t *)malloc(sizeof(memread_int_hit_t) * MEMREAD_INT_HIT_CAP);
+    if (!hits) return 3;
+    int found = 0;
+    double t0 = now_s();
+    int rc = memread_int_probe(pid, hits, MEMREAD_INT_HIT_CAP, &found, NULL, NULL, NULL);
+    printf("rc=%d 候选=%d 用时=%.2fs\n", rc, found, now_s() - t0);
+    int n = int_hits_by_value(hits, found, maxv);
+    printf("值域过滤 |v|<=%d: %d -> %d\n", maxv, found, n);
+    int shown = 0;
+    for (int i = 0; i < n && shown < limit; i++) {
+        printf("%3d  0x%-12llx  (%d, %d)\n", shown, (unsigned long long)hits[i].addr,
+               (int)hits[i].v[0], (int)hits[i].v[1]);
+        shown++;
+    }
+    printf("-- 显示 %d / %d\n", shown, n);
+    free(hits);
+    return 0;
+}
+
+typedef struct {
+    uint64_t addr;
+    int32_t first[2], last[2], lo[2], hi[2];
+    int ok;
+    int dx, dy;
+} istat_t;
+
+static int istat_cmp(const void *pa, const void *pb) {
+    const istat_t *a = (const istat_t *)pa, *b = (const istat_t *)pb;
+    int ax = a->dx > a->dy ? a->dx : a->dy;
+    int bx = b->dx > b->dy ? b->dx : b->dy;
+    if (ax < bx) return 1;
+    if (ax > bx) return -1;
+    return 0;
+}
+
+// intlive: 扫一遍整数对候选，持续采样，只打印「一个轴动得多、另一个轴几乎不动」的地址
+// 2D 游戏里人物移动 = 一个轴变、另一个轴恒定，摇杆/计数器会被这条判据直接排掉
+static int cmd_intlive(int argc, char **argv) {
+    if (argc < 5) { fprintf(stderr, "用法: intlive <pid|进程名> <秒> <间隔ms> [min_delta] [topN] [值上限]\n"); return 1; }
+    int pid = pid_arg(argv[2]);
+    if (pid <= 0) { fprintf(stderr, "找不到进程\n"); return 2; }
+    double secs = atof(argv[3]);
+    int interval_ms = atoi(argv[4]);
+    int min_delta = (argc >= 6) ? atoi(argv[5]) : 3;
+    int topn = (argc >= 7) ? atoi(argv[6]) : 40;
+    int maxv = (argc >= 8) ? atoi(argv[7]) : 2000;
+
+    memread_int_hit_t *hits = (memread_int_hit_t *)malloc(sizeof(memread_int_hit_t) * MEMREAD_INT_HIT_CAP);
+    if (!hits) return 3;
+    int found = 0;
+    double t0 = now_s();
+    int rc = memread_int_probe(pid, hits, MEMREAD_INT_HIT_CAP, &found, NULL, NULL, NULL);
+    printf("扫描: rc=%d 候选=%d 用时=%.2fs\n", rc, found, now_s() - t0);
+    if (rc != 0 || found <= 0) { free(hits); return 2; }
+    int n = int_hits_by_value(hits, found, maxv);
+    printf("值域过滤 |v|<=%d: %d -> %d\n", maxv, found, n);
+    if (n <= 0) { free(hits); return 2; }
+    const int MAXSAMPLE = 200000;
+    if (n > MAXSAMPLE) { printf("候选太多，只采样前 %d 个\n", MAXSAMPLE); n = MAXSAMPLE; }
+
+    uint64_t *addrs = (uint64_t *)malloc(sizeof(uint64_t) * n);
+    int32_t *buf = (int32_t *)malloc(sizeof(int32_t) * 2 * n);
+    istat_t *st = (istat_t *)calloc(n, sizeof(istat_t));
+    if (!addrs || !buf || !st) { free(hits); free(addrs); free(buf); free(st); return 3; }
+    for (int i = 0; i < n; i++) { addrs[i] = hits[i].addr; st[i].addr = hits[i].addr; }
+    free(hits);
+
+    double ts = now_s();
+    int samples = 0, reads = 0;
+    while (1) {
+        double el = now_s() - ts;
+        if (el > secs) break;
+        int ok = memread_read_i32x2_batch(pid, addrs, n, buf);
+        if (ok < 0) { printf("采样失败 rc=%d\n", ok); break; }
+        reads += ok;
+        for (int i = 0; i < ok; i++) {
+            int32_t *v = &buf[(size_t)i * 2];
+            if (st[i].ok == 0) {
+                for (int k = 0; k < 2; k++) { st[i].first[k] = v[k]; st[i].lo[k] = v[k]; st[i].hi[k] = v[k]; }
+            } else {
+                for (int k = 0; k < 2; k++) {
+                    if (v[k] < st[i].lo[k]) st[i].lo[k] = v[k];
+                    if (v[k] > st[i].hi[k]) st[i].hi[k] = v[k];
+                }
+            }
+            for (int k = 0; k < 2; k++) st[i].last[k] = v[k];
+            st[i].ok++;
+        }
+        samples++;
+        usleep(interval_ms * 1000);
+    }
+
+    for (int i = 0; i < n; i++) {
+        st[i].dx = ivabs((int32_t)(st[i].last[0] - st[i].first[0]));
+        st[i].dy = ivabs((int32_t)(st[i].last[1] - st[i].first[1]));
+    }
+    istat_t *sorted = (istat_t *)malloc(sizeof(istat_t) * n);
+    if (!sorted) { free(addrs); free(buf); free(st); return 3; }
+    memcpy(sorted, st, sizeof(istat_t) * n);
+    qsort(sorted, n, sizeof(istat_t), istat_cmp);
+
+    int single = 0;
+    for (int i = 0; i < n; i++) {
+        int big = sorted[i].dx > sorted[i].dy ? sorted[i].dx : sorted[i].dy;
+        int small = sorted[i].dx < sorted[i].dy ? sorted[i].dx : sorted[i].dy;
+        if (big >= min_delta && small <= 2) single++;
+    }
+    printf("采样: %d 帧 / %d 次读，候选 %d 个；单轴位移>=%d 且另一轴<=2 的有 %d 个\n",
+           samples, reads, n, min_delta, single);
+    int shown = 0;
+    for (int i = 0; i < n && shown < topn; i++) {
+        int big = sorted[i].dx > sorted[i].dy ? sorted[i].dx : sorted[i].dy;
+        int small = sorted[i].dx < sorted[i].dy ? sorted[i].dx : sorted[i].dy;
+        if (big < min_delta || small > 2) continue;
+        printf("%3d  0x%-12llx d=(%d,%d)  start=(%d,%d) -> end=(%d,%d)  range=[%d..%d / %d..%d] n=%d\n",
+               shown, (unsigned long long)sorted[i].addr, sorted[i].dx, sorted[i].dy,
+               (int)sorted[i].first[0], (int)sorted[i].first[1],
+               (int)sorted[i].last[0], (int)sorted[i].last[1],
+               (int)sorted[i].lo[0], (int)sorted[i].hi[0],
+               (int)sorted[i].lo[1], (int)sorted[i].hi[1], sorted[i].ok);
+        shown++;
+    }
+    printf("-- 显示 %d / %d\n", shown, single);
+    free(sorted); free(addrs); free(buf); free(st);
+    return 0;
+}
+
 static int cmd_read(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "用法: read <pid> <addr_hex> [f|i|l|d]\n"); return 1; }
     int pid = pid_arg(argv[2]);
@@ -791,6 +936,8 @@ static void usage(const char *prog) {
         "  %s coorddiff <pid> <file> [0=全量|1=姿态] [显示条数]\n"
         "  %s anchor <pid> <anchor_hex> [depth] [cap]\n"
         "  %s cluster <pid> [minN] [topN]\n"
+        "  %s intscan <pid|进程名> [显示条数] [值上限]\n"
+        "  %s intlive <pid|进程名> <秒> <间隔ms> [min_delta] [topN] [值上限]\n"
         "  %s chainval <pid> <static_off_hex> <depth> <off1> [off2] ...\n"
         "  %s coordcmp <fileA> <fileB> [min_delta] [topN]\n"
         "  %s live <pid> <seconds> <interval_ms> [min_delta] [topN]\n"
@@ -799,7 +946,9 @@ static void usage(const char *prog) {
         "  %s chain <pid> <addr_hex> [depth] [cap]\n"
         "  %s modinfo <pid> <addr_hex>\n"
         "  %s token <pid>\n"
-        "  %s dump <pid> <out.bin> [rw-only]\n", prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+        "  %s dump <pid> <out.bin> [rw-only]\n",
+        prog, prog, prog, prog, prog, prog, prog, prog, prog,
+        prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
@@ -819,6 +968,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "coordcmp"))  return cmd_coordcmp(argc, argv);
     if (!strcmp(cmd, "chainval"))  return cmd_chainval(argc, argv);
     if (!strcmp(cmd, "cluster"))   return cmd_cluster(argc, argv);
+    if (!strcmp(cmd, "intscan"))   return cmd_intscan(argc, argv);
+    if (!strcmp(cmd, "intlive"))   return cmd_intlive(argc, argv);
     if (!strcmp(cmd, "read"))      return cmd_read(argc, argv);
     if (!strcmp(cmd, "chain"))     return cmd_chain(argc, argv);
     if (!strcmp(cmd, "modinfo"))   return cmd_modinfo(argc, argv);

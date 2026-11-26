@@ -2509,6 +2509,121 @@ int memread_coord_probe(pid_t pid, memread_coord_hit_t *out, int cap, int *found
     return 0;
 }
 
+#pragma mark - 定点/整数坐标扫描
+
+// 判据刻意很松：8 字节对齐的一对 int32，值都在 ±LIMIT 内、非全零、至少一个分量 >= 2。
+// 真正的筛选交给「走动前后：一个轴变、另一个轴不动」这一步。
+static int int_hit_addr_cmp(const void *pa, const void *pb) {
+    const memread_int_hit_t *a = (const memread_int_hit_t *)pa;
+    const memread_int_hit_t *b = (const memread_int_hit_t *)pb;
+    if (a->addr == b->addr) return 0;
+    return (a->addr < b->addr) ? -1 : 1;
+}
+
+static int int_pair_ok(const unsigned char *p, int32_t *a, int32_t *b) {
+    memcpy(a, p, 4);
+    memcpy(b, p + 4, 4);
+    if (*a > MEMREAD_INT_VAL_LIMIT || *a < -MEMREAD_INT_VAL_LIMIT) return 0;
+    if (*b > MEMREAD_INT_VAL_LIMIT || *b < -MEMREAD_INT_VAL_LIMIT) return 0;
+    if (*a == 0 && *b == 0) return 0;
+    int aa = *a < 0 ? -*a : *a;
+    int bb = *b < 0 ? -*b : *b;
+    if (aa < 2 && bb < 2) return 0;
+    return 1;
+}
+
+int memread_int_probe(pid_t pid, memread_int_hit_t *out, int cap, int *found,
+                      volatile int *cancel, memread_region_cb cb, void *ctx) {
+    (void)cb; (void)ctx;
+    if (found) *found = 0;
+    if (!out || cap <= 0) return -2;
+    task_t task = MACH_PORT_NULL;
+    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
+    module_cache_ensure(pid);
+
+    const mach_vm_size_t CHUNK = mre_chunk_bytes();
+    unsigned char *buf = (unsigned char *)malloc((size_t)CHUNK);
+    if (!buf) { mach_port_deallocate(mach_task_self(), task); return -4; }
+
+    uint64_t rlo = 0, rhi = 0xFFFFFFFFFFFFFFFFULL;
+    const char *s = getenv("MEMREAD_RANGE_LO"); if (s) rlo = strtoull(s, NULL, 0);
+    s = getenv("MEMREAD_RANGE_HI"); if (s) rhi = strtoull(s, NULL, 0);
+    uint64_t budget = (uint64_t)mre_env_int("MEMREAD_BUDGET_MB", 0) << 20;
+
+    int n = 0, stop = 0;
+    unsigned long long scanned = 0;
+    mach_vm_address_t addr = 0;
+    for (;;) {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        kern_return_t kr = mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
+                                          (vm_region_info_t)&info, &cnt, &obj);
+        if (kr != KERN_SUCCESS || size == 0) break;
+        // 模块映像里的整数是常量表，位置不在那儿
+        int in_module = 0;
+        for (int i = 0; i < g_modsegn; i++) {
+            uint64_t st = g_modsegs[i].seg_start, en = g_modsegs[i].seg_end;
+            if (((uint64_t)addr >= st && (uint64_t)addr < en) ||
+                ((uint64_t)addr + size > st && (uint64_t)addr < en)) { in_module = 1; break; }
+        }
+        if (!in_module && snap_region_ok(&info, size) &&
+            !((uint64_t)addr + size <= rlo) && !((uint64_t)addr >= rhi)) {
+            uint64_t off = 0;
+            while (off + 16 <= (uint64_t)size) {
+                if (cancel && *cancel) { stop = 1; break; }
+                mach_vm_size_t cur = (mach_vm_size_t)((size - off > CHUNK) ? CHUNK : (size - off));
+                cur -= (cur % 8);
+                if (cur < 16) break;
+                mach_vm_size_t got = 0;
+                kr = mach_vm_read_overwrite(task, addr + off, cur,
+                                            (mach_vm_address_t)buf, &got);
+                if (kr == KERN_SUCCESS && got == cur) {
+                    for (mach_vm_size_t o = 0; o + 8 <= cur; o += 8) {
+                        int32_t a, b;
+                        if (!int_pair_ok(buf + o, &a, &b)) continue;
+                        if (n >= cap) { stop = 1; break; }
+                        out[n].addr = (uint64_t)addr + off + o;
+                        out[n].v[0] = a;
+                        out[n].v[1] = b;
+                        n++;
+                    }
+                    if (stop) break;
+                    scanned += cur;
+                    if (budget && scanned >= budget) { stop = 1; break; }
+                    mre_pace();
+                }
+                off += cur;
+            }
+        }
+        if (stop) break;
+        addr += size;
+    }
+    free(buf);
+    mach_port_deallocate(mach_task_self(), task);
+    qsort(out, (size_t)n, sizeof(memread_int_hit_t), int_hit_addr_cmp);
+    if (found) *found = n;
+    fprintf(stderr, "整数对扫描: %d 个候选（已扫 %.1f MB）\n", n, scanned / 1048576.0);
+    return 0;
+}
+
+int memread_read_i32x2_batch(pid_t pid, const uint64_t *addrs, int n, int32_t *out) {
+    if (!addrs || !out || n <= 0) return -2;
+    task_t task = MACH_PORT_NULL;
+    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
+    int ok = 0;
+    for (int i = 0; i < n; i++) {
+        mach_vm_size_t got = 0;
+        kern_return_t kr = mach_vm_read_overwrite(task, addrs[i], 8,
+                                                 (mach_vm_address_t)(out + (size_t)i * 2), &got);
+        if (kr == KERN_SUCCESS && got == 8) ok++;
+        else { out[(size_t)i * 2] = 0; out[(size_t)i * 2 + 1] = 0; }
+    }
+    mach_port_deallocate(mach_task_self(), task);
+    return ok;
+}
+
 typedef struct {
     const memread_coord_hit_t *base;
     int nbase;
