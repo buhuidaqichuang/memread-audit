@@ -889,6 +889,22 @@ static int cmd_ptrfind(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_pointgroups(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "用法: pointgroups <pid|进程名> [min] [max] [minrun] [topN] [mindist] [maxdist]\n"); return 1; }
+    int pid = pid_arg(argv[2]);
+    if (pid <= 0) { fprintf(stderr, "找不到进程\n"); return 2; }
+    float minv = (argc >= 4) ? (float)atof(argv[3]) : 1.0f;
+    float maxv = (argc >= 5) ? (float)atof(argv[4]) : 3000.0f;
+    int minrun = (argc >= 6) ? atoi(argv[5]) : 4;
+    int topn = (argc >= 7) ? atoi(argv[6]) : 20;
+    float mindist = (argc >= 8) ? (float)atof(argv[7]) : 5.0f;
+    float maxdist = (argc >= 9) ? (float)atof(argv[8]) : 1500.0f;
+    double t0 = now_s();
+    int rc = memread_pointgroups(pid, minv, maxv, mindist, maxdist, minrun, topn);
+    printf("# 统计: rc=%d 用时=%.1fs\n", rc, now_s() - t0);
+    return 0;
+}
+
 static int cmd_dump(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "用法: dump <pid> <out.bin> [rw-only]\n"); return 1; }
     int pid = pid_arg(argv[2]);
@@ -956,6 +972,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "dump"))      return cmd_dump(argc, argv);
     if (!strcmp(cmd, "strgrep"))   return cmd_strgrep(argc, argv);
     if (!strcmp(cmd, "ptrfind"))   return cmd_ptrfind(argc, argv);
+    if (!strcmp(cmd, "pointgroups")) return cmd_pointgroups(argc, argv);
     usage(argv[0]);
     return 1;
 }

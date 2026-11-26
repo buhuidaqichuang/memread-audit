@@ -54,6 +54,10 @@ int memread_strgrep(pid_t pid, const char *const *needles, int nneedles, int min
 // 64 位值检索：全内存找 8 字节对齐且等于 value 的位置，打到 stdout
 int memread_ptrfind(pid_t pid, uint64_t value, int topn, int rw_only);
 
+// 点位组扫描：按「相邻 float 对 = (x,y)」+ 同页成组 + 间距 的几何特征找坐标数组
+int memread_pointgroups(pid_t pid, float minv, float maxv,
+                        float mindist, float maxdist, int minrun, int topn);
+
 // 兼容旧签名：只有累计字节的进度回调
 int memread_dump(pid_t pid, const char *out_path, int rw_only,
                  void (*progress)(unsigned long long done, void *ctx), void *ctx);
