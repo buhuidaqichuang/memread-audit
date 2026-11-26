@@ -187,6 +187,17 @@ int memread_int_globaldiff(pid_t pid, int seconds, int min_delta, int max_delta,
                            memread_int_hit_t *out, int cap, int *found,
                            volatile int *cancel);
 
+// float 两帧差分：不依赖四元数布局，连 shared 区一起扫（Metal 顶点缓冲在那儿）
+#define MEMREAD_FLOAT_HIT_CAP 1000000
+typedef struct {
+    uint64_t addr;
+    float v[2];
+    float prev[2];
+} memread_flt_hit_t;
+
+int memread_float_globaldiff(pid_t pid, int seconds, float min_delta, float max_delta, float maxv,
+                             memread_flt_hit_t *out, int cap, int *found, volatile int *cancel);
+
 // 批量读 n 组 (int32,int32)；返回成功条数，负数=错误
 int memread_read_i32x2_batch(pid_t pid, const uint64_t *addrs, int n, int32_t *out);
 

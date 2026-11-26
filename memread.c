@@ -701,6 +701,37 @@ static int cmd_clusterq(int argc, char **argv) {
 }
 
 // ============ 整数/定点坐标（2D 手游）============
+// floatlive: 裸 float 两帧差分（含 shared 区），找走动前后在变的浮点位置
+static int cmd_floatlive(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "用法: floatlive <pid|进程名> <秒> [min_dv] [max_dv] [topN(0=全打)] [值上限]\n"); return 1; }
+    int pid = pid_arg(argv[2]);
+    if (pid <= 0) { fprintf(stderr, "找不到进程\n"); return 2; }
+    int secs = atoi(argv[3]);
+    float min_dv = (argc >= 5) ? (float)atof(argv[4]) : 0.5f;
+    float max_dv = (argc >= 6) ? (float)atof(argv[5]) : 500.0f;
+    int topn = (argc >= 7) ? atoi(argv[6]) : 40;
+    float maxv = (argc >= 8) ? (float)atof(argv[7]) : 5000.0f;
+
+    memread_flt_hit_t *hits = (memread_flt_hit_t *)malloc(sizeof(memread_flt_hit_t) * MEMREAD_FLOAT_HIT_CAP);
+    if (!hits) return 3;
+    int found = 0;
+    double t0 = now_s();
+    int rc = memread_float_globaldiff(pid, secs, min_dv, max_dv, maxv, hits, MEMREAD_FLOAT_HIT_CAP, &found, NULL);
+    printf("float 两帧差分: rc=%d 命中=%d 用时=%.2fs\n", rc, found, now_s() - t0);
+    if (rc != 0 || found <= 0) { free(hits); return 2; }
+    int shown = 0;
+    for (int i = 0; i < found && (topn <= 0 || shown < topn); i++) {
+        printf("%3d  0x%-12llx  (%.3f, %.3f) -> (%.3f, %.3f)  d=%.3f\n",
+               shown, (unsigned long long)hits[i].addr,
+               hits[i].prev[0], hits[i].prev[1], hits[i].v[0], hits[i].v[1],
+               fabsf(hits[i].v[0] - hits[i].prev[0]));
+        shown++;
+    }
+    printf("-- 显示 %d / %d\n", shown, found);
+    free(hits);
+    return 0;
+}
+
 // intscan: 枚举「看起来像坐标的整数对」（8 字节对齐的一对 int32）
 static int cmd_intscan(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "用法: intscan <pid|进程名> [显示条数(0=全打)] [值上限] [两轴都非零0/1]\n"); return 1; }
@@ -857,6 +888,7 @@ static void usage(const char *prog) {
         "  %s cluster <pid> [minN] [topN]\n"
         "  %s intscan <pid|进程名> [显示条数] [值上限]\n"
         "  %s intlive <pid|进程名> <秒> [min_delta] [max_delta] [topN] [值上限]\n"
+        "  %s floatlive <pid|进程名> <秒> [min_dv] [max_dv] [topN] [值上限]\n"
         "  %s chainval <pid> <static_off_hex> <depth> <off1> [off2] ...\n"
         "  %s coordcmp <fileA> <fileB> [min_delta] [topN]\n"
         "  %s live <pid> <seconds> <interval_ms> [min_delta] [topN]\n"
@@ -867,7 +899,7 @@ static void usage(const char *prog) {
         "  %s token <pid>\n"
         "  %s dump <pid> <out.bin> [rw-only]\n",
         prog, prog, prog, prog, prog, prog, prog, prog, prog,
-        prog, prog, prog, prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
@@ -889,6 +921,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "cluster"))   return cmd_cluster(argc, argv);
     if (!strcmp(cmd, "intscan"))   return cmd_intscan(argc, argv);
     if (!strcmp(cmd, "intlive"))   return cmd_intlive(argc, argv);
+    if (!strcmp(cmd, "floatlive")) return cmd_floatlive(argc, argv);
     if (!strcmp(cmd, "read"))      return cmd_read(argc, argv);
     if (!strcmp(cmd, "chain"))     return cmd_chain(argc, argv);
     if (!strcmp(cmd, "modinfo"))   return cmd_modinfo(argc, argv);
