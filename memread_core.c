@@ -4289,6 +4289,7 @@ int memread_pointgroups(pid_t pid, float minv, float maxv,
                 bytes += cur;
                 size_t lim = (size_t)cur - 8;
                 for (size_t i = 0; i <= lim; i += 4) {
+                    if (npts >= MRE_PG_CAP) break;
                     float a, b;
                     memcpy(&a, buf + i, 4);
                     memcpy(&b, buf + i + 4, 4);
