@@ -4468,6 +4468,7 @@ int memread_pointgroups16(pid_t pid, int minv, int maxv,
         int writable = (info.protection & VM_PROT_WRITE) != 0;
         int shared = info.shared;
         if (!readable || !writable || shared || size > (mach_vm_size_t)(512ULL * 1024 * 1024) ||
+            (uint64_t)addr < 0x200000000ULL ||
             chain_addr_in_module((uint64_t)addr)) {
             addr += size;
             continue;
