@@ -4724,7 +4724,8 @@ int memread_quadscan(pid_t pid, int stride, float minw, float maxw, int minshare
 
         int readable = (info.protection & VM_PROT_READ) != 0;
         int shared = info.shared;
-        if (!readable || !shared || size > (mach_vm_size_t)(512ULL * 1024 * 1024)) {
+        if (!readable || shared || size > (mach_vm_size_t)(512ULL * 1024 * 1024) ||
+            (uint64_t)addr < 0x115000000ULL) {
             addr += size;
             continue;
         }
@@ -4749,6 +4750,10 @@ int memread_quadscan(pid_t pid, int stride, float minw, float maxw, int minshare
                     for (size_t i = 0; i + need <= nf && nq < QD_MAXQ; i += stepf) {
                         float w, hh, cx, cy;
                         if (qd_isquad(f + i, stride, minw, maxw, &w, &hh, &cx, &cy)) {
+                            int dup = 0;
+                            for (int qq = 0; qq < nq; qq++)
+                                if (QD_ABS(qs[qq].x - cx) < 1e-3f && QD_ABS(qs[qq].y - cy) < 1e-3f) { dup = 1; break; }
+                            if (dup) continue;
                             qs[nq].a = pa + p + i * 4;
                             qs[nq].x = cx; qs[nq].y = cy; qs[nq].w = w; qs[nq].h = hh;
                             nq++;
