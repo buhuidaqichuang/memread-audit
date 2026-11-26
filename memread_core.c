@@ -4436,6 +4436,24 @@ int memread_pointgroups16(pid_t pid, int minv, int maxv,
                         k = e + 1;
                     }
                     if (best >= 0) {
+                        if (bestlen > 26) { k = n; continue; }
+                        int pairs2 = bestlen - 1;
+                        int maxrep = 0;
+                        if (pairs2 > 1) {
+                            int lim3 = bestlen < 26 ? bestlen : 26;
+                            for (int q = 0; q + 1 < lim3; q++) {
+                                int dxq = as[best + q + 1] - as[best + q];
+                                int dyq = bs[best + q + 1] - bs[best + q];
+                                int cc = 1;
+                                for (int r = 0; r + 1 < lim3; r++) {
+                                    if (r == q) continue;
+                                    if (as[best + r + 1] - as[best + r] == dxq &&
+                                        bs[best + r + 1] - bs[best + r] == dyq) cc++;
+                                }
+                                if (cc > maxrep) maxrep = cc;
+                            }
+                        }
+                        if (maxrep * 5 >= pairs2 * 3) { k = n; continue; }
                         int uniq = 0;
                         int lim2 = bestlen < 64 ? bestlen : 64;
                         for (int q = 0; q < lim2; q++) {
