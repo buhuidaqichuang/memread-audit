@@ -889,6 +889,21 @@ static int cmd_ptrfind(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_pg32(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "用法: pg32 <pid|进程名> [maxv] [minrun] [topN] [mindist] [maxdist]\n"); return 1; }
+    int pid = pid_arg(argv[2]);
+    if (pid <= 0) { fprintf(stderr, "找不到进程\n"); return 2; }
+    int maxv = (argc >= 4) ? atoi(argv[3]) : 40000;
+    int minrun = (argc >= 5) ? atoi(argv[4]) : 4;
+    int topn = (argc >= 6) ? atoi(argv[5]) : 40;
+    int mindist = (argc >= 7) ? atoi(argv[6]) : 500;
+    int maxdist = (argc >= 8) ? atoi(argv[7]) : 30000;
+    double t0 = now_s();
+    int rc = memread_pointgroups32(pid, 0, maxv, mindist, maxdist, minrun, topn);
+    printf("# 统计: rc=%d 用时=%.1fs\n", rc, now_s() - t0);
+    return 0;
+}
+
 static int cmd_pg16(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "用法: pg16 <pid|进程名> [maxv] [minrun] [topN] [mindist] [maxdist]\n"); return 1; }
     int pid = pid_arg(argv[2]);
@@ -989,6 +1004,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "ptrfind"))   return cmd_ptrfind(argc, argv);
     if (!strcmp(cmd, "pointgroups")) return cmd_pointgroups(argc, argv);
     if (!strcmp(cmd, "pg16"))       return cmd_pg16(argc, argv);
+    if (!strcmp(cmd, "pg32"))       return cmd_pg32(argc, argv);
     usage(argv[0]);
     return 1;
 }
