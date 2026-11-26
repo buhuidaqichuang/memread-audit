@@ -4393,7 +4393,7 @@ static int pg16_analyze_page(uint64_t pa, unsigned char *pg, int minv, int maxv,
         k = e + 1;
     }
     if (best < 0) return 0;
-    if (bestlen > 26) return 0;   // 太长：多半是表
+    if (bestlen < 4 || bestlen > 8) return 0;   // 只要 4~8 点组
 
     int pairs2 = bestlen - 1, maxrep = 0;
     if (pairs2 > 1) {
@@ -4468,7 +4468,7 @@ int memread_pointgroups16(pid_t pid, int minv, int maxv,
         int writable = (info.protection & VM_PROT_WRITE) != 0;
         int shared = info.shared;
         if (!readable || !writable || shared || size > (mach_vm_size_t)(512ULL * 1024 * 1024) ||
-            (uint64_t)addr < 0x200000000ULL ||
+            (uint64_t)addr < 0x115000000ULL ||
             chain_addr_in_module((uint64_t)addr)) {
             addr += size;
             continue;
