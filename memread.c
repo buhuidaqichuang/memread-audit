@@ -862,6 +862,33 @@ static int cmd_token(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_strgrep(int argc, char **argv) {
+    if (argc < 5) { fprintf(stderr, "用法: strgrep <pid|进程名> <最短长度> <关键词1> [关键词2...]\n"); return 1; }
+    int pid = pid_arg(argv[2]);
+    if (pid <= 0) { fprintf(stderr, "找不到进程\n"); return 2; }
+    int min_len = atoi(argv[3]);
+    const char *needles[16];
+    int n = 0;
+    for (int i = 4; i < argc && n < 16; i++) needles[n++] = argv[i];
+    double t0 = now_s();
+    int rc = memread_strgrep(pid, needles, n, min_len, 500);
+    printf("# 统计: rc=%d 用时=%.1fs\n", rc, now_s() - t0);
+    return rc == 0 ? 0 : 2;
+}
+
+static int cmd_ptrfind(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "用法: ptrfind <pid|进程名> <值(0x..或十进制)> [topN] [rw_only]\n"); return 1; }
+    int pid = pid_arg(argv[2]);
+    if (pid <= 0) { fprintf(stderr, "找不到进程\n"); return 2; }
+    uint64_t v = (uint64_t)strtoull(argv[3], NULL, 0);
+    int topn = (argc >= 5) ? atoi(argv[4]) : 200;
+    int rw_only = (argc >= 6) ? atoi(argv[5]) : 0;
+    double t0 = now_s();
+    int rc = memread_ptrfind(pid, v, topn, rw_only);
+    printf("# 统计: rc=%d 用时=%.1fs\n", rc, now_s() - t0);
+    return 0;
+}
+
 static int cmd_dump(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "用法: dump <pid> <out.bin> [rw-only]\n"); return 1; }
     int pid = pid_arg(argv[2]);
@@ -927,6 +954,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "modinfo"))   return cmd_modinfo(argc, argv);
     if (!strcmp(cmd, "token"))     return cmd_token(argc, argv);
     if (!strcmp(cmd, "dump"))      return cmd_dump(argc, argv);
+    if (!strcmp(cmd, "strgrep"))   return cmd_strgrep(argc, argv);
+    if (!strcmp(cmd, "ptrfind"))   return cmd_ptrfind(argc, argv);
     usage(argv[0]);
     return 1;
 }

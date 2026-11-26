@@ -4085,3 +4085,153 @@ int memread_peers_scan(pid_t pid, uint64_t self_obj, int64_t root_off, int64_t l
     fprintf(stderr, "同类对象: %d 个（vtable 0x%llX）\n", n, (unsigned long long)vt);
     return 0;
 }
+
+// ================= 字符串关键词检索（直接打 stdout） =================
+// 用于「字符串 -> 对象」锚定法：先按类名/日志串找到 ASCII 常量，再反查引用它的地方
+int memread_strgrep(pid_t pid, const char *const *needles, int nneedles,
+                    int min_len, int topn) {
+    if (min_len < 3) min_len = 3;
+
+    task_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "task_for_pid 失败: (%d) %s\n", kr, mach_error_string(kr));
+        return -1;
+    }
+
+    const mach_vm_size_t CHUNK = 4ULL * 1024 * 1024;
+    unsigned char *buf = (unsigned char *)malloc((size_t)CHUNK);
+    if (!buf) { mach_port_deallocate(mach_task_self(), task); return -4; }
+
+    enum { MAXS = 400 };
+    char s[MAXS];
+    size_t slen = 0;
+    unsigned long long saddr = 0;
+    int printed = 0, regions = 0;
+    unsigned long long bytes = 0, hstr = 0;
+    mach_vm_address_t addr = 0;
+
+    while (printed < topn) {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+
+        kr = mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t)&info, &cnt, &obj);
+        if (kr != KERN_SUCCESS || size == 0) break;
+
+        int readable = (info.protection & VM_PROT_READ) != 0;
+        int shared = info.shared;
+        if (readable && !shared && size <= (mach_vm_size_t)(512ULL * 1024 * 1024)) {
+            regions++;
+            mach_vm_address_t off = 0;
+            while (off < size && printed < topn) {
+                mach_vm_size_t cur = (size - off > CHUNK) ? CHUNK : (size - off);
+                mach_vm_size_t got = 0;
+                kr = mach_vm_read_overwrite(task, addr + off, cur,
+                                            (mach_vm_address_t)buf, &got);
+                if (kr == KERN_SUCCESS && got == cur && !all_zero(buf, (size_t)cur)) {
+                    bytes += cur;
+                    for (size_t i = 0; i < (size_t)cur; i++) {
+                        unsigned char c = buf[i];
+                        if (c >= 0x20 && c < 0x7f) {
+                            if (slen == 0) saddr = (unsigned long long)(addr + off + i);
+                            if (slen < MAXS - 1) s[slen++] = (char)c;
+                        } else {
+                            if (slen >= (size_t)min_len) {
+                                s[slen] = 0;
+                                hstr++;
+                                int hit = 0;
+                                for (int k = 0; k < nneedles && !hit; k++)
+                                    if (strstr(s, needles[k])) hit = 1;
+                                if (hit) {
+                                    printf("0x%016llX\t%s\n", saddr, s);
+                                    fflush(stdout);
+                                    printed++;
+                                    if (printed >= topn) { slen = 0; break; }
+                                }
+                            }
+                            slen = 0;
+                        }
+                    }
+                }
+                off += cur;
+            }
+            slen = 0;
+        }
+        addr += size;
+    }
+
+    free(buf);
+    mach_port_deallocate(mach_task_self(), task);
+    fprintf(stderr, "strgrep: 扫 %llu 字节 / %d 区 / %llu 条串 / 打出 %d 条\n",
+            bytes, regions, hstr, printed);
+    return printed > 0 ? 0 : -3;
+}
+
+// ================= 64 位值（指针）检索 =================
+// 用途：找到某个 vtable / type_info / 字符串指针到底被哪里引用，从而落到对象实例
+int memread_ptrfind(pid_t pid, uint64_t value, int topn, int rw_only) {
+    task_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "task_for_pid 失败: (%d) %s\n", kr, mach_error_string(kr));
+        return -1;
+    }
+
+    const mach_vm_size_t CHUNK = 4ULL * 1024 * 1024;
+    unsigned char *buf = (unsigned char *)malloc((size_t)CHUNK);
+    if (!buf) { mach_port_deallocate(mach_task_self(), task); return -4; }
+
+    int printed = 0, regions = 0;
+    unsigned long long bytes = 0;
+    mach_vm_address_t addr = 0;
+
+    while (printed < topn) {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+
+        kr = mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t)&info, &cnt, &obj);
+        if (kr != KERN_SUCCESS || size == 0) break;
+
+        int readable = (info.protection & VM_PROT_READ) != 0;
+        int writable = (info.protection & VM_PROT_WRITE) != 0;
+        int shared = info.shared;
+        if (readable && !shared && (!rw_only || writable) &&
+            size <= (mach_vm_size_t)(512ULL * 1024 * 1024)) {
+            regions++;
+            mach_vm_address_t off = 0;
+            while (off < size && printed < topn) {
+                mach_vm_size_t cur = (size - off > CHUNK) ? CHUNK : (size - off);
+                mach_vm_size_t got = 0;
+                kr = mach_vm_read_overwrite(task, addr + off, cur,
+                                            (mach_vm_address_t)buf, &got);
+                if (kr == KERN_SUCCESS && got == cur) {
+                    bytes += cur;
+                    size_t n8 = (size_t)cur / 8;
+                    for (size_t i = 0; i < n8; i++) {
+                        uint64_t w;
+                        memcpy(&w, buf + i * 8, 8);
+                        if (w == value) {
+                            printf("0x%016llX\n", (unsigned long long)(addr + off + i * 8));
+                            fflush(stdout);
+                            printed++;
+                            if (printed >= topn) break;
+                        }
+                    }
+                }
+                off += cur;
+            }
+        }
+        addr += size;
+    }
+
+    free(buf);
+    mach_port_deallocate(mach_task_self(), task);
+    fprintf(stderr, "ptrfind: 扫 %llu 字节 / %d 区 / 命中 %d 处\n", bytes, regions, printed);
+    return printed > 0 ? 0 : -3;
+}

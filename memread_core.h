@@ -49,6 +49,11 @@ int memread_find_ex(pid_t pid, const char *out_path, const char *needle,
                     memread_region_cb cb, void *ctx, unsigned long long *phits,
                     volatile int *cancel);
 
+// 字符串关键词检索：扫可读非 shared 区，把含任一关键字的 ASCII 串打到 stdout
+int memread_strgrep(pid_t pid, const char *const *needles, int nneedles, int min_len, int topn);
+// 64 位值检索：全内存找 8 字节对齐且等于 value 的位置，打到 stdout
+int memread_ptrfind(pid_t pid, uint64_t value, int topn, int rw_only);
+
 // 兼容旧签名：只有累计字节的进度回调
 int memread_dump(pid_t pid, const char *out_path, int rw_only,
                  void (*progress)(unsigned long long done, void *ctx), void *ctx);
