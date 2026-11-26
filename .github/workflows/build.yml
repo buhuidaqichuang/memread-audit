@@ -26,8 +26,14 @@ jobs:
             -isysroot "$SDK" \
             -miphoneos-version-min=15.0 \
             -o memread memread.c memread_core.c
-          file memread
-          ls -l memread
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -O2 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=15.0 \
+            -o udpsniff udpsniff.c
+          file memread udpsniff
+          ls -l memread udpsniff
 
       - name: Ad-hoc sign (best effort)
         run: |
@@ -39,6 +45,7 @@ jobs:
           name: memread-arm64
           path: |
             memread
+            udpsniff
             ent.plist
           if-no-files-found: error
 
