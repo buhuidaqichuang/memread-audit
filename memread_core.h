@@ -358,3 +358,4 @@ void memread_sig_progress(int *phase, unsigned long long *done, unsigned long lo
 #endif
 int memread_pointgroups16(pid_t pid, int minv, int maxv, int mindist, int maxdist, int minrun, int topn);
 int memread_pointgroups32(pid_t pid, int minv, int maxv, int mindist, int maxdist, int minrun, int topn);
+int memread_quadscan(pid_t pid, int stride, float minw, float maxw, int minshare, int topn);

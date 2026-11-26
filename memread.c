@@ -889,6 +889,21 @@ static int cmd_ptrfind(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_quadscan(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "用法: quadscan <pid|进程名> [stride] [minw] [maxw] [minshare] [topN]\n"); return 1; }
+    int pid = pid_arg(argv[2]);
+    if (pid <= 0) { fprintf(stderr, "找不到进程\n"); return 2; }
+    int stride = (argc >= 4) ? atoi(argv[3]) : 8;
+    float minw = (argc >= 5) ? (float)atof(argv[4]) : 0.2f;
+    float maxw = (argc >= 6) ? (float)atof(argv[5]) : 2000.0f;
+    int minshare = (argc >= 7) ? atoi(argv[6]) : 3;
+    int topn = (argc >= 8) ? atoi(argv[7]) : 20;
+    double t0 = now_s();
+    int rc = memread_quadscan(pid, stride, minw, maxw, minshare, topn);
+    printf("# 统计: rc=%d 用时=%.1fs\n", rc, now_s() - t0);
+    return 0;
+}
+
 static int cmd_pg32(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "用法: pg32 <pid|进程名> [maxv] [minrun] [topN] [mindist] [maxdist]\n"); return 1; }
     int pid = pid_arg(argv[2]);
@@ -1005,6 +1020,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "pointgroups")) return cmd_pointgroups(argc, argv);
     if (!strcmp(cmd, "pg16"))       return cmd_pg16(argc, argv);
     if (!strcmp(cmd, "pg32"))       return cmd_pg32(argc, argv);
+    if (!strcmp(cmd, "quadscan"))   return cmd_quadscan(argc, argv);
     usage(argv[0]);
     return 1;
 }

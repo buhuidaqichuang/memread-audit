@@ -4652,3 +4652,130 @@ int memread_pointgroups32(pid_t pid, int minv, int maxv,
             bytes, regions, pages, kept, shown);
     return shown > 0 ? 0 : -3;
 }
+
+// ================= quad 检测（GPU 共享缓冲里的四顶点矩形） =================
+// 角色在 2D 引擎里通常是一个 quad：4 个连续顶点 (x,y) 构成轴对齐矩形。
+// 判据：四顶点只占 2 个 x 值 + 2 个 y 值（容差内），宽高在给定范围。
+#define QD_MAXQ 256
+#define QD_ABS(v) ((v) < 0 ? -(v) : (v))
+
+static int qd_isquad(float *v, int stride, float minw, float maxw, float *ow, float *oh,
+                     float *ox, float *oy) {
+    float x0 = v[0], y0 = v[1];
+    float x1 = v[stride / 4 + 0], y1 = v[stride / 4 + 1];
+    float x2 = v[stride * 2 / 4 + 0], y2 = v[stride * 2 / 4 + 1];
+    float x3 = v[stride * 3 / 4 + 0], y3 = v[stride * 3 / 4 + 1];
+
+    float xs[4] = {x0, x1, x2, x3};
+    float ys[4] = {y0, y1, y2, y3};
+
+    float minx = xs[0], maxx = xs[0], miny = ys[0], maxy = ys[0];
+    for (int i = 1; i < 4; i++) {
+        if (xs[i] < minx) minx = xs[i];
+        if (xs[i] > maxx) maxx = xs[i];
+        if (ys[i] < miny) miny = ys[i];
+        if (ys[i] > maxy) maxy = ys[i];
+    }
+    float w = maxx - minx, hh = maxy - miny;
+    if (!(w >= minw && w <= maxw)) return 0;
+    if (!(hh >= minw && hh <= maxw)) return 0;
+
+    // 每个顶点必须落在四个角上（容差 = 宽高的 1%）
+    float ex = w * 0.01f, ey = hh * 0.01f;
+    if (ex < 1e-5f) ex = 1e-5f;
+    if (ey < 1e-5f) ey = 1e-5f;
+    for (int i = 0; i < 4; i++) {
+        if (!(QD_ABS(xs[i] - minx) <= ex || QD_ABS(xs[i] - maxx) <= ex)) return 0;
+        if (!(QD_ABS(ys[i] - miny) <= ey || QD_ABS(ys[i] - maxy) <= ey)) return 0;
+    }
+    *ow = w; *oh = hh; *ox = (minx + maxx) * 0.5f; *oy = (miny + maxy) * 0.5f;
+    return 1;
+}
+
+int memread_quadscan(pid_t pid, int stride, float minw, float maxw, int minshare, int topn) {
+    task_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "task_for_pid 失败: (%d) %s\n", kr, mach_error_string(kr));
+        return -1;
+    }
+
+    const size_t BLK = 262144;
+    unsigned char *buf = (unsigned char *)malloc(BLK + 64);
+    if (!buf) { mach_port_deallocate(mach_task_self(), task); return -4; }
+
+    typedef struct { uint64_t a; float x, y, w, h; } qd_t;
+    qd_t qs[QD_MAXQ];
+
+    int shown = 0, regions = 0, pages = 0, kept = 0;
+    unsigned long long bytes = 0;
+    mach_vm_address_t addr = 0;
+    int quad_total = 0;
+
+    while (shown < topn) {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+
+        kr = mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t)&info, &cnt, &obj);
+        if (kr != KERN_SUCCESS || size == 0) break;
+
+        int readable = (info.protection & VM_PROT_READ) != 0;
+        int shared = info.shared;
+        if (!readable || !shared || size > (mach_vm_size_t)(512ULL * 1024 * 1024)) {
+            addr += size;
+            continue;
+        }
+        regions++;
+
+        mach_vm_address_t off = 0;
+        while (off < size && shown < topn) {
+            uint64_t pa = (uint64_t)addr + off;
+            size_t want = BLK;
+            if (off + BLK > size) want = (size_t)(size - off);
+            mach_vm_size_t got = 0;
+            kr = mach_vm_read_overwrite(task, addr + off, want, (mach_vm_address_t)buf, &got);
+            if (kr == KERN_SUCCESS && got >= want) {
+                bytes += got;
+                for (size_t p = 0; p + 4096 <= want; p += 4096) {
+                    pages++;
+                    float *f = (float *)(buf + p);
+                    size_t nf = 4096 / 4;
+                    int nq = 0;
+                    size_t stepf = stride / 4;
+                    size_t need = stepf * 4;
+                    for (size_t i = 0; i + need <= nf && nq < QD_MAXQ; i += stepf) {
+                        float w, hh, cx, cy;
+                        if (qd_isquad(f + i, stride, minw, maxw, &w, &hh, &cx, &cy)) {
+                            qs[nq].a = pa + p + i * 4;
+                            qs[nq].x = cx; qs[nq].y = cy; qs[nq].w = w; qs[nq].h = hh;
+                            nq++;
+                        }
+                    }
+                    if (nq >= minshare) {
+                        kept++;
+                        quad_total += nq;
+                        printf("PAGE 0x%016llX  quads=%d\n", (unsigned long long)(pa + p), nq);
+                        int show = nq < 8 ? nq : 8;
+                        for (int q = 0; q < show; q++)
+                            printf("   center=(%.2f, %.2f)  wh=(%.2f x %.2f)  @0x%llX\n",
+                                   qs[q].x, qs[q].y, qs[q].w, qs[q].h,
+                                   (unsigned long long)qs[q].a);
+                        fflush(stdout);
+                        shown++;
+                    }
+                }
+            }
+            off += want;
+        }
+        addr += size;
+    }
+
+    free(buf);
+    mach_port_deallocate(mach_task_self(), task);
+    fprintf(stderr, "quadscan: stride=%d 扫 %llu 字节 / %d 共享区 / %d 页 / 保留 %d 页 / quad 计 %d\n",
+            stride, bytes, regions, pages, kept, quad_total);
+    return shown > 0 ? 0 : -3;
+}
