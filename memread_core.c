@@ -4251,18 +4251,22 @@ int memread_pointgroups(pid_t pid, float minv, float maxv,
         fprintf(stderr, "task_for_pid 失败: (%d) %s\n", kr, mach_error_string(kr));
         return -1;
     }
+    if (module_cache_ensure(pid) != 0)
+        fprintf(stderr, "warn: 模块段表不可用，将不跳过模块映像\n");
 
-    const mach_vm_size_t CHUNK = 4ULL * 1024 * 1024;
-    unsigned char *buf = (unsigned char *)malloc((size_t)CHUNK);
-    mre_pg_pt *pts = (mre_pg_pt *)malloc(sizeof(mre_pg_pt) * MRE_PG_CAP);
-    if (!buf || !pts) { free(buf); free(pts); return -4; }
+    const size_t PAGE = 4096;
+    unsigned char *buf = (unsigned char *)malloc(PAGE + 16);
+    if (!buf) { mach_port_deallocate(mach_task_self(), task); return -4; }
 
-    int npts = 0;
+    enum { MAXP = 1024 };
+    float xs[MAXP], ys[MAXP];
+    uint64_t ad[MAXP];
+
+    int shown = 0, regions = 0, pages = 0, pageskept = 0;
     unsigned long long bytes = 0;
-    int regions = 0;
     mach_vm_address_t addr = 0;
 
-    while (1) {
+    while (shown < topn) {
         mach_vm_size_t size = 0;
         vm_region_basic_info_data_64_t info;
         mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
@@ -4273,78 +4277,70 @@ int memread_pointgroups(pid_t pid, float minv, float maxv,
         if (kr != KERN_SUCCESS || size == 0) break;
 
         int readable = (info.protection & VM_PROT_READ) != 0;
+        int writable = (info.protection & VM_PROT_WRITE) != 0;
         int shared = info.shared;
-        if (!readable || shared || size > (mach_vm_size_t)(512ULL * 1024 * 1024)) {
+        if (!readable || !writable || shared || size > (mach_vm_size_t)(512ULL * 1024 * 1024) ||
+            chain_addr_in_module((uint64_t)addr)) {
             addr += size;
             continue;
         }
         regions++;
 
         mach_vm_address_t off = 0;
-        while (off < size && npts < MRE_PG_CAP - 8) {
-            mach_vm_size_t cur = (size - off > CHUNK) ? CHUNK : (size - off);
+        while (off < size && shown < topn) {
+            uint64_t pa = (uint64_t)addr + off;
+            mach_vm_size_t want = PAGE;
+            if (off + PAGE > size) want = size - off;
+            mach_vm_size_t readlen = want + 8;
+            if (off + readlen > size) readlen = size - off;
             mach_vm_size_t got = 0;
-            kr = mach_vm_read_overwrite(task, addr + off, cur, (mach_vm_address_t)buf, &got);
-            if (kr == KERN_SUCCESS && got == cur) {
-                bytes += cur;
-                size_t lim = (size_t)cur - 8;
-                for (size_t i = 0; i <= lim; i += 4) {
-                    if (npts >= MRE_PG_CAP) break;
+            kr = mach_vm_read_overwrite(task, addr + off, readlen, (mach_vm_address_t)buf, &got);
+            if (kr == KERN_SUCCESS && got >= want) {
+                bytes += got;
+                pages++;
+                int n = 0;
+                size_t lim = (size_t)want - 8;
+                for (size_t i = 0; i <= lim && n < MAXP; i += 4) {
                     float a, b;
                     memcpy(&a, buf + i, 4);
                     memcpy(&b, buf + i + 4, 4);
                     if (!(a >= minv && a <= maxv)) continue;
                     if (!(b >= minv && b <= maxv)) continue;
-                    /* 两个值都非零整、避免把 0/1 类布尔对当成坐标 */
-                    if ((a == 0.0f && b == 0.0f)) continue;
-                    pts[npts].addr = (uint64_t)(addr + off + i);
-                    pts[npts].x = a;
-                    pts[npts].y = b;
-                    npts++;
-                    i += 4;
+                    if (a == 0.0f && b == 0.0f) continue;
+                    xs[n] = a; ys[n] = b; ad[n] = pa + i;
+                    n++;
+                }
+                if (n >= minrun) {
+                    int good = 0, pairs = 0;
+                    for (int k = 0; k + 1 < n; k++) {
+                        float dx = xs[k + 1] - xs[k];
+                        float dy = ys[k + 1] - ys[k];
+                        float d2 = dx * dx + dy * dy;
+                        pairs++;
+                        if (d2 >= mindist * mindist && d2 <= maxdist * maxdist) good++;
+                    }
+                    if (pairs > 0 && good * 10 >= pairs * 7) {
+                        pageskept++;
+                        printf("PAGE 0x%016llX  pts=%d  spaced=%d/%d\n",
+                               (unsigned long long)pa, n, good, pairs);
+                        int show = n < 14 ? n : 14;
+                        for (int k = 0; k < show; k++)
+                            printf("   +0x%03llX  0x%016llX  (%.2f, %.2f)\n",
+                                   (unsigned long long)(ad[k] - pa),
+                                   (unsigned long long)ad[k], xs[k], ys[k]);
+                        fflush(stdout);
+                        shown++;
+                    }
                 }
             }
-            off += cur;
+            off += want;
         }
         addr += size;
     }
 
-    fprintf(stderr, "pointgroups: 扫 %llu 字节 / %d 区 / 候选点 %d\n", bytes, regions, npts);
-
-    /* 按 4KB 页分组（地址天然递增） */
-    int shown = 0;
-    int i = 0;
-    while (i < npts && shown < topn) {
-        uint64_t page = pts[i].addr & ~(uint64_t)0xFFF;
-        int j = i;
-        while (j < npts && (pts[j].addr & ~(uint64_t)0xFFF) == page) j++;
-        int n = j - i;
-        if (n >= minrun) {
-            int good = 0, pairs = 0;
-            for (int k = i; k + 1 < j; k++) {
-                float dx = pts[k + 1].x - pts[k].x;
-                float dy = pts[k + 1].y - pts[k].y;
-                float d = dx * dx + dy * dy;
-                pairs++;
-                if (d >= mindist * mindist && d <= maxdist * maxdist) good++;
-            }
-            if (pairs > 0 && good * 10 >= pairs * 7) {
-                printf("PAGE 0x%016llX  pts=%d  spaced=%d/%d\n", (unsigned long long)page, n, good, pairs);
-                int lim = n < 14 ? n : 14;
-                for (int k = 0; k < lim; k++)
-                    printf("   +0x%03llX  0x%016llX  (%.2f, %.2f)\n",
-                           (unsigned long long)(pts[i + k].addr - page),
-                           (unsigned long long)pts[i + k].addr, pts[i + k].x, pts[i + k].y);
-                fflush(stdout);
-                shown++;
-            }
-        }
-        i = j;
-    }
-
     free(buf);
-    free(pts);
     mach_port_deallocate(mach_task_self(), task);
-    fprintf(stderr, "pointgroups: 输出 %d 个页\n", shown);
+    fprintf(stderr, "pointgroups: 扫 %llu 字节 / %d 区 / %d 页 / 保留 %d 页 / 输出 %d\n",
+            bytes, regions, pages, pageskept, shown);
     return shown > 0 ? 0 : -3;
 }
