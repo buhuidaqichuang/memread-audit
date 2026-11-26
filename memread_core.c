@@ -2629,6 +2629,124 @@ int memread_read_i32x2_batch(pid_t pid, const uint64_t *addrs, int n, int32_t *o
     return ok;
 }
 
+static int int_diff_cmp(const void *pa, const void *pb) {
+    const memread_int_hit_t *a = (const memread_int_hit_t *)pa;
+    const memread_int_hit_t *b = (const memread_int_hit_t *)pb;
+    int da = (int)a->v[0] - (int)a->prev[0]; if (da < 0) da = -da;
+    int db = (int)b->v[0] - (int)b->prev[0]; if (db < 0) db = -db;
+    if (da == db) return 0;
+    return (da > db) ? -1 : 1;
+}
+
+int memread_int_globaldiff(pid_t pid, int seconds, int min_delta, int maxv,
+                           memread_int_hit_t *out, int cap, int *found,
+                           volatile int *cancel) {
+    if (found) *found = 0;
+    if (!out || cap <= 0) return -2;
+    task_t task = MACH_PORT_NULL;
+    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
+    module_cache_ensure(pid);
+
+    static memread_region_info_t regs[4096];
+    int nreg = memread_regions_list(pid, regs, 4096);
+    if (nreg <= 0) { mach_port_deallocate(mach_task_self(), task); return -2; }
+
+    uint64_t total = 0;
+    int nok = 0;
+    for (int i = 0; i < nreg; i++) {
+        if (!((regs[i].prot & VM_PROT_WRITE) != 0)) continue;
+        if (regs[i].in_module) continue;
+        if (regs[i].size > (uint64_t)MEMREAD_SNAP_REGION_MAX) continue;
+        total += regs[i].size;
+        nok++;
+    }
+    fprintf(stderr, "两帧差分: %d 个可写区, 共 %.1f MB\n", nok, total / 1048576.0);
+    if (total == 0) { mach_port_deallocate(mach_task_self(), task); return -2; }
+
+    unsigned char *base = (unsigned char *)malloc((size_t)total);
+    if (!base) {
+        fprintf(stderr, "内存不足，需要 %.0f MB（可以用 MEMREAD_RANGE_LO/HI 缩小范围）\n", total / 1048576.0);
+        mach_port_deallocate(mach_task_self(), task);
+        return -4;
+    }
+    const mach_vm_size_t CHUNK = mre_chunk_bytes();
+    unsigned char *tmp = (unsigned char *)malloc((size_t)CHUNK);
+    if (!tmp) { free(base); mach_port_deallocate(mach_task_self(), task); return -4; }
+
+    // 第一帧：整块快照进内存（读失败的 chunk 填 0）
+    memset(base, 0, (size_t)total);
+    uint64_t goff = 0;
+    for (int i = 0; i < nreg; i++) {
+        if (!((regs[i].prot & VM_PROT_WRITE) != 0)) continue;
+        if (regs[i].in_module) continue;
+        if (regs[i].size > (uint64_t)MEMREAD_SNAP_REGION_MAX) continue;
+        uint64_t co = 0;
+        while (co + 4 <= regs[i].size) {
+            if (cancel && *cancel) break;
+            mach_vm_size_t cur = (mach_vm_size_t)((regs[i].size - co > CHUNK) ? CHUNK : (regs[i].size - co));
+            cur -= (cur % 8);
+            if (cur == 0) break;
+            mach_vm_size_t got = 0;
+            kern_return_t kr = mach_vm_read_overwrite(task, regs[i].addr + co, cur,
+                                                      (mach_vm_address_t)(base + goff + co), &got);
+            if (kr != KERN_SUCCESS || got != cur) {
+                memset(base + goff + co, 0, (size_t)cur);
+            }
+            co += cur;
+        }
+        goff += regs[i].size;
+    }
+
+    if (seconds > 0) sleep((unsigned)seconds);
+
+    // 第二帧：逐 4 字节比对
+    int n = 0;
+    goff = 0;
+    for (int i = 0; i < nreg && n < cap; i++) {
+        if (!((regs[i].prot & VM_PROT_WRITE) != 0)) continue;
+        if (regs[i].in_module) continue;
+        if (regs[i].size > (uint64_t)MEMREAD_SNAP_REGION_MAX) continue;
+        uint64_t co = 0;
+        while (co + 8 <= regs[i].size && n < cap) {
+            if (cancel && *cancel) break;
+            mach_vm_size_t cur = (mach_vm_size_t)((regs[i].size - co > CHUNK) ? CHUNK : (regs[i].size - co));
+            cur -= (cur % 8);
+            if (cur < 8) break;
+            mach_vm_size_t got = 0;
+            kern_return_t kr = mach_vm_read_overwrite(task, regs[i].addr + co, cur,
+                                                      (mach_vm_address_t)tmp, &got);
+            if (kr != KERN_SUCCESS || got != cur) { co += cur; continue; }
+            for (mach_vm_size_t o = 0; o + 8 <= cur && n < cap; o += 4) {
+                int32_t a1 = 0, a2 = 0, n1 = 0, n2 = 0;
+                memcpy(&a1, base + goff + co + o, 4);
+                memcpy(&a2, tmp + o, 4);
+                int dv = (int)a2 - (int)a1;
+                if (dv < 0) dv = -dv;
+                if (dv < min_delta) continue;
+                if (maxv > 0 && (a1 > maxv || a1 < -maxv || a2 > maxv || a2 < -maxv)) continue;
+                memcpy(&n1, base + goff + co + o + 4, 4);
+                memcpy(&n2, tmp + o + 4, 4);
+                int dn = (int)n2 - (int)n1;
+                if (dn < 0) dn = -dn;
+                if (dn > 1) continue;
+                out[n].addr = regs[i].addr + co + o;
+                out[n].prev[0] = a1; out[n].v[0] = a2;
+                out[n].prev[1] = n1; out[n].v[1] = n2;
+                n++;
+            }
+            co += cur;
+        }
+        goff += regs[i].size;
+    }
+
+    free(tmp);
+    free(base);
+    mach_port_deallocate(mach_task_self(), task);
+    qsort(out, (size_t)n, sizeof(memread_int_hit_t), int_diff_cmp);
+    if (found) *found = n;
+    return 0;
+}
+
 typedef struct {
     const memread_coord_hit_t *base;
     int nbase;

@@ -171,13 +171,21 @@ int memread_coord_probe(pid_t pid, memread_coord_hit_t *out, int cap, int *found
 
 typedef struct {
     uint64_t addr;
-    int32_t  v[2];
+    int32_t  v[2];      // 当前值
+    int32_t  prev[2];   // 上一帧值（intscan 时与 v 相同）
 } memread_int_hit_t;
 
 // maxv>0 时扫描阶段就按 |值|<=maxv 过滤；need_both=1 要求两个分量都非零
 int memread_int_probe(pid_t pid, memread_int_hit_t *out, int cap, int *found,
                       int maxv, int need_both,
                       volatile int *cancel, memread_region_cb cb, void *ctx);
+
+// 全局两帧差分：先把所有可写区整数快照进内存，隔 seconds 再扫一遍逐 4 字节比对，
+// 只留「本身变了 >= min_delta、值在 ±maxv 内、且相邻 4 字节基本没动」的位置。
+// 这是 2D 游戏找角色坐标的主手段（不需要知道坐标值，也不受候选上限影响）。
+int memread_int_globaldiff(pid_t pid, int seconds, int min_delta, int maxv,
+                           memread_int_hit_t *out, int cap, int *found,
+                           volatile int *cancel);
 
 // 批量读 n 组 (int32,int32)；返回成功条数，负数=错误
 int memread_read_i32x2_batch(pid_t pid, const uint64_t *addrs, int n, int32_t *out);
