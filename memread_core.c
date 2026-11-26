@@ -2744,9 +2744,6 @@ int memread_int_globaldiff(pid_t pid, int seconds, int min_delta, int max_delta,
                 if (maxv > 0 && (a1 > maxv || a1 < -maxv || a2 > maxv || a2 < -maxv)) continue;
                 memcpy(&n1, bufA + o + 4, 4);
                 memcpy(&n2, bufB + o + 4, 4);
-                int dn = (int)n2 - (int)n1;
-                if (dn < 0) dn = -dn;
-                if (dn > 1) continue;
                 out[n].addr = regs[i].addr + co + o;
                 out[n].prev[0] = a1; out[n].v[0] = a2;
                 out[n].prev[1] = n1; out[n].v[1] = n2;
