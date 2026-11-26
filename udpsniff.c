@@ -146,10 +146,14 @@ int main(int argc, char **argv) {
     unsigned char *buf = malloc(blen);
     if (!buf) return 3;
 
-    FILE *out = fopen(outpath, "w");
-    if (!out) { fprintf(stderr, "打不开 %s: %s\n", outpath, strerror(errno)); return 4; }
-    int s1 = dup(1);
-    dup2(fileno(out), 1);
+    FILE *out = NULL;
+    int s1 = -1;
+    if (strcmp(outpath, "-") != 0) {
+        out = fopen(outpath, "w");
+        if (!out) { fprintf(stderr, "打不开 %s: %s\n", outpath, strerror(errno)); return 4; }
+        s1 = dup(1);
+        dup2(fileno(out), 1);
+    }
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
 
@@ -170,8 +174,7 @@ int main(int argc, char **argv) {
         fflush(stdout);
     }
     fflush(stdout);
-    dup2(s1, 1);
-    fclose(out);
+    if (out) { dup2(s1, 1); fclose(out); }
     close(fd);
     fprintf(stderr, "udpsniff: done pkts_out\n");
     return 0;
