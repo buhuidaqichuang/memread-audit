@@ -90,6 +90,8 @@ static void dump_pkt(const unsigned char *p, int caplen) {
         if (pay < 0) pay = 0;
         printf("%ld.%06ld v6:%d -> v6:%d pay=%d\n", (long)tv.tv_sec, (long)tv.tv_usec, sport, dport, pay);
         hexdump(udp + 8, pay, 128);
+    } else if (caplen >= 14) {
+        printf("%ld.%06ld ET=0x%02x%02x caplen=%d\n", (long)tv.tv_sec, (long)tv.tv_usec, p[12], p[13], caplen);
     }
 }
 
@@ -169,8 +171,17 @@ int main(int argc, char **argv) {
 
     time_t t0 = time(NULL);
     fprintf(stderr, "udpsniff: if=%s secs=%d out=%s dev=bpf%d blen=%u\n", ifname, secs, outpath, idx, blen);
+    long nread = 0, nhit = 0, nbytes = 0;
+    time_t last = t0;
     while (!g_stop && (time(NULL) - t0) < secs) {
         int n = read(fd, buf, blen);
+        nread++;
+        if (n > 0) { nhit++; nbytes += n; }
+        if (time(NULL) != last) {
+            fprintf(stderr, "[STAT] reads=%ld nonzero=%ld bytes=%ld\n", nread, nhit, nbytes);
+            fflush(stderr);
+            last = time(NULL);
+        }
         if (n <= 0) continue;
         unsigned char *p = buf;
         while (p + sizeof(struct ud_bpf_hdr) <= buf + n) {
